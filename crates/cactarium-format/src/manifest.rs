@@ -68,6 +68,10 @@ pub struct PackageSection {
     /// Path of the README to show, relative to the repo root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
+    /// The arrangement the thorns belong to, when they sit at the repo root (`Thorn/`). Repos laid
+    /// out as `Arrangement/Thorn/` don't need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement: Option<String>,
     /// The thorns to publish, by directory name. Default: every directory with an interface.ccl.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thorns: Option<Vec<String>>,
