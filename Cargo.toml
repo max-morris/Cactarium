@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/cactarium-format"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/max-morris/Cactarium"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+toml = { version = "1.1.2", features = ["preserve_order"] }
+indexmap = { version = "2.14.0", features = ["serde"] }
+semver = { version = "1.0.28", features = ["serde"] }
+thiserror = "2.0.18"

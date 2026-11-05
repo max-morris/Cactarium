@@ -1,0 +1,12 @@
+# Same style as Cactup (see its rustfmt.toml for the reasoning behind each setting).
+max_width = 105
+style_edition = "2024"
+fn_call_width = 105
+attr_fn_like_width = 105
+struct_lit_width = 105
+struct_variant_width = 105
+array_width = 105
+single_line_if_else_max_width = 105
+single_line_let_else_max_width = 105
+chain_width = 80
+reorder_imports = false
