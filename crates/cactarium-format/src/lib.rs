@@ -2,9 +2,11 @@
 //!
 //! - [`sim`]: `.sim` files, which hold a parfile together with the thornlist it ran on, both kept
 //!   verbatim, plus per-repo pins.
-//! - [`manifest`]: `cactarium.toml`, committed in an author's repo and read at each tag. It
-//!   describes either a package or a stack.
-//! - [`stack`]: stack recipes (`extends` + overrides) and flat stacks.
+//! - [`manifest`]: `cactarium.toml` (a package) and `cactarium-stack.toml` (a stack), committed
+//!   in a repo and read at each tag.
+//! - [`stack`]: stack definitions (flat thornlist, recipe, or both) and frozen releases.
+//! - [`ccl`]: dependency facts from a thorn's interface.ccl and configuration.ccl.
+//! - [`crl`]: the CRL 1.0 thornlist parser (shared with cactup).
 //! - [`name`], [`version`], [`slug`]: owner/name identifiers, track-namespaced semver, and the
 //!   `owner/name[/Thorn][@...]` references users type.
 //!
@@ -12,6 +14,8 @@
 //! error, and a generation newer than this crate knows is rejected with an upgrade message (the
 //! same discipline as cactup's MDB generations).
 
+pub mod ccl;
+pub mod crl;
 pub mod error;
 pub mod manifest;
 pub mod name;

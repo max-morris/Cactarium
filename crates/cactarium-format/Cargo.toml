@@ -13,3 +13,5 @@ toml.workspace = true
 indexmap.workspace = true
 semver.workspace = true
 thiserror.workspace = true
+anyhow = "1.0.102"
+regex = "1.13.0"
