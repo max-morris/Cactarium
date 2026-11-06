@@ -61,6 +61,14 @@ enum Command {
     Sync { slug: String },
     /// Local development only: create a user who can use the development sign-in.
     DevUser { username: String },
+    /// Create an API token for a user (scope "publish") and print it. It is shown only once.
+    Token {
+        username: String,
+        #[arg(long, default_value = "cli")]
+        name: String,
+        #[arg(long, default_value_t = 90)]
+        days: i32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +137,13 @@ async fn main() -> anyhow::Result<()> {
             let e = model::find_entry(&state, owner, name).await.map_err(|e| anyhow::anyhow!("{e}"))?.context("no such entry")?;
             let n = tracker::sync(&state, &e).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{}: {n} new versions", e.slug());
+            Ok(())
+        }
+        Command::Token { username, name, days } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            let token = web::account::mint_token(&state, &user, &name, days).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{token}");
             Ok(())
         }
         Command::DevUser { username } => {

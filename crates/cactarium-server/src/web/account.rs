@@ -388,8 +388,14 @@ pub const TOKEN_PREFIX: &str = "cactarium_";
 
 pub async fn create_token(State(state): State<AppState>, s: SignedIn, Form(f): Form<TokenForm>) -> AppResult<Response> {
     s.session.check_csrf(&f.csrf)?;
-    let days = f.days.clamp(1, 366);
-    let name = f.name.trim().chars().take(80).collect::<String>();
+    let token = mint_token(&state, &s.user, &f.name, f.days.clamp(1, 366) as i32).await?;
+    settings_page(&state, &s, Some(token)).await
+}
+
+/// Creates a "publish" token for `user`, returning it (it is stored only as a hash).
+pub async fn mint_token(state: &AppState, user: &User, name: &str, days: i32) -> AppResult<String> {
+    let days = days.clamp(1, 366);
+    let name = name.trim().chars().take(80).collect::<String>();
     if name.is_empty() {
         return Err(AppError::bad("give the token a name"));
     }
@@ -397,16 +403,16 @@ pub async fn create_token(State(state): State<AppState>, s: SignedIn, Form(f): F
     sqlx::query(
         "INSERT INTO api_tokens (user_id, name, token_hash, prefix, scopes, expires_at) VALUES ($1, $2, $3, $4, $5, now() + make_interval(days => $6))",
     )
-    .bind(s.user.id)
+    .bind(user.id)
     .bind(&name)
     .bind(sha256(&token))
     .bind(token.chars().take(TOKEN_PREFIX.len() + 6).collect::<String>())
     .bind(vec!["publish".to_owned()])
-    .bind(days as i32)
+    .bind(days)
     .execute(&state.db)
     .await?;
-    audit(&state, Some(s.user.id), "token.create", Some(&name), json!({ "days": days }), None).await?;
-    settings_page(&state, &s, Some(token)).await
+    audit(state, Some(user.id), "token.create", Some(&name), json!({ "days": days }), None).await?;
+    Ok(token)
 }
 
 pub async fn revoke_token(State(state): State<AppState>, s: SignedIn, Path(id): Path<i64>, Form(f): Form<CsrfForm>) -> AppResult<Response> {
