@@ -1,0 +1,8 @@
+<nav class="admin-nav" aria-label="Admin">
+  <a href="/admin" {% if nav == "review" %}class="selected" aria-current="page"{% endif %}>Review</a>
+  <a href="/admin/entries" {% if nav == "entries" %}class="selected" aria-current="page"{% endif %}>Entries</a>
+  <a href="/admin/curated" {% if nav == "curated" %}class="selected" aria-current="page"{% endif %}>Curated</a>
+  <a href="/admin/tags" {% if nav == "tags" %}class="selected" aria-current="page"{% endif %}>Tag alerts</a>
+  <a href="/admin/users" {% if nav == "users" %}class="selected" aria-current="page"{% endif %}>Users</a>
+  <a href="/admin/audit" {% if nav == "audit" %}class="selected" aria-current="page"{% endif %}>Audit log</a>
+</nav>

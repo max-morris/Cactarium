@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · Cactarium{% endblock %}
+{% block content %}
+<section class="stack-lg">
+  <h1>{{ title }}</h1>
+  <form role="search" action="/search" method="get" class="big-search">
+    <label class="sr-only" for="sq">Search</label>
+    <input id="sq" type="search" name="q" value="{{ q }}" placeholder="Name, summary, thorn or implementation">
+    <label class="sr-only" for="sk">Kind</label>
+    <select id="sk" name="kind">
+      <option value="" {% if kind == "" %}selected{% endif %}>Everything</option>
+      <option value="package" {% if kind == "package" %}selected{% endif %}>Packages</option>
+      <option value="stack" {% if kind == "stack" %}selected{% endif %}>Stacks</option>
+      <option value="sim" {% if kind == "sim" %}selected{% endif %}>Sims</option>
+      <option value="thorn" {% if kind == "thorn" %}selected{% endif %}>Thorns</option>
+    </select>
+    <button class="button" type="submit">Search</button>
+  </form>
+  {% if kind != "thorn" %}
+    {% let rows = results %}
+    {% include "_entry_table.html" %}
+  {% endif %}
+  {% if !thorns.is_empty() || kind == "thorn" %}
+  <h2>Thorns</h2>
+  <div class="table-box"><table>
+    <thead><tr><th scope="col">Thorn</th><th scope="col">Implements</th><th scope="col">Package</th><th scope="col">Version</th></tr></thead>
+    <tbody>
+    {% for t in thorns %}
+      <tr><td class="mono"><a href="/thorns/{{ t.thorn }}">{{ t.thorn }}</a></td><td class="mono"><a href="/implementations/{{ t.implements }}">{{ t.implements }}</a></td><td class="mono"><a href="{{ t.package_url }}">{{ t.package }}</a></td><td class="mono">{{ t.version }}</td></tr>
+    {% else %}
+      <tr><td colspan="4" class="muted">No thorns match.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+{% endblock %}

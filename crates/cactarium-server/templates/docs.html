@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Docs · Cactarium{% endblock %}
+{% block content %}
+<article class="prose docs">
+<h1>Publishing on the Cactarium</h1>
+<p>The Cactarium holds three kinds of entry, all named <code>owner/name</code>:</p>
+<ul>
+  <li><strong>Packages</strong>: a git repo of thorns, versioned by its tags. The code stays in your repo.</li>
+  <li><strong>Stacks</strong>: versioned thornlists. Every release pins every repo to a commit.</li>
+  <li><strong>Sims</strong>: a parfile plus the exact configuration it ran on, as one <code>.sim</code> file.</li>
+</ul>
+<p>Browsing and downloading need no account. Publishing needs one: sign in with GitHub or ORCID. A new entry is reviewed by an admin before it is public; later versions of an approved entry publish on their own.</p>
+
+<h2 id="versions">Versions and tracks</h2>
+<p>Tag releases <code>v1.2.3</code>. A repo can carry independent version lines, called tracks, as tag prefixes: <code>mixed-precision/v1.2.3</code> is version <code>1.2.3</code> on track <code>mixed-precision</code>, written <code>owner/pkg@mixed-precision:1.2.3</code>. Ranges such as <code>@mixed-precision:^1.2</code> never cross tracks.</p>
+<p>The first time the Cactarium sees a tag it freezes the commit. Moving a tag afterward changes nothing here: the frozen commit keeps being served, and you and the admins are alerted. Publish a new version instead. A bad version can be <em>yanked</em>: still downloadable by exact version, never chosen by a range.</p>
+
+<h2 id="manifests">Manifests</h2>
+<p>A package repo commits <code>cactarium.toml</code> at its root:</p>
+<pre class="code">format = 1
+
+[package]
+name = "carpetx"
+owners = ["your-cactarium-name"]   # proof you control the repo
+description = "CarpetX with mixed-precision grid functions"
+license = "LGPL-2.1-or-later"
+# arrangement = "CarpetX"          # only if the thorns sit at the repo root
+# thorns = ["CarpetX", "Loop"]     # default: every directory with an interface.ccl
+default-track = "mixed-precision"
+
+[tracks.mixed-precision]
+description = "CCTK_REAL4/REAL2 storage"
+
+[[fork-of]]
+target = "einsteintoolkit/carpetx"
+
+[[depends-on]]
+target = "max-morris/cactus"
+range = "mixed-precision:^1"
+
+[[works-with]]
+target = "max-morris/carpetx-mp"
+range = "^1"
+
+[[incompatible-with]]
+target = "einsteintoolkit/et"
+note = "needs the mixed-precision flesh"
+
+[[caveat]]
+thorn = "TestReal2"
+note = "needs _Float16 (GCC 12 or newer)"</pre>
+<p>Thorns and their dependencies (<code>IMPLEMENTS</code>, <code>INHERITS</code>, <code>REQUIRES</code>, …) are read from each thorn's <code>interface.ccl</code> and <code>configuration.ccl</code>. Claims are shown and checked; nothing resolves them into a build.</p>
+<p>A stack lives in <code>cactarium-stack.toml</code>, in its own small repo (a <em>manifest repo</em>) or alongside a package. It can be a plain thornlist, a recipe built on other stacks, or both:</p>
+<pre class="code">format = 1
+
+[stack]
+name = "carpetx-mp-forks"
+owners = ["your-cactarium-name"]
+extends = ["einsteintoolkit/et@2026.5.0"]   # bases, highest priority first
+# thornlist = "extra.th"                     # a plain thornlist, or sections on top of the bases
+enable = ["CarpetX/TestReal4"]               # un-#DISABLE or keep a thorn
+disable = ["CarpetX/PDESolvers"]
+
+[[stack.override]]                           # redirect a repo of the bases
+repo = "CarpetX"
+package = "max-morris/carpetx@mixed-precision:^1"   # or url = "…" and ref = "branch"
+
+[[stack.pin]]                                # optional: fix a repo's commit in the definition
+name = "AsterX"
+url = "https://github.com/jaykalinani/AsterX.git"
+ref = "main"
+commit = "…40 hex digits…"</pre>
+<p>Each tag cuts a release: the Cactarium merges the sources, applies the overrides, resolves every branch to its current commit and freezes the result. It refuses thorn-name collisions (Cactus thorn names are global) and repos checked out from conflicting sources. Two unpinned forms exist for development: <code>owner/stack@head</code> puts each repo at the tip of the branch the stack names, and <code>owner/stack@master</code> puts every repo at the tip of its default branch, like <code>cactup install master</code>.</p>
+
+<h2 id="sim">The .sim format</h2>
+<p>A <code>.sim</code> is TOML holding the thornlist and the parfile verbatim, a pin for every repo, declared inputs and run hints. Only fully specified sims (every repo pinned, nothing dirty) can be published. Make one with <code>cactup sim export</code>, or <code>cactup sim pack foo.th foo.par</code>; read one with <code>cactup import</code> or <code>cactup sim unpack</code>.</p>
+
+<h2 id="api">API</h2>
+<p>Read endpoints need no token. Base URL: <code>{{ base_url }}/api/v1</code>.</p>
+<ul>
+  <li><code>GET /entries/{owner}/{name}</code></li>
+  <li><code>GET /packages/{owner}/{name}/versions</code></li>
+  <li><code>GET /resolve?req=owner/name@track:range</code>: the best matching version, with its tag and frozen commit</li>
+  <li><code>GET /stacks/{owner}/{name}/releases/{version}</code>, and <code>…/head</code> or <code>…/master</code></li>
+  <li><code>GET /sims/{owner}/{name}/{version}/download</code></li>
+  <li><code>POST /sims/{owner}/{name}</code> with <code>Authorization: Bearer &lt;token&gt;</code> and the .sim as the body</li>
+</ul>
+<p>Every response carries an <code>api-generation</code> header.</p>
+</article>
+{% endblock %}

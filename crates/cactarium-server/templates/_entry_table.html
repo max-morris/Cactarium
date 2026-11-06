@@ -1,0 +1,20 @@
+<div class="table-box">
+<table>
+  <thead><tr><th scope="col">Name</th><th scope="col">Kind</th><th scope="col">Latest</th><th scope="col">Summary</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a class="mono strong" href="{{ r.url }}">{{ r.slug }}</a>
+        {% if r.verified %}<span class="badge good">verified</span>{% endif %}
+        {% if r.curated %}<span class="badge quiet">curated</span>{% endif %}
+        {% if r.visibility != "public" %}<span class="badge warn">{{ r.visibility }}</span>{% endif %}</td>
+      <td>{{ r.kind }}</td>
+      <td class="mono">{{ r.latest }}</td>
+      <td class="muted">{{ r.summary }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">Nothing here yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>

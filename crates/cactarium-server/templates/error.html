@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ status }} · Cactarium{% endblock %}
+{% block content %}
+<section class="narrow">
+  <h1>{{ status }}</h1>
+  <p class="lead">{{ message }}</p>
+  <p><a href="/">Back to the Cactarium</a></p>
+</section>
+{% endblock %}

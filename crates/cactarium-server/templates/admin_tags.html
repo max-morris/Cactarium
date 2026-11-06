@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Tag alerts · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<section class="stack">
+  <p class="muted">Tags that moved to another commit or vanished after their version was frozen. The frozen commit is still what the Cactarium serves.</p>
+  {% for a in alerts %}
+  <div class="card row-wrap between">
+    <span><a class="mono strong" href="{{ a.entry_url }}">{{ a.entry }}</a> tag <span class="mono">{{ a.tag }}</span>: frozen <span class="mono">{{ a.frozen }}</span>, {% if a.now.is_empty() %}deleted upstream{% else %}now <span class="mono">{{ a.now }}</span>{% endif %} · {{ a.when }}</span>
+    <form method="post" action="/admin/tags/{{ a.id }}/ack" class="inline"><input type="hidden" name="_csrf" value="{{ ctx.csrf }}"><button class="button small ghost" type="submit">Acknowledge</button></form>
+  </div>
+  {% else %}<p class="muted">No open alerts.</p>{% endfor %}
+</section>
+{% endblock %}

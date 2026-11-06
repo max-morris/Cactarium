@@ -1,0 +1,24 @@
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Version</th><th scope="col">Git tag</th><th scope="col">Frozen commit</th><th scope="col">Date</th><th scope="col">Status</th>{% if e.can_manage %}<th scope="col"><span class="sr-only">Actions</span></th>{% endif %}</tr></thead>
+  <tbody>
+  {% for v in rows %}
+    <tr {% if v.current %}class="current"{% endif %}>
+      <td class="mono"><a href="{{ v.url }}">{{ v.label }}</a></td>
+      <td class="mono">{{ v.tag }}</td>
+      <td class="mono">{{ v.commit }}</td>
+      <td>{{ v.date }}</td>
+      <td class="muted">{{ v.status }}</td>
+      {% if e.can_manage %}<td>
+        <form method="post" action="{{ e.url }}/yank" class="inline">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          <input type="hidden" name="version_id" value="{{ v.id }}">
+          {% if v.yanked %}<input type="hidden" name="yank" value="0"><button class="link-button" type="submit">Unyank</button>
+          {% else %}<input type="hidden" name="yank" value="1"><input name="reason" placeholder="reason" aria-label="Reason to yank {{ v.label }}" class="small-input"><button class="link-button" type="submit">Yank</button>{% endif %}
+        </form>
+      </td>{% endif %}
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No versions yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>

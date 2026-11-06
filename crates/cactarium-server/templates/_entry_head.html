@@ -1,0 +1,24 @@
+<div class="entry-head stack-sm">
+  <div class="row-wrap">
+    <span class="eyebrow">{{ e.kind }}</span>
+    {% if e.verified %}<span class="badge good">verified</span>{% endif %}
+    {% if e.curated %}<span class="badge quiet" title="Published by Cactarium admins for a repo whose authors have not published it themselves">curated</span>{% endif %}
+    {% if e.visibility == "pending" %}<span class="badge warn">pending review</span>{% endif %}
+    {% if e.visibility == "hidden" %}<span class="badge warn">hidden</span>{% endif %}
+  </div>
+  <h1 class="mono">{{ e.slug }}</h1>
+  {% if !e.summary.is_empty() %}<p class="lead">{{ e.summary }}</p>{% endif %}
+  {% if !e.repo_url.is_empty() %}<p class="meta"><a href="{{ e.repo_url }}" rel="nofollow noopener">{{ e.repo_url }}</a></p>{% endif %}
+  {% if e.can_manage && !e.review_status.is_empty() %}
+    <div class="alert {% if e.review_status == "changes-requested" %}warn{% endif %}">
+      <strong>Review: {{ e.review_status }}.</strong>
+      {% if !e.review_note.is_empty() %} {{ e.review_note }}{% endif %}
+      {% if e.review_status == "changes-requested" %}
+      <form method="post" action="{{ e.url }}/resubmit" class="inline">
+        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+        <button class="button small" type="submit">I've made the changes</button>
+      </form>
+      {% endif %}
+    </div>
+  {% endif %}
+</div>

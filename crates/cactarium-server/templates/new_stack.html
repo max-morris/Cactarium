@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Cut a stack release · Cactarium{% endblock %}
+{% block content %}
+<section class="stack-lg">
+  <h1>Cut a stack release</h1>
+  <p class="lead">For a stack kept in a repo, push a version tag instead. Here you give the definition directly; the Cactarium resolves every branch to its current commit and freezes the result.</p>
+  {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
+  <form class="stack" method="post" action="/new/stack">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <div class="split">
+      <div class="split-main stack-sm">
+        <label for="def">Stack definition (the contents of <span class="mono">cactarium-stack.toml</span>)</label>
+        <textarea id="def" name="definition" class="mono" rows="14" spellcheck="false" required>{{ definition }}</textarea>
+        <label for="th">Thornlist <span class="muted">(optional; for a flat stack, or extra sections on top of the bases)</span></label>
+        <textarea id="th" name="thornlist" class="mono" rows="14" spellcheck="false">{{ thornlist }}</textarea>
+      </div>
+      <div class="split-side stack-sm">
+        <label for="ver">Release version</label>
+        <input id="ver" name="version" class="mono" value="{{ version }}" placeholder="1.0.0 or mixed-precision:1.0.0" required>
+        <button class="button" type="submit">Resolve and release</button>
+        <pre class="code small">format = 1
+
+[stack]
+name = "carpetx-mp"
+extends = ["einsteintoolkit/et@2026.5.0"]
+enable = ["CarpetX/TestReal4"]
+
+[[stack.override]]
+repo = "CarpetX"
+url = "https://github.com/you/CarpetX.git"
+ref = "mixed-precision"</pre>
+      </div>
+    </div>
+  </form>
+</section>
+{% endblock %}

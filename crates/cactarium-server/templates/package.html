@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}{{ e.slug }} · Cactarium{% endblock %}
+{% block content %}
+{% include "_entry_head.html" %}
+<div class="split">
+  <div class="split-main stack">
+    <div class="card stack-sm">
+      {% if tracks.len() > 1 %}
+      <div class="row-wrap">
+        <span class="strong small" id="tl">Track</span>
+        <nav class="pills" aria-labelledby="tl">
+        {% for t in tracks %}<a class="pill mono {% if t.selected %}selected{% endif %}" href="{{ t.url }}" {% if t.selected %}aria-current="true"{% endif %}>{% if t.name.is_empty() %}default{% else %}{{ t.name }}{% endif %}</a>{% endfor %}
+        </nav>
+      </div>
+      {% for t in tracks %}{% if t.selected && !t.description.is_empty() %}<p class="muted small">{{ t.description }}</p>{% endif %}{% endfor %}
+      {% endif %}
+      {% if let Some(v) = version %}
+        <p class="small muted">Version <span class="mono ink">{{ v.label }}</span> · tag <span class="mono ink">{{ v.tag }}</span> · commit <span class="mono ink">{{ v.commit }}</span>, frozen when first seen{% if !v.status.is_empty() %} · <strong>{{ v.status }}</strong>{% endif %}</p>
+        {% if !version_note.is_empty() %}<div class="alert warn">{{ version_note }}</div>{% endif %}
+        {% call m::copy(add_cmd) %}{% endcall %}
+      {% else %}
+        <p class="muted">No versions yet. Tags named vX.Y.Z (or track/vX.Y.Z) appear here once the repo is checked.</p>
+      {% endif %}
+    </div>
+    {% include "_tabs.html" %}
+    {% if tab == "readme" %}
+      <article class="card prose">{% if readme_html.is_empty() %}<p class="muted">No README.</p>{% else %}{{ readme_html|safe }}{% endif %}</article>
+    {% else if tab == "thorns" %}
+      <div class="table-box"><table>
+        <thead><tr><th scope="col">Thorn</th><th scope="col">Implements</th><th scope="col">Requires</th><th scope="col">Inherits</th></tr></thead>
+        <tbody>{% for t in thorns %}<tr><td class="mono"><a href="/thorns/{{ t.name }}">{{ t.name }}</a>{% if !t.caveat.is_empty() %} <span class="badge warn" title="{{ t.caveat }}">caveat</span>{% endif %}</td><td class="mono">{{ t.implements }}</td><td class="muted small">{{ t.requires }}</td><td class="muted small">{{ t.inherits }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No thorns.</td></tr>{% endfor %}</tbody>
+      </table></div>
+    {% else if tab == "versions" %}
+      {% let rows = versions %}
+      {% include "_versions_table.html" %}
+    {% else if tab == "usedby" %}
+      {% let rows = used_by %}
+      {% include "_entry_table.html" %}
+    {% endif %}
+  </div>
+  <aside class="split-side stack">
+    <section class="card stack-sm">
+      <h2 class="h-small">Compatibility</h2>
+      {% include "_claims.html" %}
+      {% for c in caveats %}<div class="alert warn small"><strong>{{ c.0 }}:</strong> {{ c.1 }}</div>{% endfor %}
+    </section>
+    {% if e.can_manage %}
+    <section class="card stack-sm">
+      <h2 class="h-small">Manage</h2>
+      <form method="post" action="{{ e.url }}/refresh">
+        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+        <button class="button small ghost" type="submit">Check for new tags now</button>
+      </form>
+      {% if !poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ poll_error }}</p>{% endif %}
+      <details><summary class="small">Webhook for instant updates</summary>
+        <p class="small">Payload URL: <code class="mono">{{ webhook_url }}</code></p>
+        <p class="small">Secret: <code class="mono">{{ webhook_secret }}</code></p>
+        <p class="muted small">GitHub: Settings › Webhooks, content type application/json, "Just the push event". GitLab: Tag push events, use the secret as the token.</p>
+      </details>
+    </section>
+    {% endif %}
+  </aside>
+</div>
+{% endblock %}

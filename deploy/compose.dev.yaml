@@ -1,0 +1,12 @@
+# Local development on top of compose.yaml: dev sign-in, local demo repos, fast polling.
+services:
+  app:
+    environment:
+      CACTARIUM_BASE_URL: http://localhost:${PORT:-8000}
+      CACTARIUM_DEV_LOGIN: "1"
+      CACTARIUM_ALLOW_LOCAL_REPOS: "1"
+      CACTARIUM_POLL_SECONDS: "60"
+      CACTARIUM_SUPERADMIN: ${CACTARIUM_SUPERADMIN:-dev:max}
+    volumes:
+      - ./demo/repos:/repos:ro
+      - ./demo/files:/demo:ro

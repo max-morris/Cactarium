@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Audit log · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<div class="table-box"><table>
+  <thead><tr><th scope="col">When</th><th scope="col">Who</th><th scope="col">Action</th><th scope="col">Target</th><th scope="col">Details</th></tr></thead>
+  <tbody>{% for r in rows %}<tr><td class="small">{{ r.when }}</td><td class="mono">{{ r.actor }}</td><td class="mono">{{ r.action }}</td><td class="mono">{{ r.target }}</td><td class="mono small break">{{ r.details }}</td></tr>{% endfor %}</tbody>
+</table></div>
+{% endblock %}

@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block content %}
+<section class="hero stack">
+  <h1>Thorns, stacks and simulations for Cactus</h1>
+  <p class="lead">Publish thorns straight from your own repo, release pinned stacks, and hand anyone a simulation they can rebuild and run with one cactup command. No single release decides what works together.</p>
+  <form role="search" action="/search" method="get" class="big-search">
+    <label class="sr-only" for="q">Search the Cactarium</label>
+    <input id="q" type="search" name="q" placeholder="Search packages, stacks, sims, thorns, implementations…">
+    <button class="button" type="submit">Search</button>
+  </form>
+</section>
+<section class="cards" aria-label="What you can find here">
+  <a class="card kind-card" href="/search?kind=package">
+    <span class="eyebrow">Packages · {{ packages }}</span>
+    <span class="card-title">Thorn repos, versioned by tags</span>
+    <span class="muted">Your code stays in your repo. Tag v1.2.0, or a track like mixed-precision/v1.2.0, and the Cactarium freezes that commit.</span>
+    <code class="mono command-static">cactup add owner/pkg</code>
+  </a>
+  <a class="card kind-card" href="/search?kind=stack">
+    <span class="eyebrow">Stacks · {{ stacks }}</span>
+    <span class="card-title">Thornlists with releases</span>
+    <span class="muted">A plain thornlist, or a recipe built on other stacks. Each release pins every repo, for any stack.</span>
+    <code class="mono command-static">cactup install owner/stack</code>
+  </a>
+  <a class="card kind-card" href="/search?kind=sim">
+    <span class="eyebrow">Sims · {{ sims }}</span>
+    <span class="card-title">A parfile and the exact code it ran on</span>
+    <span class="muted">One .sim file: parfile and thornlist verbatim, every repo pinned, inputs declared.</span>
+    <code class="mono command-static">cactup import owner/sim</code>
+  </a>
+</section>
+<section class="stack">
+  <h2>Recently updated</h2>
+  {% let rows = recent %}
+  {% include "_entry_table.html" %}
+</section>
+{% endblock %}

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Register a repo · Cactarium{% endblock %}
+{% block content %}
+<section class="narrow stack-lg">
+  <h1>Register a repo</h1>
+  <p class="lead">Your code stays in your repo. The Cactarium reads it at every version tag and freezes the commit the tag names.</p>
+  <ol class="steps">
+    <li>Commit <span class="mono">cactarium.toml</span> (a package) and/or <span class="mono">cactarium-stack.toml</span> (a stack) at the repo root, with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span>. Only someone who can push to the repo can put your name there; that is the proof you control it.</li>
+    <li>Tag a release: <span class="mono">v1.0.0</span>, or on a track, <span class="mono">mixed-precision/v1.0.0</span>.</li>
+    <li>Paste the repo's https URL below.</li>
+  </ol>
+  {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
+  <form class="card stack" method="post" action="/new/repo">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <label for="url">Repo URL</label>
+    <input id="url" name="url" class="mono" value="{{ url }}" placeholder="https://github.com/you/YourArrangement" required>
+    <button class="button" type="submit">Register</button>
+  </form>
+  <p class="muted small">See the <a href="/docs#manifests">manifest reference</a>. New entries are reviewed by an admin before they are public; later versions publish on their own.</p>
+</section>
+{% endblock %}

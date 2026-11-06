@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}{{ e.slug }} · Cactarium{% endblock %}
+{% block content %}
+{% include "_entry_head.html" %}
+{% if !authors.is_empty() || !license.is_empty() %}<p class="meta">{% if !authors.is_empty() %}By {{ authors }}{% endif %}{% if !license.is_empty() %} · {{ license }}{% endif %}</p>{% endif %}
+<div class="split">
+  <div class="split-main stack">
+    {% if !e.description_html.is_empty() %}<article class="card prose">{{ e.description_html|safe }}</article>{% endif %}
+    {% include "_tabs.html" %}
+    {% if tab == "parfile" %}
+      <p class="small muted mono">{{ parfile_name }}</p><pre class="code">{{ parfile }}</pre>
+    {% else if tab == "thornlist" %}
+      <p class="small muted mono">{{ thornlist_name }}</p><pre class="code">{{ thornlist }}</pre>
+    {% else if tab == "pins" %}
+      {% include "_pins.html" %}
+    {% else if tab == "inputs" %}
+      {% for i in inputs %}<div class="card stack-sm"><span class="mono strong">{{ i.0 }}</span><span>{{ i.1 }}</span>{% if !i.2.is_empty() %}<span class="small muted mono">{{ i.2 }}</span>{% endif %}</div>{% else %}<p class="muted">This sim needs nothing from outside its sources.</p>{% endfor %}
+    {% else if tab == "run" %}
+      <div class="card stack-sm"><p class="muted small">Suggestions only: your flags and your machine decide.</p>
+      {% for r in run %}<p><span class="muted">{{ r.0 }}</span> <span class="mono">{{ r.1 }}</span></p>{% else %}<p class="muted">No run hints.</p>{% endfor %}</div>
+    {% else if tab == "versions" %}
+      {% let rows = versions %}
+      {% include "_versions_table.html" %}
+    {% endif %}
+  </div>
+  <aside class="split-side stack">
+    <section class="card stack-sm">
+      <h2 class="h-small">Run it</h2>
+      {% call m::copy(import_cmd) %}{% endcall %}
+      <p class="small muted">Installs the pinned sources, builds, asks for any inputs, then runs or submits.</p>
+      <a class="button" href="{{ download_url }}">Download .sim</a>
+      <p class="small muted">Want plain files? <span class="mono">cactup sim unpack</span> writes the .th and .par.</p>
+    </section>
+    {% if !provenance.is_empty() %}
+    <section class="card stack-sm small">
+      <h2 class="h-small">Provenance</h2>
+      {% for p in provenance %}<span><span class="muted">{{ p.0 }}</span> <span class="mono">{{ p.1 }}</span></span>{% endfor %}
+    </section>
+    {% endif %}
+    {% if e.can_manage && !warnings.is_empty() %}
+    <section class="card stack-sm small">
+      <h2 class="h-small">Notes for review</h2>
+      {% for w in warnings %}<p class="alert warn small">{{ w }}</p>{% endfor %}
+    </section>
+    {% endif %}
+    {% if e.can_manage %}<a class="button ghost small" href="/new/sim?name={{ e.slug }}">Upload a new version</a>{% endif %}
+  </aside>
+</div>
+{% endblock %}
