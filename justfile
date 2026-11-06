@@ -36,6 +36,10 @@ status:
 down:
     {{compose}} down
 
+# Production, once per VM: deploy/.env, docker group, Apache proxy, nightly backups
+setup:
+    sh deploy/setup.sh
+
 # Production: build and (re)start, applying migrations
 up:
     test -f deploy/.env || { echo "deploy/.env is missing: run just setup"; exit 1; }
