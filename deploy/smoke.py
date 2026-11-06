@@ -217,10 +217,13 @@ check("a release never changes", s == 200 and "already exists" in text, s)
 maxv.get("/new/stack")
 clash = ("!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n"
          "!URL = " + REPOS + "/cactusbase.git\n"
-         "!REPO_PATH = $2\n!CHECKOUT = Other/Boundary\n")
+         "!REPO_PATH = $2\n!CHECKOUT =\nOther/Boundary\n")
 s, text, _ = maxv.post("/new/stack", {"definition": definition.replace("smoke-stack", "clash"), "thornlist": clash, "version": "0.1.0"})
 check("thorn-name collisions are refused", s == 200 and "collide" in text, text[text.find("alert"):][:300])
 page(anon, "/max/clash", expect=404)  # a failed release leaves no entry behind
+maxv.get("/new/stack")
+s, text, _ = maxv.post("/new/stack", {"definition": definition.replace("smoke-stack", "squeezed"), "thornlist": clash.replace("!CHECKOUT =\nOther/Boundary", "!CHECKOUT = Other/Boundary"), "version": "0.1.0"})
+check("a thorn on the !CHECKOUT line is refused", s == 200 and "its own line" in text, s)
 text = page(anon, "/max/carpetx")
 check("the newest manifest's default track is shown first", 'pill mono selected" href="/max/carpetx?track=mixed-precision"' in text)
 
