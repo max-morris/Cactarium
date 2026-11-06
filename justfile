@@ -10,6 +10,8 @@ default:
 # Local development: build and start at http://localhost:8000 with dev sign-in
 dev:
     test -f deploy/.env || just _dev-env
+    grep -q '^DEMO_REPOS=' deploy/.env || echo "DEMO_REPOS=$PWD/deploy/demo/repos" >> deploy/.env
+    mkdir -p deploy/demo/repos deploy/demo/files
     {{devc}} up -d --build
     @echo "The Cactarium is at http://localhost:$(grep -E '^PORT=' deploy/.env | cut -d= -f2 || echo 8000)"
 

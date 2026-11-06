@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000").rstrip("/")
+ENV = dict(l.strip().split("=", 1) for l in open(__file__.rsplit("/", 1)[0] + "/.env") if "=" in l and not l.startswith("#"))
+REPOS = "file://" + ENV["DEMO_REPOS"]
 FAILED = []
 
 
@@ -87,7 +89,7 @@ def page(v, path, expect=200, contains=None):
 anon = Visitor()
 for p in ["/", "/search", "/search?kind=package", "/search?kind=stack", "/search?kind=sim", "/search?kind=thorn",
           "/search?q=carpetx", "/search?q=driver", "/docs", "/thorns/CarpetX/Loop", "/thorns/Loop",
-          "/implementations/driver", "/sources?url=file:///repos/cactus.git", "/max", "/et",
+          "/implementations/driver", "/sources?url=" + REPOS + "/cactus.git", "/max", "/et",
           "/max/carpetx", "/max/carpetx?tab=thorns", "/max/carpetx?tab=versions", "/max/carpetx?tab=usedby",
           "/max/carpetx?track=default", "/max/carpetx/mixed-precision:1.0.0", "/max/carpetx/1.0.0",
           "/et/et", "/et/et/2026.5.0", "/max/carpetx-mp", "/max/qc0-demo", "/max/qc0-demo/1?tab=pins",
@@ -185,7 +187,8 @@ check("a release never changes", s == 200 and "already exists" in text, s)
 # Collisions are refused.
 maxv.get("/new/stack")
 clash = ("!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n"
-         "!URL = file:///repos/cactusbase.git\n!REPO_PATH = $2\n!CHECKOUT = Other/Boundary\n")
+         "!URL = " + REPOS + "/cactusbase.git\n"
+         "!REPO_PATH = $2\n!CHECKOUT = Other/Boundary\n")
 s, text, _ = maxv.post("/new/stack", {"definition": definition.replace("smoke-stack", "clash"), "thornlist": clash, "version": "0.1.0"})
 check("thorn-name collisions are refused", s == 200 and "collide" in text, text[text.find("alert"):][:300])
 

@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 DEMO=$PWD/demo
 REPOS=$DEMO/repos
+U=file://$REPOS   # the same path inside the container (see compose.dev.yaml)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$REPOS" "$DEMO/files"
@@ -115,34 +116,34 @@ publish carpetx
 # The ET stack: a flat stack in a manifest repo, by user "et".
 new_repo et-stack
 R=$WORK/et-stack
-cat > "$R/et.th" <<'EOF'
+cat > "$R/et.th" <<EOF
 # A tiny stand-in for the Einstein Toolkit's component list.
 !CRL_VERSION = 1.0
 
 !DEFINE ROOT = Cactus
-!DEFINE ARR  = $ROOT/arrangements
+!DEFINE ARR  = \$ROOT/arrangements
 
 # Cactus Flesh
-!TARGET   = $ROOT
+!TARGET   = \$ROOT
 !TYPE     = git
-!URL      = file:///repos/cactus.git
+!URL      = $U/cactus.git
 !NAME     = flesh
 !CHECKOUT = Makefile lib src
 
 # CactusBase thorns
-!TARGET   = $ARR
+!TARGET   = \$ARR
 !TYPE     = git
-!URL      = file:///repos/cactusbase.git
-!REPO_PATH= $2
+!URL      = $U/cactusbase.git
+!REPO_PATH= \$2
 !CHECKOUT =
 CactusBase/Boundary
 CactusBase/IOUtil
 
 # CarpetX thorns
-!TARGET   = $ARR
+!TARGET   = \$ARR
 !TYPE     = git
-!URL      = file:///repos/carpetx.git
-!REPO_PATH= $2
+!URL      = $U/carpetx.git
+!REPO_PATH= \$2
 !CHECKOUT =
 CarpetX/Arith
 CarpetX/CarpetX
@@ -196,10 +197,10 @@ echo "Registering on the local site"
 cli migrate >/dev/null
 for u in max et alice; do cli dev-user "$u"; done
 cli admin trust et
-cli register et file:///repos/et-stack.git
-cli register max file:///repos/carpetx.git
-cli register max file:///repos/carpetx-mp.git
-cli register alice file:///repos/spacetimex.git
+cli register et $U/et-stack.git
+cli register max $U/carpetx.git
+cli register max $U/carpetx-mp.git
+cli register alice $U/spacetimex.git
 
 # A fully specified sim, pinned to today's demo commits.
 c() { git --git-dir="$REPOS/$1.git" rev-parse "$2"; }
@@ -239,19 +240,19 @@ description = "Initial data for the black holes"
 
 [[repo]]
 name = "flesh"
-url = "file:///repos/cactus.git"
+url = "$U/cactus.git"
 ref = "master"
 commit = "$(c cactus master)"
 
 [[repo]]
 name = "cactusbase"
-url = "file:///repos/cactusbase.git"
+url = "$U/cactusbase.git"
 ref = "master"
 commit = "$(c cactusbase master)"
 
 [[repo]]
 name = "carpetx"
-url = "file:///repos/carpetx.git"
+url = "$U/carpetx.git"
 ref = "master"
 commit = "$(c carpetx master)"
 
