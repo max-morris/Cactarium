@@ -193,7 +193,7 @@ pub async fn cut_release(state: &AppState, user: &User, definition: &str, thornl
     }
     // Resolve before anything is created, so a definition that fails leaves no trace.
     let own = thornlist.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("{t}\n"));
-    let resolution = stacks::resolve(state, stack, own.as_deref(), None).await?;
+    let resolution = stacks::resolve(state, &user.username, stack, own.as_deref(), None).await?;
     let slug = format!("{}/{name}@{label}", user.username).parse().map_err(AppError::bad)?;
     let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
     let entry = match existing {

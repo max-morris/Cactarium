@@ -36,16 +36,16 @@ pub struct RepoMove {
     pub to: Option<String>,
 }
 
-/// Loads a stack release's frozen form.
-pub async fn load_release(state: &AppState, slug: &Slug) -> AppResult<FrozenStack> {
-    let exact = slug.exact().map_err(AppError::bad)?;
+/// Loads a base stack's release. Only public stacks, or the extending stack owner's own, can be
+/// bases; anything else is reported exactly like a release that does not exist.
+pub async fn load_release(state: &AppState, owner: &str, slug: &Slug) -> AppResult<FrozenStack> {
+    let unavailable = || AppError::bad(format!("base stack release '{slug}' is not available"));
+    let exact = slug.exact().map_err(|_| unavailable())?;
     let entry = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
         .await?
-        .filter(|e| e.kind == "stack" && e.visibility != "hidden")
-        .ok_or_else(|| AppError::bad(format!("base stack '{}' does not exist", slug.entry())))?;
-    let v = model::version_by_label(state, entry.id, &exact.to_string())
-        .await?
-        .ok_or_else(|| AppError::bad(format!("base stack '{}' has no release {exact}", slug.entry())))?;
+        .filter(|e| e.kind == "stack" && (e.visibility == "public" || (e.owner == owner && e.visibility != "hidden")))
+        .ok_or_else(unavailable)?;
+    let v = model::version_by_label(state, entry.id, &exact.to_string()).await?.ok_or_else(unavailable)?;
     frozen_of(state, &v).await
 }
 
@@ -103,6 +103,7 @@ pub struct Resolution {
 /// Resolves a definition into a release, or with `tip` into one of the unpinned forms.
 pub async fn resolve(
     state: &AppState,
+    owner: &str,
     section: &StackSection,
     own_text: Option<&str>,
     tip: Option<Tip>,
@@ -122,7 +123,7 @@ pub async fn resolve(
         sources.push(("the stack's thornlist".into(), t.to_owned(), BTreeMap::new()));
     }
     for base in &section.extends {
-        let f = load_release(state, base).await?;
+        let f = load_release(state, owner, base).await?;
         let pins = f.repos.iter().map(|p| (p.name.clone(), p.clone())).collect();
         sources.push((base.to_string(), f.thornlist.text, pins));
     }

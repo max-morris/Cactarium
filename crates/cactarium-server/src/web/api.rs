@@ -181,7 +181,11 @@ pub async fn stack_releases(State(state): State<AppState>, Path((owner, name)): 
 }
 
 /// A release's frozen form, or `head` / `master`: the unpinned forms, resolved now.
-pub async fn stack_release(State(state): State<AppState>, Path((owner, name, version)): Path<(String, String, String)>) -> ApiResult<Response> {
+pub async fn stack_release(
+    State(state): State<AppState>,
+    ip: ClientIp,
+    Path((owner, name, version)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
     let e = public_entry(&state, &owner, &name, Some("stack")).await?;
     let tip = match version.as_str() {
         "head" => Some(Tip::Head),
@@ -192,10 +196,12 @@ pub async fn stack_release(State(state): State<AppState>, Path((owner, name, ver
         let v = model::version_by_label(&state, e.id, &version).await?.ok_or(AppError::NotFound)?;
         return Ok(Json(stacks::frozen_of(&state, &v).await?).into_response());
     };
+    // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
+    state.limiter.check("tip", ip.0, 12)?;
     let (definition, own) = current_definition(&state, &e).await?;
     let m = Manifest::from_toml(&definition).map_err(AppError::bad)?;
     let section = m.stack.ok_or_else(|| AppError::bad("the stack definition has no [stack]"))?;
-    let r = stacks::resolve(&state, &section, own.as_deref(), Some(tip)).await?;
+    let r = stacks::resolve(&state, &e.owner, &section, own.as_deref(), Some(tip)).await?;
     let frozen = FrozenStack {
         format: 1,
         stack: format!("{}@{version}", e.slug()).parse().map_err(AppError::bad)?,
@@ -213,6 +219,10 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
     if let Some(repo) = tracker::repo_of(state, e.id).await? {
         let policy = GitPolicy { allow_local: state.cfg.allow_local_repos };
         let commit = git::resolve_ref(policy, &repo.url, None).await.map_err(AppError::bad)?;
+        let key = (e.id, commit.clone());
+        if let Some(hit) = state.definitions.lock().expect("definitions lock").get(&key).cloned() {
+            return Ok(hit);
+        }
         let co = git::checkout(policy, &repo.url, &commit, None).await.map_err(AppError::bad)?;
         let def = git::read_in(&co, STACK_FILE)
             .map_err(AppError::bad)?
@@ -221,6 +231,11 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
             Some(p) => git::read_in(&co, &p).map_err(AppError::bad)?,
             None => None,
         };
+        let mut cache = state.definitions.lock().expect("definitions lock");
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(key, (def.clone(), own.clone()));
         return Ok((def, own));
     }
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(

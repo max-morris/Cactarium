@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use super::{Session, Visitor, create_session, current_session, destroy_session, random_token, set_session_data, with_cookie};
 use crate::audit::audit;
 use crate::error::{AppError, AppResult};
+use crate::security::ClientIp;
 use crate::state::AppState;
 use crate::templates::{ChooseNamePage, LoginPage, PageCtx, page};
 use cactup_ecosystem_common::name::Owner;
@@ -50,15 +51,31 @@ pub struct NextQuery {
     next: Option<String>,
 }
 
-/// Only same-site paths may be a post-login destination.
+/// Only a path on this site may be a post-login destination. Anything that, once a browser has
+/// dropped control characters or folded backslashes, could leave the site falls back to the
+/// dashboard.
 fn safe_next(next: Option<&str>) -> String {
-    match next {
-        Some(n) if n.starts_with('/') && !n.starts_with("//") && !n.contains('\\') => n.to_owned(),
-        _ => "/dashboard".into(),
+    let fallback = || "/dashboard".to_owned();
+    let Some(n) = next else { return fallback() };
+    if !n.starts_with('/') || n.chars().any(|c| c.is_control() || c == '\\') || n.starts_with("//") {
+        return fallback();
+    }
+    let base = url::Url::parse("https://cactarium.invalid/").expect("static url");
+    match base.join(n) {
+        Ok(u) if u.origin() == base.origin() && !u.path().starts_with("//") => {
+            let mut out = u.path().to_owned();
+            if let Some(q) = u.query() {
+                out.push('?');
+                out.push_str(q);
+            }
+            out
+        }
+        _ => fallback(),
     }
 }
 
-pub async fn login_page(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<NextQuery>) -> AppResult<Response> {
+pub async fn login_page(State(state): State<AppState>, ip: ClientIp, headers: HeaderMap, Query(q): Query<NextQuery>) -> AppResult<Response> {
+    state.limiter.check("login", ip.0, 30)?;
     let (s, cookie) = ensure_session(&state, &headers).await?;
     let ctx = PageCtx::new(&state, Some(&s));
     let body = page(&LoginPage {
@@ -119,11 +136,13 @@ async fn begin(state: &AppState, headers: &HeaderMap, provider: &str, next: Opti
     Ok(res)
 }
 
-pub async fn github_begin(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<NextQuery>) -> AppResult<Response> {
+pub async fn github_begin(State(state): State<AppState>, ip: ClientIp, headers: HeaderMap, Query(q): Query<NextQuery>) -> AppResult<Response> {
+    state.limiter.check("login", ip.0, 30)?;
     begin(&state, &headers, "github", q.next.as_deref()).await
 }
 
-pub async fn orcid_begin(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<NextQuery>) -> AppResult<Response> {
+pub async fn orcid_begin(State(state): State<AppState>, ip: ClientIp, headers: HeaderMap, Query(q): Query<NextQuery>) -> AppResult<Response> {
+    state.limiter.check("login", ip.0, 30)?;
     begin(&state, &headers, "orcid", q.next.as_deref()).await
 }
 
@@ -312,8 +331,10 @@ async fn finish(state: &AppState, headers: &HeaderMap, s: Session, id: Identity,
 }
 
 async fn sign_in(state: &AppState, _headers: &HeaderMap, old: Session, user_id: i64, id: &Identity, next: &str) -> AppResult<Response> {
-    let who = id.login.as_deref().unwrap_or(&id.subject);
-    if state.cfg.is_superadmin(&id.provider, who) || state.cfg.is_superadmin(&id.provider, &id.subject) {
+    // GitHub logins can be renamed and then claimed by someone else, so GitHub accounts are
+    // matched by their numeric id only; ORCID iDs and dev names are stable.
+    let who = if id.provider == "github" { &id.subject } else { id.login.as_deref().unwrap_or(&id.subject) };
+    if state.cfg.is_superadmin(&id.provider, who) {
         let changed = sqlx::query("UPDATE users SET role = 'superadmin' WHERE id = $1 AND role <> 'superadmin'")
             .bind(user_id)
             .execute(&state.db)
@@ -326,7 +347,7 @@ async fn sign_in(state: &AppState, _headers: &HeaderMap, old: Session, user_id: 
     // Rotate: the pre-login session is dropped and a new token issued.
     destroy_session(state, &old).await?;
     let (_, cookie) = create_session(state, Some(user_id), json!({})).await?;
-    audit(state, Some(user_id), "login", Some(&id.provider), json!({}), None).await?;
+    audit(state, Some(user_id), "login", Some(&id.provider), json!({ "who": who }), None).await?;
     Ok((with_cookie(HeaderMap::new(), cookie), Redirect::to(next)).into_response())
 }
 
@@ -334,8 +355,11 @@ async fn name_available(state: &AppState, name: &str) -> AppResult<bool> {
     if name.parse::<Owner>().is_err() {
         return Ok(false);
     }
+    // A name that already owns entries (curated ones, or transferred ones) belongs to whoever
+    // they were made for, not to the first person to sign up with it.
     let taken: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1) OR EXISTS (SELECT 1 FROM reserved_names WHERE name = $1)",
+        "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1) OR EXISTS (SELECT 1 FROM reserved_names WHERE name = $1)
+            OR EXISTS (SELECT 1 FROM entries WHERE lower(owner) = lower($1))",
     )
     .bind(name)
     .fetch_one(&state.db)
@@ -413,6 +437,24 @@ pub async fn choose_name(State(state): State<AppState>, Visitor(s): Visitor, hea
     }
     let uid = create_user(&state, &name, &id).await?;
     sign_in(&state, &headers, s, uid, &id, &safe_next(Some(&next))).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_next;
+
+    #[test]
+    fn next_stays_on_the_site() {
+        assert_eq!(safe_next(Some("/max/carpetx?tab=thorns")), "/max/carpetx?tab=thorns");
+        assert_eq!(safe_next(Some("/settings")), "/settings");
+        // A percent-encoded tab stays a path on this site; the decoded one (what the query
+        // parameter becomes) is what browsers would drop.
+        assert_eq!(safe_next(Some("/%09/evil.example")), "/%09/evil.example");
+        for bad in ["//evil.example", "/\t/evil.example", "/\\evil.example", "https://evil.example",
+                    "/a\nb", "evil", "/\u{0}x"] {
+            assert_eq!(safe_next(Some(bad)), "/dashboard", "{bad:?}");
+        }
+    }
 }
 
 #[derive(Deserialize)]

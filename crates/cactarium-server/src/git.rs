@@ -24,44 +24,84 @@ pub struct GitPolicy {
     pub allow_local: bool,
 }
 
+/// Addresses the registry must never fetch from: anything not globally routable.
 fn private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
+            let o = v.octets();
             v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast()
-                || v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64 // 100.64/10, shared address space
+                || v.is_multicast() || v.is_documentation()
+                || o[0] == 0                                   // 0/8
+                || o[0] == 100 && (o[1] & 0xc0) == 64          // 100.64/10, shared address space
+                || o[0] == 192 && o[1] == 0 && o[2] == 0       // 192.0.0/24, protocol assignments
+                || o[0] == 198 && (o[1] & 0xfe) == 18          // 198.18/15, benchmarking
+                || o[0] >= 240                                 // 240/4, reserved
         }
         IpAddr::V6(v) => {
-            v.is_loopback() || v.is_unspecified() || (v.segments()[0] & 0xfe00) == 0xfc00 // unique local
-                || (v.segments()[0] & 0xffc0) == 0xfe80 // link local
+            let s = v.segments();
+            v.is_loopback() || v.is_unspecified() || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00                   // unique local
+                || (s[0] & 0xffc0) == 0xfe80                   // link local
+                || s[0] == 0x0064 && s[1] == 0xff9b            // 64:ff9b::/96 and /48, NAT64
+                || s[0] == 0x2001 && s[1] == 0x0db8            // documentation
                 || v.to_ipv4_mapped().is_some_and(|m| private(IpAddr::V4(m)))
+                || v.to_ipv4().is_some_and(|m| private(IpAddr::V4(m)))
         }
     }
 }
 
+/// A repo URL that passed the policy, and the address git must connect to.
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub url: String,
+    /// `host:port:address` for curl's resolve list: git connects to the address that was checked,
+    /// not to whatever the name resolves to a moment later (DNS rebinding).
+    resolve: Option<String>,
+}
+
 /// Checks a repo URL against the policy. Returns it normalized (no trailing slash, no userinfo).
 pub async fn check_url(policy: GitPolicy, raw: &str) -> anyhow::Result<String> {
+    Ok(check(policy, raw).await?.url)
+}
+
+async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
     let url = url::Url::parse(raw.trim()).with_context(|| format!("'{raw}' is not a URL"))?;
     if !url.username().is_empty() || url.password().is_some() {
         bail!("repo URLs must not contain credentials");
     }
     match url.scheme() {
         "https" => {}
-        "file" if policy.allow_local => return Ok(url.to_string()),
+        "file" if policy.allow_local => return Ok(Target { url: url.to_string(), resolve: None }),
         "http" if policy.allow_local => {}
         _ => bail!("repo URLs must be https://"),
     }
     let host = url.host_str().ok_or_else(|| anyhow!("'{raw}' has no host"))?.to_owned();
-    if !policy.allow_local {
-        let port = url.port_or_known_default().unwrap_or(443);
-        let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .with_context(|| format!("cannot resolve '{host}'"))?
-            .collect();
-        if addrs.is_empty() || addrs.iter().any(|a| private(a.ip())) {
-            bail!("'{host}' is not a public host");
-        }
+    let normalized = url.as_str().trim_end_matches('/').to_owned();
+    if policy.allow_local {
+        return Ok(Target { url: normalized, resolve: None });
     }
-    Ok(url.as_str().trim_end_matches('/').to_owned())
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("cannot resolve '{host}'"))?
+        .collect();
+    if addrs.is_empty() || addrs.iter().any(|a| private(a.ip())) {
+        bail!("'{host}' is not a public host");
+    }
+    let ip = match addrs[0].ip() {
+        IpAddr::V4(v) => v.to_string(),
+        IpAddr::V6(v) => format!("[{v}]"),
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    Ok(Target { url: normalized, resolve: Some(format!("{bare}:{port}:{ip}")) })
+}
+
+fn git_to(policy: GitPolicy, home: &Path, target: &Target) -> Command {
+    let mut c = git(policy, home);
+    if let Some(r) = &target.resolve {
+        c.args(["-c", &format!("http.curloptResolve={r}")]);
+    }
+    c
 }
 
 fn git(policy: GitPolicy, home: &Path) -> Command {
@@ -78,7 +118,8 @@ fn git(policy: GitPolicy, home: &Path) -> Command {
         .env("GIT_HTTP_LOW_SPEED_TIME", "30")
         .args(["-c", "protocol.allow=never", "-c", "protocol.https.allow=always"])
         .args(["-c", "core.hooksPath=/dev/null", "-c", "submodule.recurse=false", "-c", "credential.helper="])
-        .args(["-c", "http.followRedirects=initial"])
+        // A redirect could point anywhere, including inside our own network.
+        .args(["-c", "http.followRedirects=false"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -138,18 +179,19 @@ fn parse_ls_remote(out: &str, prefix: &str) -> Vec<RemoteRef> {
 }
 
 pub async fn ls_tags(policy: GitPolicy, url: &str) -> anyhow::Result<Vec<RemoteRef>> {
-    let url = check_url(policy, url).await?;
+    let t = check(policy, url).await?;
     let home = tempfile::tempdir()?;
-    let mut c = git(policy, home.path());
-    c.args(["ls-remote", "--tags", "--", &url]);
+    let mut c = git_to(policy, home.path(), &t);
+    c.args(["ls-remote", "--tags", "--", &t.url]);
     Ok(parse_ls_remote(&run(c, "listing tags").await?, "refs/tags/"))
 }
 
 /// The commit a branch (or tag) currently names, or the default branch's when `git_ref` is None.
 pub async fn resolve_ref(policy: GitPolicy, url: &str, git_ref: Option<&str>) -> anyhow::Result<String> {
-    let url = check_url(policy, url).await?;
+    let t = check(policy, url).await?;
+    let url = t.url.clone();
     let home = tempfile::tempdir()?;
-    let mut c = git(policy, home.path());
+    let mut c = git_to(policy, home.path(), &t);
     c.args(["ls-remote", "--", &url]);
     let out = run(c, "listing refs").await?;
     let want: Vec<String> = match git_ref {
@@ -185,14 +227,15 @@ fn dir_size(p: &Path) -> u64 {
 /// Fetches exactly `commit` (depth 1) and checks it out. Falls back to fetching `via` (a branch or
 /// tag) when the server refuses to serve an unadvertised commit.
 pub async fn checkout(policy: GitPolicy, url: &str, commit: &str, via: Option<&str>) -> anyhow::Result<Checkout> {
-    let url = check_url(policy, url).await?;
+    let t = check(policy, url).await?;
+    let url = t.url.clone();
     let dir = tempfile::tempdir()?;
     let home = dir.path().join("home");
     let path = dir.path().join("src");
     std::fs::create_dir_all(&home)?;
     std::fs::create_dir_all(&path)?;
     let g = |args: &[&str]| {
-        let mut c = git(policy, &home);
+        let mut c = git_to(policy, &home, &t);
         c.current_dir(&path).args(args);
         c
     };
@@ -200,7 +243,14 @@ pub async fn checkout(policy: GitPolicy, url: &str, commit: &str, via: Option<&s
     let direct = run(g(&["fetch", "-q", "--depth", "1", "--no-tags", "--", &url, commit]), "fetching the commit").await;
     if let Err(e) = direct {
         let Some(via) = via else { return Err(e) };
-        run(g(&["fetch", "-q", "--no-tags", "--", &url, via]), "fetching the commit").await?;
+        run(g(&["fetch", "-q", "--depth", "1", "--no-tags", "--", &url, via]), "fetching the commit").await?;
+    }
+    // Refuse before writing the tree out: a small, highly compressed download can expand to
+    // gigabytes on disk.
+    let listing = run(g(&["ls-tree", "-r", "-l", "--", commit]), "listing the tree").await?;
+    let total: u64 = listing.lines().filter_map(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok()).sum();
+    if total > MAX_TREE_BYTES {
+        bail!("the repo is too large to index ({} MB at this commit)", total / (1024 * 1024));
     }
     run(g(&["-c", "advice.detachedHead=false", "checkout", "-q", commit]), "checking out the commit").await?;
     let tree = run(g(&["rev-parse", &format!("{commit}^{{tree}}")]), "reading the tree").await?.trim().to_owned();
@@ -259,7 +309,8 @@ mod tests {
 
     #[test]
     fn private_addresses() {
-        for a in ["10.0.0.1", "127.0.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"] {
+        for a in ["10.0.0.1", "127.0.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "0.1.2.3", "198.18.0.1", "240.0.0.1",
+                  "224.0.0.1", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1", "64:ff9b::a00:1", "ff02::1"] {
             assert!(private(a.parse().unwrap()), "{a}");
         }
         for a in ["140.82.112.3", "2606:50c0:8000::153"] {

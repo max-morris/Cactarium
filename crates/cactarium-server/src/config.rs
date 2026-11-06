@@ -15,8 +15,8 @@ pub struct Config {
     /// The public origin, e.g. `https://cactarium.cct.lsu.edu` or `http://localhost:8000`.
     pub base_url: Url,
     pub bind: String,
-    /// `provider:subject-or-login` identities that are always superadmin, e.g.
-    /// `github:max-morris`, `orcid:0000-0002-1825-0097`, `dev:max`.
+    /// Identities that are always superadmin: `github:<numeric account id>` (a login could be
+    /// renamed and claimed by someone else), `orcid:<iD>`, or `dev:<name>`.
     pub superadmins: Vec<(String, String)>,
     pub github: Option<OAuthApp>,
     pub orcid: Option<OAuthApp>,
@@ -61,6 +61,9 @@ impl Config {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| match s.split_once(':') {
+                Some(("github", id)) if !id.chars().all(|c| c.is_ascii_digit()) => {
+                    bail!("CACTARIUM_SUPERADMIN: give the GitHub account's numeric id, not its login ('{id}'); `gh api users/{id} -q .id` prints it")
+                }
                 Some((p, who)) if ["github", "orcid", "dev"].contains(&p) => {
                     Ok((p.to_owned(), who.to_ascii_lowercase()))
                 }
