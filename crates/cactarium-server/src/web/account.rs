@@ -178,14 +178,26 @@ pub async fn cut_release(state: &AppState, user: &User, definition: &str, thornl
     let stack = m.stack.as_ref().ok_or_else(|| AppError::bad("the definition needs a [stack] section"))?;
     let tv: TrackedVersion = version.trim().parse().map_err(AppError::bad)?;
     let name = stack.name.to_string();
-    let entry = match model::find_entry(state, &user.username, &name).await? {
-        Some(e) if e.kind != "stack" => return Err(AppError::Conflict(format!("{} is a {}, not a stack", e.slug(), e.kind))),
-        Some(e) => {
-            if tracker::repo_of(state, e.id).await?.is_some() {
-                return Err(AppError::bad(format!("{} is released from its repo; push a version tag instead", e.slug())));
-            }
-            e
+    let label = tv.to_string();
+    let existing = model::find_entry(state, &user.username, &name).await?;
+    if let Some(e) = &existing {
+        if e.kind != "stack" {
+            return Err(AppError::Conflict(format!("{} is a {}, not a stack", e.slug(), e.kind)));
         }
+        if tracker::repo_of(state, e.id).await?.is_some() {
+            return Err(AppError::bad(format!("{} is released from its repo; push a version tag instead", e.slug())));
+        }
+        if model::version_by_label(state, e.id, &label).await?.is_some() {
+            return Err(AppError::Conflict(format!("{}@{label} already exists; releases never change", e.slug())));
+        }
+    }
+    // Resolve before anything is created, so a definition that fails leaves no trace.
+    let own = thornlist.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("{t}\n"));
+    let resolution = stacks::resolve(state, stack, own.as_deref(), None).await?;
+    let slug = format!("{}/{name}@{label}", user.username).parse().map_err(AppError::bad)?;
+    let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
+    let entry = match existing {
+        Some(e) => e,
         None => {
             publish::create_entry(
                 state,
@@ -202,14 +214,6 @@ pub async fn cut_release(state: &AppState, user: &User, definition: &str, thornl
             .await?
         }
     };
-    let label = tv.to_string();
-    if model::version_by_label(state, entry.id, &label).await?.is_some() {
-        return Err(AppError::Conflict(format!("{}@{label} already exists; releases never change", entry.slug())));
-    }
-    let own = thornlist.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("{t}\n"));
-    let resolution = stacks::resolve(state, stack, own.as_deref(), None).await?;
-    let slug = format!("{}@{label}", entry.slug()).parse().map_err(AppError::bad)?;
-    let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
     let toml = toml::to_string(&frozen).map_err(anyhow::Error::from)?;
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let manifest_json = serde_json::to_value(&m).map_err(anyhow::Error::from)?;

@@ -191,6 +191,9 @@ clash = ("!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangement
          "!REPO_PATH = $2\n!CHECKOUT = Other/Boundary\n")
 s, text, _ = maxv.post("/new/stack", {"definition": definition.replace("smoke-stack", "clash"), "thornlist": clash, "version": "0.1.0"})
 check("thorn-name collisions are refused", s == 200 and "collide" in text, text[text.find("alert"):][:300])
+page(anon, "/max/clash", expect=404)  # a failed release leaves no entry behind
+text = page(anon, "/max/carpetx")
+check("the newest manifest's default track is shown first", 'pill mono selected" href="/max/carpetx?track=mixed-precision"' in text)
 
 print()
 if FAILED:
