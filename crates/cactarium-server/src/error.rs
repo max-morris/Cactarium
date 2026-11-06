@@ -56,14 +56,7 @@ impl AppError {
                 tracing::error!("internal error: {e:#}");
                 "Something went wrong on our side.".into()
             }
-            other => {
-                let m = other.to_string();
-                let mut c = m.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                    None => m,
-                }
-            }
+            other => capitalize(&other.to_string()),
         }
     }
 }
@@ -80,6 +73,28 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+/// Capitalizes a message, unless it starts with something case-significant: a slug, a path, a
+/// version, a quoted name, an identifier.
+fn capitalize(m: &str) -> String {
+    let first = m.split_whitespace().next().unwrap_or("");
+    let literal = first.contains(['/', '@', ':', '.', '_', '\'', '"', '`']) || first.chars().skip(1).any(|c| c.is_uppercase());
+    let mut c = m.chars();
+    match c.next() {
+        Some(f) if !literal => f.to_uppercase().collect::<String>() + c.as_str(),
+        _ => m.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn slugs_keep_their_case() {
+        assert_eq!(super::capitalize("max/et-lite@1.0.0 already exists"), "max/et-lite@1.0.0 already exists");
+        assert_eq!(super::capitalize("the form expired"), "The form expired");
+        assert_eq!(super::capitalize("'carpetx' is taken"), "'carpetx' is taken");
+    }
+}
 
 /// The API's error: `{"error": "..."}` with the right status.
 #[derive(Debug)]
