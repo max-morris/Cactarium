@@ -75,6 +75,18 @@ fn enable_lines(text: &str, enable: &[String]) -> String {
         + if text.ends_with('\n') { "\n" } else { "" }
 }
 
+/// Thorns written on a `!CHECKOUT` line itself. Cactus reads a CRL list as its ThornList too and
+/// skips every line starting with `!`, so such a thorn would be fetched but never built.
+pub fn thorns_on_checkout_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let (k, v) = l.trim_start().split_once('=')?;
+            (k.trim() == "!CHECKOUT").then_some(v)
+        })
+        .flat_map(|v| v.split_whitespace().filter(|t| t.contains('/')).map(str::to_owned).collect::<Vec<_>>())
+        .collect()
+}
+
 fn checkout_key(c: &Component, root: &str) -> String {
     let joined = crl::lexical_canonicalize(&format!("{}/{}", c.target, c.checkout));
     joined.strip_prefix(&format!("{root}/")).unwrap_or(&joined).to_owned()
@@ -100,6 +112,13 @@ pub async fn resolve(
     // Sources in priority order: (label, text, base pins).
     let mut sources: Vec<(String, String, BTreeMap<String, RepoPin>)> = Vec::new();
     if let Some(t) = own_text {
+        let stuck = thorns_on_checkout_lines(t);
+        if !stuck.is_empty() {
+            return Err(AppError::bad(format!(
+                "put each thorn on its own line after !CHECKOUT = (Cactus skips lines starting with !, so these would never be built): {}",
+                stuck.join(", ")
+            )));
+        }
         sources.push(("the stack's thornlist".into(), t.to_owned(), BTreeMap::new()));
     }
     for base in &section.extends {
@@ -372,6 +391,12 @@ mod tests {
     fn enabling_uncomments_disabled_lines() {
         let t = "!CHECKOUT =\nA/B\n#DISABLED A/C\n  #DISABLED   A/D\n";
         assert_eq!(enable_lines(t, &["A/C".into(), "A/D".into()]), "!CHECKOUT =\nA/B\nA/C\nA/D\n");
+    }
+
+    #[test]
+    fn thorns_on_the_checkout_line_are_found() {
+        let t = "!CHECKOUT = Makefile lib\n!CHECKOUT = A/B C/D\n!CHECKOUT =\nE/F\n";
+        assert_eq!(thorns_on_checkout_lines(t), ["A/B", "C/D"]);
     }
 
     #[test]
