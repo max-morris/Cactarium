@@ -84,8 +84,11 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
         return Err(AppError::bad(format!("[sim] root is '{}' but the thornlist's ROOT is '{}'", sim.sim.root, list.root())));
     }
     let mut warnings = Vec::new();
+    let par = &sim.parfile.text;
+    let comments = cactup_ecosystem_common::par::comment_spans(par);
+    let in_comment = |at: usize| comments.iter().any(|c| c.contains(&at));
     let mut found: BTreeSet<String> = BTreeSet::new();
-    for m in PRIVATE_PATH.find_iter(&sim.parfile.text) {
+    for m in PRIVATE_PATH.find_iter(par).filter(|m| !in_comment(m.start())) {
         found.insert(m.as_str().trim_end_matches('/').to_owned());
     }
     if !found.is_empty() {
@@ -104,10 +107,24 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     if sim.sim.license.is_none() {
         warnings.push("no license: others can view it but may not know whether they can reuse it".into());
     }
-    for k in knob_tokens(&sim.parfile.text) {
-        if !sim.inputs.iter().any(|i| i.knob == k) {
-            warnings.push(format!("the parfile uses @KNOB({k})@ but declares no [[input]] for it"));
+    // Exactly cactup's lexing: comments and @@ escapes are not uses, and a knob with a default in
+    // every use is optional.
+    match cactup_ecosystem_common::par::references(par) {
+        Ok(refs) if sim.parfile.kind == cactup_ecosystem_common::sim::ParfileKind::Par => {
+            for k in refs.knobs.iter().filter(|k| !k.optional) {
+                if !sim.inputs.iter().any(|i| i.knob == k.name) {
+                    warnings.push(format!("the parfile needs @KNOB({})@ but declares no [[input]] for it", k.name));
+                }
+            }
+            for e in refs.env.iter().filter(|e| !e.optional) {
+                warnings.push(format!("the parfile needs the environment variable {} (@ENV({})@), so it is not self-contained", e.name, e.name));
+            }
         }
+        Ok(_) => {}
+        Err(e) if sim.parfile.kind == cactup_ecosystem_common::sim::ParfileKind::Par => {
+            warnings.push(format!("cactup would refuse this parfile at submit time: {e}"));
+        }
+        Err(_) => {}
     }
     let index = SimIndex {
         thorns: list.components().iter().filter(|c| c.checkout.contains('/')).map(|c| c.checkout.clone()).collect(),
@@ -117,11 +134,6 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
         warnings,
     };
     Ok(Checked { sim, index })
-}
-
-fn knob_tokens(par: &str) -> BTreeSet<String> {
-    static KNOB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@KNOB\(([A-Za-z0-9_.-]+)\)@").expect("valid regex"));
-    KNOB.captures_iter(par).map(|c| c[1].to_owned()).collect()
 }
 
 /// Publishes a checked sim as the next version of `user`'s `name` (creating the entry if new).
@@ -234,6 +246,34 @@ commit = "{SHA}"
         let w = c.index.warnings.join("\n");
         assert!(w.contains("/home/mmorris"), "{w}");
         assert!(w.contains("@KNOB(id)@"), "{w}");
+    }
+
+    /// The pretty-bhns false positives: paths and knob syntax mentioned in comments are no use.
+    #[test]
+    fn comments_are_not_uses() {
+        let par = "# results go to /work/me; @KNOB(name)@ is the required form\ny = \"@KNOB-OPTIONAL(mail, none)@\"";
+        let c = check(sim(false, par).as_bytes()).unwrap();
+        let w = c.index.warnings.join("\n");
+        assert!(!w.contains("/work") && !w.contains("KNOB"), "{w}");
+    }
+
+    /// Max's real BHNS parfile documents @KNOB(name)@ and /work in comments; neither is a use.
+    #[test]
+    fn the_real_bhns_parfile_has_no_false_positives() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let path = std::path::Path::new(&home).join("src/pretty-bhns/parfiles/bhns_gw230529_dense_output.par");
+        let Ok(par) = std::fs::read_to_string(path) else { return };
+        let mut parsed = SimFile::from_toml(&sim(false, "x = 1")).unwrap();
+        parsed.parfile.text = par;
+        parsed.inputs.push(cactup_ecosystem_common::sim::Input {
+            knob: "kadath-initial-data".into(),
+            description: None,
+            url: None,
+            sha256: None,
+        });
+        let c = check(parsed.to_toml().unwrap().as_bytes()).unwrap();
+        let w = c.index.warnings.join("\n");
+        assert!(!w.contains("/work") && !w.contains("KNOB") && !w.contains("refuse"), "{w}");
     }
 
     #[test]
