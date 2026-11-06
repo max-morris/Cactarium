@@ -412,8 +412,13 @@ fn pick<'a>(versions: &'a [Version], label: Option<&str>, track: Option<&str>, d
 }
 
 async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry, versions: Vec<Version>, label: Option<&str>, q: EntryQ) -> AppResult<Response> {
-    let newest_manifest: Option<Manifest> =
-        versions.iter().filter(|v| v.usable()).find_map(|v| v.manifest.clone()).and_then(|m| serde_json::from_value(m).ok());
+    // The most recently published manifest decides the default track and the track descriptions.
+    let newest_manifest: Option<Manifest> = versions
+        .iter()
+        .filter(|v| v.usable() && v.manifest.is_some())
+        .max_by_key(|v| v.created_at)
+        .and_then(|v| v.manifest.clone())
+        .and_then(|m| serde_json::from_value(m).ok());
     let default_track = newest_manifest.as_ref().and_then(|m| m.package.as_ref()).and_then(|p| p.default_track.clone());
     let current = pick(&versions, label, q.track.as_deref(), default_track.as_deref())?;
     let manifest: Option<Manifest> = current.and_then(|v| v.manifest.clone()).and_then(|m| serde_json::from_value(m).ok());

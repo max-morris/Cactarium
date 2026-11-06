@@ -25,6 +25,7 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; }
+html { overflow-x: hidden; }
 body { background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 16px; line-height: 1.5; }
 a { color: var(--accent); }
 a:hover { color: var(--ink); }
@@ -42,8 +43,8 @@ p { margin: 0; }
 .small { font-size: 14px; }
 .strong { font-weight: 600; }
 .break { word-break: break-all; }
-.lead { font-size: 18px; color: var(--muted); max-width: 860px; }
-.meta { font-size: 14px; color: var(--muted); }
+.lead { font-size: 18px; color: var(--muted); max-width: 860px; overflow-wrap: anywhere; }
+.meta { font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
 .eyebrow { font-size: 13px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); }
 .h-small { font-size: 15px; font-weight: 600; }
 .h-medium { font-size: 20px; }
@@ -107,7 +108,8 @@ label { font-weight: 500; font-size: 15px; }
 .badge.good { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 .badge.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .command { display: flex; align-items: center; gap: 8px; padding: 8px 8px 8px 14px; background: var(--code); border-radius: var(--radius-sm); }
-.command code { flex: 1 1 auto; overflow-x: auto; white-space: nowrap; font-size: 15px; }
+.command code { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 15px; }
+.split-side .command code { white-space: normal; overflow-wrap: anywhere; font-size: 14px; }
 pre.code { margin: 0; padding: 16px; background: var(--code); border-radius: var(--radius-sm); font-size: 13px; line-height: 1.6; overflow-x: auto; white-space: pre; max-height: 640px; overflow-y: auto; }
 
 /* tables */
