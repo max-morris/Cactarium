@@ -177,6 +177,13 @@ struct Known {
 /// Brings an entry up to date with its repo's tags. Returns how many versions were added.
 pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
+    let banned: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND banned)")
+        .bind(&entry.owner)
+        .fetch_one(&state.db)
+        .await?;
+    if banned || entry.visibility == "hidden" {
+        return Ok(0);
+    }
     let result = sync_inner(state, entry, &repo).await;
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
@@ -325,7 +332,9 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
         let readme_path = pkg.readme.clone().unwrap_or_else(|| "README.md".into());
         p.readme_html = git::read_in(co, &readme_path).ok().flatten().map(|t| markdown::render(&t));
         let allow = pkg.thorns.as_ref();
-        for t in ccl::scan_tree(&co.path) {
+        let root = co.path.clone();
+        let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?;
+        for t in scanned {
             let Some(name) = t.name.clone() else {
                 return Err(AppError::bad("the repo root is itself a thorn; publish it from an arrangement-level repo"));
             };
@@ -350,7 +359,7 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
             Some(path) => Some(git::read_in(co, path).map_err(AppError::bad)?.ok_or_else(|| AppError::bad(format!("'{path}' does not exist at this tag")))?),
             None => None,
         };
-        let resolution = stacks::resolve(state, stack, own.as_deref(), None).await?;
+        let resolution = stacks::resolve(state, &entry.owner, stack, own.as_deref(), None).await?;
         let slug: Slug = format!("{}@{}", entry.slug(), tv).parse().map_err(AppError::bad)?;
         let filename = stack.thornlist.as_deref().and_then(|p| p.rsplit('/').next()).map(str::to_owned).unwrap_or_else(|| format!("{}.th", entry.name));
         let frozen = stacks::freeze(slug, &filename, resolution, Some(text.clone()))?;

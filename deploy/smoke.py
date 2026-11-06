@@ -140,6 +140,35 @@ if sub:
     check("approve", s == 303, s)
     page(anon, "/alice/spacetimex", contains="spacetimex")
 
+# Security regressions (from the review).
+# A stack can't extend someone else's pending stack, and can't tell that it exists.
+alice.get("/new/stack")
+pend = 'format = 1\n\n[stack]\nname = "alice-private"\nextends = ["et/et@2026.5.0"]\n'
+s, _, _ = alice.post("/new/stack", {"definition": pend, "thornlist": "", "version": "1.0.0"})
+check("alice cuts a (pending) stack release", s == 303, s)
+page(anon, "/alice/alice-private", expect=404)
+maxv.get("/new/stack")
+peek = 'format = 1\n\n[stack]\nname = "peek"\nextends = ["alice/alice-private@1.0.0"]\n'
+s, text, _ = maxv.post("/new/stack", {"definition": peek, "thornlist": "", "version": "0.1.0"})
+check("a pending stack is not available as a base", s == 200 and "is not available" in text, s)
+# The post-login destination stays on the site.
+v = Visitor()
+v.get("/auth/login")
+s, _, hdrs = v.post("/auth/dev", {"username": "alice", "next": "/\t/evil.example"})
+check("a tab-smuggled next stays on the site", s == 303 and hdrs.get("location") == "/dashboard", hdrs.get("location"))
+# A name that owns entries cannot be claimed by signing up with it.
+maxv.get("/admin/curated")
+overlay = 'format = 1\n\n[package]\nname = "cb"\nowners = ["orgx"]\narrangement = "CactusBase"\n'
+s, _, _ = maxv.post("/admin/curated", {"owner": "orgx", "url": REPOS + "/cactusbase.git", "manifest": overlay})
+check("an admin creates a curated package under a new owner", s == 303, s)
+v = Visitor()
+v.get("/auth/login")
+s, _, hdrs = v.post("/auth/dev", {"username": "orgx", "next": "/dashboard"})
+check("signing in as that owner must choose another name", hdrs.get("location") == "/auth/choose-name", hdrs.get("location"))
+# The unpinned forms are rate-limited.
+codes = [anon.get("/api/v1/stacks/et/et/releases/head")[0] for _ in range(14)]
+check("@head requests are rate-limited", codes[0] == 200 and codes[-1] == 429, codes)
+
 # Users: trust alice.
 text = page(maxv, "/admin/users")
 uid = re.search(r'<a class="mono strong" href="/alice">alice</a>.*?action="/admin/users/(\d+)"', text, re.S)

@@ -210,6 +210,7 @@ fn make_state(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<AppState> {
         db,
         http: reqwest::Client::builder().timeout(Duration::from_secs(20)).user_agent("cactarium").build()?,
         limiter: Arc::new(security::RateLimiter::default()),
+        definitions: Arc::default(),
         cfg: Arc::new(cfg),
     })
 }
