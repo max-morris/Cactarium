@@ -94,6 +94,13 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
             found.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    let stuck = crate::stacks::thorns_on_checkout_lines(&sim.thornlist.text);
+    if !stuck.is_empty() {
+        warnings.push(format!(
+            "these thorns sit on a !CHECKOUT line, where Cactus never builds them: {}",
+            stuck.join(", ")
+        ));
+    }
     if sim.sim.license.is_none() {
         warnings.push("no license: others can view it but may not know whether they can reuse it".into());
     }
