@@ -1,0 +1,48 @@
+# The Cactarium: the app and its Postgres. The app publishes only on loopback (BIND); in
+# production the host's Apache terminates TLS and proxies to it.
+name: cactarium
+
+services:
+  db:
+    image: postgres:17-trixie
+    environment:
+      POSTGRES_USER: cactarium
+      POSTGRES_DB: cactarium
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cactarium -d cactarium"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: cactarium:local
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://cactarium:${POSTGRES_PASSWORD}@db/cactarium
+    ports:
+      # Never 0.0.0.0: Docker's published ports bypass the host firewall.
+      - "${BIND:-127.0.0.1}:${PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend, front]
+    restart: unless-stopped
+
+networks:
+  # The database is reachable only from the app.
+  backend:
+    internal: true
+  # The app's way out, for fetching authors' repos and OAuth.
+  front: {}
+
+volumes:
+  db-data: {}

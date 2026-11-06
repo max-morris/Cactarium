@@ -1,0 +1,8 @@
+{% for c in claims %}
+<div class="claim"><span class="muted small">{{ c.kind }}</span>
+  <span><a class="mono" href="{{ c.target_url }}">{{ c.target }}</a> <span class="mono">{{ c.range }}</span></span>
+  {% if !c.note.is_empty() %}<span class="muted small">{{ c.note }}</span>{% endif %}
+</div>
+{% else %}
+<p class="muted small">No compatibility claims.</p>
+{% endfor %}

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Upload a sim · Cactarium{% endblock %}
+{% block content %}
+<section class="narrow stack-lg">
+  <h1>Upload a sim</h1>
+  <p class="lead">Make the file with <span class="mono">cactup sim export</span>, or from a loose .th and .par with <span class="mono">cactup sim pack</span>. Or publish from the terminal with <span class="mono">cactup sim publish</span>.</p>
+  {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
+  <form class="card stack" method="post" action="/new/sim" enctype="multipart/form-data">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <label for="simfile">The .sim file (up to 1 MB)</label>
+    <input id="simfile" name="file" type="file" accept=".sim,.toml" required>
+    <label for="simname">Publish as <span class="muted">(defaults to the name inside the file)</span></label>
+    <div class="row"><span class="mono muted">{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}/</span><input id="simname" name="name" class="mono" placeholder="bhns-gw230529-dense"></div>
+    <button class="button" type="submit">Publish</button>
+  </form>
+  <p class="muted small">Only fully specified sims can be published: every repo pinned to a commit, nothing dirty. A new sim is reviewed once; later versions publish right away.</p>
+</section>
+{% endblock %}

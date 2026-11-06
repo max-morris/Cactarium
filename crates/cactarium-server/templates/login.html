@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Cactarium{% endblock %}
+{% block content %}
+<section class="narrow stack-lg">
+  <h1>Sign in</h1>
+  <p class="lead">Browsing and downloading need no account. Sign in to publish packages, stacks and sims.</p>
+  <div class="stack">
+    {% if github %}<a class="button big" href="/auth/github?next={{ next }}">Sign in with GitHub</a>{% endif %}
+    {% if orcid %}<a class="button big ghost" href="/auth/orcid?next={{ next }}">Sign in with ORCID</a>{% endif %}
+    {% if !github && !orcid && !dev_login %}<p class="muted">No sign-in method is configured on this server.</p>{% endif %}
+  </div>
+  {% if dev_login %}
+  <form class="card stack" method="post" action="/auth/dev">
+    <h2>Development sign-in</h2>
+    <p class="muted">Only on a server running on localhost. Signs you in as any name, creating the user if needed.</p>
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label for="du">Name</label>
+    <input id="du" name="username" class="mono" required pattern="[a-z0-9][a-z0-9._-]*" placeholder="max">
+    <button class="button" type="submit">Sign in</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

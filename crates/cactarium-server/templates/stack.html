@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}{{ e.slug }} · Cactarium{% endblock %}
+{% block content %}
+{% include "_entry_head.html" %}
+<div class="split">
+  <div class="split-main stack">
+    <section class="card stack-sm">
+      {% if let Some(v) = version %}
+        <p class="small muted">Release <span class="mono ink">{{ v.label }}</span> · {{ how }} · {{ pins.len() }} repos pinned · {{ v.date }}{% if !v.status.is_empty() %} · <strong>{{ v.status }}</strong>{% endif %}</p>
+        {% call m::copy(install_cmd) %}{% endcall %}
+        <details class="small">
+          <summary>Advanced: unpinned branch tips (not reproducible)</summary>
+          <div class="alert warn stack-sm">
+            <span><strong>@head</strong>: each repo at the tip of the branch this stack names.</span>
+            {% call m::copy(tip_cmd) %}{% endcall %}
+            <span><strong>@master</strong>: every repo at the tip of its default branch, like <span class="mono">cactup install master</span>.</span>
+            {% call m::copy(master_cmd) %}{% endcall %}
+            <span class="small">Two installs a day apart can differ.</span>
+          </div>
+        </details>
+      {% else %}
+        <p class="muted">No releases yet.</p>
+      {% endif %}
+    </section>
+    {% if !extends.is_empty() || !recipe.is_empty() %}
+    <section class="card stack-sm">
+      <h2 class="h-small">Built from</h2>
+      {% for b in extends %}<p>Extends <a class="mono" href="{{ b.1 }}">{{ b.0 }}</a></p>{% endfor %}
+      {% if !recipe.is_empty() %}<details><summary class="small">Definition</summary><pre class="code">{{ recipe }}</pre></details>{% endif %}
+    </section>
+    {% endif %}
+    {% if !diff.is_empty() %}
+    <section class="card stack-sm">
+      <h2 class="h-small">Changed since the previous release</h2>
+      <div class="table-box"><table><thead><tr><th scope="col">Repo</th><th scope="col">From</th><th scope="col">To</th></tr></thead><tbody>
+      {% for d in diff %}<tr><td class="mono">{{ d.repo }}</td><td class="mono">{% if let Some(f) = d.from %}{{ f }}{% else %}(new){% endif %}</td><td class="mono">{% if let Some(t) = d.to %}{{ t }}{% else %}(removed){% endif %}</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
+    {% endif %}
+    <section class="stack-sm">
+      <div class="row-wrap"><h2 class="h-small">Frozen thornlist</h2>{% if let Some(v) = version %}<a class="small" href="{{ e.url }}/{{ v.label }}/download.th">Download .th</a> <a class="small" href="/api/v1/stacks/{{ e.slug }}/releases/{{ v.label }}">JSON</a>{% endif %}</div>
+      <pre class="code">{{ frozen_text }}</pre>
+    </section>
+    <section class="stack-sm">
+      <h2 class="h-small">Pins</h2>
+      {% include "_pins.html" %}
+    </section>
+    <section class="stack-sm">
+      <h2 class="h-small">Releases</h2>
+      {% let rows = releases %}
+      {% include "_versions_table.html" %}
+    </section>
+  </div>
+  <aside class="split-side stack">
+    <section class="card stack-sm">
+      <h2 class="h-small">Claims</h2>
+      {% include "_claims.html" %}
+    </section>
+    <section class="card stack-sm">
+      <h2 class="h-small">Used as a base by</h2>
+      {% for u in used_by %}<a class="mono" href="{{ u.url }}">{{ u.slug }}</a>{% else %}<p class="muted small">Nothing yet.</p>{% endfor %}
+    </section>
+    {% if e.can_manage %}
+    <section class="card stack-sm">
+      <h2 class="h-small">Manage</h2>
+      {% if repo_backed %}
+      <form method="post" action="{{ e.url }}/refresh"><input type="hidden" name="_csrf" value="{{ ctx.csrf }}"><button class="button small ghost" type="submit">Check for new tags now</button></form>
+      {% if !poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ poll_error }}</p>{% endif %}
+      {% else %}
+      <a class="button small" href="/new/stack?name={{ e.slug }}">Cut a release</a>
+      {% endif %}
+    </section>
+    {% endif %}
+  </aside>
+</div>
+{% endblock %}

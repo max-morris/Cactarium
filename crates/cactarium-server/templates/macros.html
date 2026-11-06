@@ -1,0 +1,2 @@
+{% macro badge(text, class) %}<span class="badge {{ class }}">{{ text }}</span>{% endmacro %}
+{% macro copy(cmd) %}<div class="command"><code class="mono">{{ cmd }}</code><button type="button" class="icon-button" data-copy="{{ cmd }}" aria-label="Copy command"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>{% endmacro %}

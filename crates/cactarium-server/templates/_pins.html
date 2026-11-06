@@ -1,0 +1,9 @@
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Repo</th><th scope="col">Ref</th><th scope="col">Commit</th><th scope="col">Cactarium</th></tr></thead>
+  <tbody>
+  {% for p in pins %}
+    <tr><td class="mono" title="{{ p.url }}">{{ p.repo }}</td><td class="mono">{{ p.git_ref }}</td><td class="mono">{{ p.commit }}</td>
+    <td>{% if let Some(r) = p.registered %}<a class="mono" href="{{ r.1 }}">{{ r.0 }}</a>{% else %}<a class="muted small" href="/sources?url={{ p.url|urlencode }}">unregistered source</a>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="4" class="muted">No pins.</td></tr>{% endfor %}
+  </tbody>
+</table></div>

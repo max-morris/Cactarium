@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Users · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<section class="stack">
+  <form class="row-wrap" method="get" action="/admin/users"><label class="sr-only" for="uq">Filter</label><input id="uq" name="q" value="{{ q }}" placeholder="name"><button class="button small" type="submit">Filter</button></form>
+  <div class="table-box"><table>
+    <thead><tr><th scope="col">User</th><th scope="col">Sign-in</th><th scope="col">Role</th><th scope="col">Flags</th><th scope="col">Joined</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+    {% for u in users %}
+    <tr>
+      <td><a class="mono strong" href="/{{ u.username }}">{{ u.username }}</a>{% if u.display != u.username %}<br><span class="small muted">{{ u.display }}</span>{% endif %}</td>
+      <td class="small mono">{{ u.identities }}</td>
+      <td>{{ u.role }}</td>
+      <td>{% if u.trusted %}<span class="badge good">trusted</span>{% endif %}{% if u.banned %}<span class="badge warn">banned</span>{% endif %}</td>
+      <td class="small">{{ u.created }}</td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}" class="row-wrap">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          {% if u.trusted %}<button class="button small ghost" name="action" value="untrust">Untrust</button>{% else %}<button class="button small ghost" name="action" value="trust">Trust</button>{% endif %}
+          {% if u.role != "superadmin" %}
+            {% if u.banned %}<button class="button small ghost" name="action" value="unban">Unban</button>{% else %}<button class="button small ghost" name="action" value="ban">Ban</button>{% endif %}
+            {% if ctx.is_superadmin() %}
+              {% if u.role == "admin" %}<button class="button small ghost" name="action" value="revoke-admin">Revoke admin</button>{% else %}<button class="button small" name="action" value="grant-admin">Make admin</button>{% endif %}
+            {% endif %}
+          {% endif %}
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="small muted">Trusted users publish without review. Only the superadmin can make or revoke admins.</p>
+</section>
+{% endblock %}

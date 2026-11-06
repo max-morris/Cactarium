@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Review · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<div class="split reverse">
+  <section class="split-side stack-sm" aria-label="Queue">
+    <h1 class="h-medium">Review queue</h1>
+    {% for s in open %}
+      <a class="queue-item {% if s.selected %}selected{% endif %}" href="/admin?s={{ s.id }}">
+        <span class="small"><strong class="{% if s.status == "changes-requested" %}warn-text{% else %}good-text{% endif %}">{{ s.status }}</strong> · {{ s.kind }}</span>
+        <span class="mono strong">{{ s.entry }}</span>
+        <span class="small muted">by {{ s.submitter }} · {{ s.when }}</span>
+      </a>
+    {% else %}
+      <p class="muted">Nothing waiting.</p>
+    {% endfor %}
+    <p class="small muted">Trusted users skip this queue; their submissions are recorded as auto-approved.</p>
+  </section>
+  <section class="split-main stack" aria-label="Review">
+  {% if let Some(r) = review %}
+    <div class="stack-sm">
+      <span class="eyebrow">{{ r.kind }} · {{ r.status }}</span>
+      <h2 class="mono"><a href="{{ r.entry_url }}">{{ r.entry }}</a></h2>
+      {% if !r.summary.is_empty() %}<p class="lead">{{ r.summary }}</p>{% endif %}
+      <p class="small muted">Submitted by <span class="mono">{{ r.submitter }}</span>{% if r.submitter_trusted %} (trusted){% endif %}</p>
+    </div>
+    <div class="split">
+      <div class="split-main stack">
+        {% for w in r.warnings %}<p class="alert warn small">{{ w }}</p>{% endfor %}
+        {% if !r.versions.is_empty() %}
+        <div class="table-box"><table><thead><tr><th scope="col">Version</th><th scope="col">Commit</th><th scope="col">Status</th></tr></thead><tbody>
+        {% for v in r.versions %}<tr><td class="mono"><a href="{{ v.url }}">{{ v.label }}</a></td><td class="mono">{{ v.commit }}</td><td class="muted small">{{ v.status }}</td></tr>{% endfor %}
+        </tbody></table></div>
+        {% endif %}
+        {% if !r.thorns.is_empty() %}
+        <div class="table-box"><table><thead><tr><th scope="col">Thorn</th><th scope="col">Implements</th><th scope="col">Requires</th></tr></thead><tbody>
+        {% for t in r.thorns %}<tr><td class="mono">{{ t.name }}</td><td class="mono">{{ t.implements }}</td><td class="muted small">{{ t.requires }}</td></tr>{% endfor %}
+        </tbody></table></div>
+        {% endif %}
+        {% if !r.claims.is_empty() %}<div class="card stack-sm">{% let claims = r.claims.clone() %}{% include "_claims.html" %}</div>{% endif %}
+        {% if !r.detail.is_empty() %}<pre class="code">{{ r.detail }}</pre>{% endif %}
+        {% if !r.readme_html.is_empty() %}<article class="card prose">{{ r.readme_html|safe }}</article>{% endif %}
+      </div>
+      <form class="split-side card stack-sm" method="post" action="/admin/review/{{ r.id }}">
+        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+        <h3 class="h-small">Checklist</h3>
+        {% for c in r.checklist %}
+          <label class="check"><input type="checkbox" name="check_{{ c.0 }}" {% if c.2 %}checked{% endif %}> <span>{{ c.1 }}</span></label>
+        {% endfor %}
+        <label for="note">Note to the submitter</label>
+        <textarea id="note" name="note" rows="4">{{ r.note }}</textarea>
+        <button class="button" name="decision" value="approve" type="submit">Approve and publish</button>
+        <button class="button ghost" name="decision" value="changes" type="submit">Request changes</button>
+        <button class="button danger" name="decision" value="reject" type="submit">Reject</button>
+        {% if !r.submitter_trusted %}
+        <label class="check small"><input type="checkbox" name="trust_submitter"> <span>Also mark <strong>{{ r.submitter }}</strong> as trusted (future submissions publish without review)</span></label>
+        {% endif %}
+      </form>
+    </div>
+  {% else %}
+    <p class="muted">Pick a submission.</p>
+  {% endif %}
+  </section>
+</div>
+{% endblock %}

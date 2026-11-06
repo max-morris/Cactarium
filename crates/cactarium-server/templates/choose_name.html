@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Choose your name · Cactarium{% endblock %}
+{% block content %}
+<section class="narrow stack-lg">
+  <h1>Choose your Cactarium name</h1>
+  <p class="lead">Everything you publish lives under it: <span class="mono">name/package</span>. Lowercase letters, digits, <span class="mono">.</span> <span class="mono">_</span> <span class="mono">-</span>.</p>
+  {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
+  <form class="card stack" method="post" action="/auth/choose-name">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <label for="un">Name</label>
+    <input id="un" name="username" class="mono" value="{{ suggestion }}" required>
+    <button class="button" type="submit">Continue</button>
+  </form>
+  <p class="muted">Signing in with {{ provider }}.</p>
+</section>
+{% endblock %}

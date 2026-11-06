@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ owner }} · Cactarium{% endblock %}
+{% block content %}
+<section class="stack-lg">
+  <div class="stack-sm">
+    <span class="eyebrow">Owner</span>
+    <h1 class="mono">{{ owner }}</h1>
+    {% if display != owner %}<p class="lead">{{ display }}</p>{% endif %}
+  </div>
+  {% let rows = entries %}
+  {% include "_entry_table.html" %}
+</section>
+{% endblock %}

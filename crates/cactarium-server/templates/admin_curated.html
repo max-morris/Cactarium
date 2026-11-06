@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Curated · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<section class="stack-lg">
+  <p class="muted">Curated packages cover repos whose authors have not published them: the manifest lives here, and admins name versions by commit. For curated <em>stacks</em>, keep a manifest repo of our own (e.g. <span class="mono">cactarium/carpetx-stack</span>) and register it like any repo.</p>
+  {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
+  <form class="card stack-sm" method="post" action="/admin/curated">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <h2 class="h-small">New curated package</h2>
+    <label for="co">Owner namespace</label><input id="co" name="owner" class="mono" value="cactarium" required>
+    <label for="cu">Repo URL</label><input id="cu" name="url" class="mono" placeholder="https://github.com/EinsteinToolkit/CarpetX" required>
+    <label for="cm">Overlay manifest (cactarium.toml)</label>
+    <textarea id="cm" name="manifest" class="mono" rows="10" spellcheck="false" required>format = 1
+
+[package]
+name = ""
+owners = ["cactarium"]
+description = ""</textarea>
+    <button class="button" type="submit">Create</button>
+  </form>
+  {% for e in curated %}
+  <div class="card stack-sm">
+    <a class="mono strong" href="{{ e.url }}">{{ e.slug }}</a>
+    <p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span> ({{ v.commit }}){% if !loop.last %} · {% endif %}{% else %}No versions yet.{% endfor %}</p>
+    <form method="post" action="/admin/curated/{{ e.id }}/version" class="row-wrap">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label class="sr-only" for="vl{{ e.id }}">Version</label><input id="vl{{ e.id }}" name="version" class="mono small-input" placeholder="1.0.0" required>
+      <label class="sr-only" for="vc{{ e.id }}">Commit</label><input id="vc{{ e.id }}" name="commit" class="mono" placeholder="full commit id" required>
+      <button class="button small" type="submit">Add version</button>
+    </form>
+  </div>
+  {% endfor %}
+</section>
+{% endblock %}
