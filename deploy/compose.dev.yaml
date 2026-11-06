@@ -8,5 +8,7 @@ services:
       CACTARIUM_POLL_SECONDS: "60"
       CACTARIUM_SUPERADMIN: ${CACTARIUM_SUPERADMIN:-dev:max}
     volumes:
-      - ./demo/repos:/repos:ro
+      # The demo repos sit at the same absolute path inside and outside the container, so their
+      # file:// URLs work for the server and for a cactup on the host alike.
+      - ./demo/repos:${DEMO_REPOS:-/repos}:ro
       - ./demo/files:/demo:ro
