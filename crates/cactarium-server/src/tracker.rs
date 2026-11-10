@@ -15,6 +15,7 @@ use cactup_ecosystem_common::stack::FrozenStack;
 use cactup_ecosystem_common::version::TrackedVersion;
 use serde_json::json;
 
+use cactup_ecosystem_common::version::TagPattern;
 use crate::audit::audit;
 use crate::auth::{User, random_token};
 use crate::error::{AppError, AppResult};
@@ -32,12 +33,80 @@ fn policy(state: &AppState) -> GitPolicy {
     GitPolicy { allow_local: state.cfg.allow_local_repos }
 }
 
-fn version_tags(refs: Vec<RemoteRef>) -> Vec<(RemoteRef, TrackedVersion)> {
-    let mut v: Vec<_> = refs
-        .into_iter()
-        .filter_map(|r| TrackedVersion::from_tag(&r.name).map(|t| (r, t)))
-        .collect();
+/// How a repo's tags become versions: its manifest's `tag-pattern` if it has one, else `vX.Y.Z`
+/// and `track/vX.Y.Z`; tags below its `since` are left out. The current rule is kept with the repo
+/// (`entry_repos.tag_pattern`, `min_version`) so polling needn't read the manifest first; it is
+/// refreshed from the manifest at registration, after each new version, on a curated update and
+/// on a hand-over.
+#[derive(Default)]
+pub struct TagRule {
+    pattern: Option<TagPattern>,
+    since: Option<semver::Version>,
+}
+
+impl TagRule {
+    pub fn of_manifest(m: &Manifest) -> TagRule {
+        let (pattern, since) = match (&m.package, &m.stack) {
+            (Some(p), _) => (p.tag_pattern.as_deref(), p.since.clone()),
+            (_, Some(s)) => (s.tag_pattern.as_deref(), s.since.clone()),
+            _ => (None, None),
+        };
+        // The manifest was validated, so the pattern parses.
+        TagRule { pattern: pattern.and_then(|p| p.parse().ok()), since }
+    }
+
+    fn of(repo: &RepoRow) -> AppResult<TagRule> {
+        Ok(TagRule {
+            pattern: repo.tag_pattern.as_deref().map(str::parse).transpose().map_err(AppError::bad)?,
+            since: repo
+                .min_version
+                .as_deref()
+                .map(semver::Version::parse)
+                .transpose()
+                .map_err(AppError::bad)?,
+        })
+    }
+
+    fn stored(&self) -> (Option<String>, Option<String>) {
+        (
+            self.pattern.as_ref().map(|p| p.as_str().to_owned()),
+            self.since.as_ref().map(ToString::to_string),
+        )
+    }
+
+    fn version(&self, tag: &str) -> Option<TrackedVersion> {
+        let tv = match &self.pattern {
+            Some(p) => p.version(tag)?,
+            None => TrackedVersion::from_tag(tag)?,
+        };
+        self.since.as_ref().is_none_or(|s| tv.version >= *s).then_some(tv)
+    }
+
+    fn describe(&self) -> String {
+        match &self.pattern {
+            Some(p) => format!("tags matching {}", p.as_str()),
+            None => "version tags (vX.Y.Z or track/vX.Y.Z)".to_owned(),
+        }
+    }
+}
+
+/// Keeps the repo's tag rule in step with a manifest.
+async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResult<()> {
+    let (pattern, since) = rule.stored();
+    sqlx::query("UPDATE entry_repos SET tag_pattern = $2, min_version = $3 WHERE entry_id = $1")
+        .bind(entry_id)
+        .bind(pattern)
+        .bind(since)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+fn version_tags(refs: Vec<RemoteRef>, rule: &TagRule) -> Vec<(RemoteRef, TrackedVersion)> {
+    let mut v: Vec<_> = refs.into_iter().filter_map(|r| rule.version(&r.name).map(|t| (r, t))).collect();
     v.sort_by(|a, b| (&a.1.track, &a.1.version).cmp(&(&b.1.track, &b.1.version)));
+    // Two tags naming one version: the first wins.
+    v.dedup_by(|b, a| a.1 == b.1);
     v
 }
 
@@ -46,38 +115,52 @@ pub struct Found {
     pub url: String,
     pub tag: String,
     pub manifests: Vec<(&'static str, Manifest)>,
+    /// How its tags become versions, from the manifest on its default branch.
+    pub rule: TagRule,
 }
 
-/// Looks at a repo before registering it: its newest version tag and the manifests there.
+fn read_manifests(co: &git::Checkout, at: &str) -> AppResult<Vec<(&'static str, Manifest)>> {
+    let mut manifests = Vec::new();
+    for file in [PACKAGE_FILE, STACK_FILE] {
+        if let Some(text) = git::read_in(co, file).map_err(AppError::bad)? {
+            let m = Manifest::from_repo_file(file, &text)
+                .map_err(|e| AppError::bad(format!("{file} at {at}: {e}")))?;
+            manifests.push((file, m));
+        }
+    }
+    Ok(manifests)
+}
+
+/// Looks at a repo before registering it: how its tags become versions (the default branch's
+/// manifest may give a tag pattern), its newest version tag, and the manifests there.
 pub async fn inspect(state: &AppState, url: &str) -> AppResult<Found> {
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
+    let head = git::resolve_ref(policy(state), &url, None).await.map_err(AppError::bad)?;
+    let at_head = git::checkout(policy(state), &url, &head, None).await.map_err(AppError::bad)?;
+    let rule = read_manifests(&at_head, "the default branch")?
+        .first()
+        .map(|(_, m)| TagRule::of_manifest(m))
+        .unwrap_or_default();
     let refs = git::ls_tags(policy(state), &url).await.map_err(AppError::bad)?;
-    let tags = version_tags(refs);
+    let tags = version_tags(refs, &rule);
     // Newest on the default track, else newest of any track.
     let newest = tags
         .iter()
         .filter(|(_, t)| t.track.is_none())
         .max_by(|a, b| a.1.version.cmp(&b.1.version))
         .or_else(|| tags.iter().max_by(|a, b| a.1.version.cmp(&b.1.version)))
-        .ok_or_else(|| AppError::bad("the repo has no version tags (vX.Y.Z or track/vX.Y.Z)"))?;
+        .ok_or_else(|| AppError::bad(format!("the repo has no {} yet", rule.describe())))?;
     let co = git::checkout(policy(state), &url, &newest.0.commit, Some(&newest.0.name))
         .await
         .map_err(AppError::bad)?;
-    let mut manifests = Vec::new();
-    for file in [PACKAGE_FILE, STACK_FILE] {
-        if let Some(text) = git::read_in(&co, file).map_err(AppError::bad)? {
-            let m = Manifest::from_repo_file(file, &text)
-                .map_err(|e| AppError::bad(format!("{file} at {}: {e}", newest.0.name)))?;
-            manifests.push((file, m));
-        }
-    }
+    let manifests = read_manifests(&co, &newest.0.name)?;
     if manifests.is_empty() {
         return Err(AppError::bad(format!(
             "no {PACKAGE_FILE} or {STACK_FILE} at {} (the newest version tag)",
             newest.0.name
         )));
     }
-    Ok(Found { url, tag: newest.0.name.clone(), manifests })
+    Ok(Found { url, tag: newest.0.name.clone(), manifests, rule })
 }
 
 fn owners_of(m: &Manifest) -> Vec<String> {
@@ -148,7 +231,7 @@ pub async fn register(
             },
         )
         .await?;
-        attach_repo(state, &entry, &found.url, file, None).await?;
+        attach_repo(state, &entry, &found.url, file, None, &found.rule).await?;
         entries.push(entry);
     }
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
@@ -159,7 +242,8 @@ pub async fn register(
 }
 
 /// Admin-only: a package for a repo nobody on the Cactarium controls, with an overlay manifest
-/// kept here instead of in the repo.
+/// kept here instead of in the repo. Its `tag-pattern` and `since` say which upstream tags are
+/// versions.
 pub async fn register_curated(
     state: &AppState,
     admin: &User,
@@ -182,11 +266,104 @@ pub async fn register_curated(
         },
     )
     .await?;
-    attach_repo(state, &entry, &url, PACKAGE_FILE, Some(overlay)).await?;
+    attach_repo(state, &entry, &url, PACKAGE_FILE, Some(overlay), &TagRule::of_manifest(&m)).await?;
     // The admin vouches for the tags that exist now; later upstream tags are reviewed unless the
     // entry or its owner is trusted. A failure is kept as the repo's poll error.
     let _ = sync_as(state, &entry, Some(admin)).await;
     Ok(entry)
+}
+
+/// Admin-only: replaces a curated package's repo URL and overlay manifest (and so its tag rule),
+/// then syncs. Versions already published stay as they are.
+pub async fn update_curated(
+    state: &AppState,
+    admin: &User,
+    entry: &Entry,
+    url: &str,
+    overlay: &str,
+) -> AppResult<usize> {
+    if !entry.curated {
+        return Err(AppError::bad(format!(
+            "{} is not curated (it uses its repo's manifest)",
+            entry.slug()
+        )));
+    }
+    let m = Manifest::from_repo_file(PACKAGE_FILE, overlay).map_err(AppError::bad)?;
+    if name_of(&m) != entry.name {
+        return Err(AppError::bad(format!(
+            "the manifest names '{}', not '{}'",
+            name_of(&m),
+            entry.name
+        )));
+    }
+    let (pattern, since) = TagRule::of_manifest(&m).stored();
+    let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
+    sqlx::query("UPDATE entry_repos SET url = $2, overlay_manifest = $3, tag_pattern = $4, min_version = $5 WHERE entry_id = $1")
+        .bind(entry.id)
+        .bind(&url)
+        .bind(overlay)
+        .bind(&pattern)
+        .bind(&since)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("UPDATE entries SET summary = COALESCE($2, summary) WHERE id = $1")
+        .bind(entry.id)
+        .bind(summary_of(&m))
+        .execute(&state.db)
+        .await?;
+    audit(
+        state,
+        Some(admin.id),
+        "curated.update",
+        Some(&entry.slug()),
+        json!({ "url": url, "tag_pattern": pattern, "since": since }),
+        None,
+    )
+    .await?;
+    sync_as(state, entry, Some(admin)).await
+}
+
+/// Admin-only: a curated package whose repo now carries its own cactarium.toml (on its default
+/// branch, naming the entry's owner) stops using the overlay. Its name and versions stay; its tag
+/// rule becomes the repo manifest's.
+pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResult<()> {
+    let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
+    if !entry.curated || repo.overlay_manifest.is_none() {
+        return Err(AppError::bad(format!("{} already uses its repo's manifest", entry.slug())));
+    }
+    let head = git::resolve_ref(policy(state), &repo.url, None).await.map_err(AppError::bad)?;
+    let co = git::checkout(policy(state), &repo.url, &head, None)
+        .await
+        .map_err(AppError::bad)?;
+    let text = git::read_in(&co, PACKAGE_FILE)
+        .map_err(AppError::bad)?
+        .ok_or_else(|| AppError::bad(format!("the repo's default branch has no {PACKAGE_FILE} yet")))?;
+    let m = Manifest::from_repo_file(PACKAGE_FILE, &text).map_err(AppError::bad)?;
+    if name_of(&m) != entry.name {
+        return Err(AppError::bad(format!(
+            "the repo's {PACKAGE_FILE} names '{}', not '{}'",
+            name_of(&m),
+            entry.name
+        )));
+    }
+    if !owners_of(&m).contains(&entry.owner) {
+        return Err(AppError::bad(format!(
+            "the repo's {PACKAGE_FILE} doesn't list '{}' in owners",
+            entry.owner
+        )));
+    }
+    sqlx::query("UPDATE entry_repos SET overlay_manifest = NULL WHERE entry_id = $1")
+        .bind(entry.id)
+        .execute(&state.db)
+        .await?;
+    // From now on the repo's own manifest says how its tags become versions.
+    store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
+    sqlx::query("UPDATE entries SET curated = FALSE, updated_at = now() WHERE id = $1")
+        .bind(entry.id)
+        .execute(&state.db)
+        .await?;
+    audit(state, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
+        .await
 }
 
 async fn attach_repo(
@@ -195,13 +372,17 @@ async fn attach_repo(
     url: &str,
     file: &str,
     overlay: Option<&str>,
+    rule: &TagRule,
 ) -> AppResult<()> {
-    sqlx::query("INSERT INTO entry_repos (entry_id, url, manifest_file, webhook_secret, overlay_manifest) VALUES ($1, $2, $3, $4, $5)")
+    let (pattern, since) = rule.stored();
+    sqlx::query("INSERT INTO entry_repos (entry_id, url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version) VALUES ($1, $2, $3, $4, $5, $6, $7)")
         .bind(entry.id)
         .bind(url)
         .bind(file)
         .bind(random_token())
         .bind(overlay)
+        .bind(pattern)
+        .bind(since)
         .execute(&state.db)
         .await?;
     Ok(())
@@ -213,11 +394,13 @@ pub struct RepoRow {
     pub manifest_file: String,
     pub webhook_secret: String,
     pub overlay_manifest: Option<String>,
+    pub tag_pattern: Option<String>,
+    pub min_version: Option<String>,
 }
 
 pub async fn repo_of(state: &AppState, entry_id: i64) -> AppResult<Option<RepoRow>> {
     Ok(sqlx::query_as::<_, RepoRow>(
-        "SELECT url, manifest_file, webhook_secret, overlay_manifest FROM entry_repos WHERE entry_id = $1",
+        "SELECT url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version FROM entry_repos WHERE entry_id = $1",
     )
     .bind(entry_id)
     .fetch_optional(&state.db)
@@ -297,7 +480,7 @@ async fn sync_inner(
     }
 
     let mut added = 0;
-    for (r, tv) in version_tags(refs) {
+    for (r, tv) in version_tags(refs, &TagRule::of(repo)?) {
         if by_tag.contains_key(r.name.as_str()) {
             continue;
         }
@@ -309,6 +492,18 @@ async fn sync_inner(
     }
     if added > 0 {
         publish::touch(state, entry.id).await?;
+        // The newest version's manifest says how later tags become versions.
+        let newest: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND state <> 'invalid'
+             ORDER BY (track = '') DESC, sort_key DESC LIMIT 1",
+        )
+        .bind(entry.id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+        if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
+            store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
+        }
     }
     Ok(added)
 }
@@ -484,12 +679,19 @@ async fn prepare(
             .await
             .map_err(anyhow::Error::from)?;
         for t in scanned {
-            let Some(name) = t.name.clone() else {
-                return Err(AppError::bad(
-                    "the repo root is itself a thorn; publish it from an arrangement-level repo",
-                ));
+            // A repo that is one thorn (the Einstein Toolkit's ExternalLibraries-* repos) names it,
+            // and its arrangement, in the manifest.
+            let (name, dir) = match (t.name.clone(), allow.map(Vec::as_slice), &pkg.arrangement) {
+                (Some(n), _, _) => (n, t.dir.to_string_lossy().into_owned()),
+                (None, Some([one]), Some(_)) => (one.clone(), ".".to_owned()),
+                (None, _, _) => {
+                    return Err(AppError::bad(
+                        "the repo root is itself a thorn: name it and its arrangement in the manifest \
+                         ([package] arrangement = \"ExternalLibraries\", thorns = [\"HDF5\"])",
+                    ));
+                }
             };
-            if allow.is_some_and(|a| !a.contains(&name)) {
+            if t.name.is_some() && allow.is_some_and(|a| !a.contains(&name)) {
                 continue;
             }
             let arrangement = match (&t.arrangement, &pkg.arrangement) {
@@ -501,8 +703,7 @@ async fn prepare(
                     ));
                 }
             };
-            p.thorns
-                .push((arrangement, name, t.dir.to_string_lossy().into_owned(), t.facts));
+            p.thorns.push((arrangement, name, dir, t.facts));
         }
         if p.thorns.is_empty() {
             return Err(AppError::bad("no thorns found (directories with an interface.ccl)"));

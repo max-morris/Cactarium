@@ -485,6 +485,8 @@ pub struct AdminEntryRow {
     pub verified: bool,
     pub trusted: bool,
     pub curated: bool,
+    /// How a curated package's upstream tags become versions; empty otherwise.
+    pub tag_rule: String,
     pub versions: Vec<VersionRow>,
 }
 

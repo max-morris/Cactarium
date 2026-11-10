@@ -322,6 +322,19 @@ async fn admin_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<Admi
             verified: e.verified,
             trusted: e.trusted,
             curated: e.curated,
+            tag_rule: match tracker::repo_of(state, e.id).await? {
+                Some(r) if e.curated => {
+                    let mut parts = vec![match &r.tag_pattern {
+                        Some(p) => format!("versions from tags matching {p}"),
+                        None => "versions from vX.Y.Z tags and by commit".to_owned(),
+                    }];
+                    if let Some(s) = &r.min_version {
+                        parts.push(format!("from {s} on"));
+                    }
+                    parts.join(", ")
+                }
+                _ => String::new(),
+            },
             versions: versions.iter().take(12).map(|v| version_row(&e, v, None)).collect(),
         });
     }
@@ -428,6 +441,33 @@ pub struct CuratedForm {
     owner: String,
     url: String,
     manifest: String,
+    #[serde(rename = "_csrf")]
+    csrf: String,
+}
+
+/// Hands a curated package over to the cactarium.toml its repo now carries.
+pub async fn hand_over(
+    State(state): State<AppState>,
+    a: Admin,
+    Path(id): Path<i64>,
+    Form(f): Form<CsrfOnly>,
+) -> AppResult<Response> {
+    a.0.session.check_csrf(&f.csrf)?;
+    let e = model::entry_by_id(&state, id).await?;
+    match tracker::hand_over(&state, &a.0.user, &e).await {
+        Ok(()) => {
+            let _ = tracker::sync(&state, &model::entry_by_id(&state, id).await?).await;
+            Ok(Redirect::to("/admin/curated").into_response())
+        }
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+            curated_page(&state, &a, Some(format!("{}: {m}", e.slug()))).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CsrfOnly {
     #[serde(rename = "_csrf")]
     csrf: String,
 }

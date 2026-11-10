@@ -4,7 +4,7 @@
 {% block content %}
 {% include "_admin_nav.html" %}
 <section class="stack-lg">
-  <p class="muted">Curated packages cover repos whose authors have not published them: the manifest lives here, and admins name versions by commit. For curated <em>stacks</em>, keep a manifest repo of our own (e.g. <span class="mono">cactarium/carpetx-stack</span>) and register it like any repo.</p>
+  <p class="muted">Curated packages cover repos whose maintainers have not committed a <span class="mono">cactarium.toml</span>: the manifest lives here instead. Versions come from upstream tags (<span class="mono">vX.Y.Z</span>, or the manifest's <span class="mono">tag-pattern</span> such as <span class="mono">ET_{major}_{minor}_v{patch}</span>, from its <span class="mono">since</span> on) or are named by commit below. Many at once: <span class="mono">just curate &lt;admin&gt; curate.toml</span>. Once a repo carries its own <span class="mono">cactarium.toml</span> (same name, the owner in <span class="mono">owners</span>), <em>Use the repo's manifest</em> hands the package over; its name and versions stay. For curated <em>stacks</em>, keep a manifest repo of our own and register it like any repo.</p>
   {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
   <form class="card stack-sm" method="post" action="/admin/curated">
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
@@ -17,12 +17,21 @@
 [package]
 name = ""
 owners = ["cactarium"]
-description = ""</textarea>
+description = ""
+# tag-pattern = "ET_{major}_{minor}_v{patch}"   # for release tags that aren't vX.Y.Z
+# since = "2026.5.0"                            # ignore older tags</textarea>
     <button class="button" type="submit">Create</button>
   </form>
   {% for e in curated %}
   <div class="card stack-sm">
-    <a class="mono strong" href="{{ e.url }}">{{ e.slug }}</a>
+    <div class="row-wrap between">
+      <a class="mono strong" href="{{ e.url }}">{{ e.slug }}</a>
+      <form method="post" action="/admin/curated/{{ e.id }}/hand-over">
+        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+        <button class="button small ghost" type="submit" title="The repo now carries its own cactarium.toml">Use the repo's manifest</button>
+      </form>
+    </div>
+    {% if !e.tag_rule.is_empty() %}<p class="small">{{ e.tag_rule }}</p>{% endif %}
     <p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span> ({{ v.commit }}){% if !loop.last %} · {% endif %}{% else %}No versions yet.{% endfor %}</p>
     <form method="post" action="/admin/curated/{{ e.id }}/version" class="row-wrap">
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">

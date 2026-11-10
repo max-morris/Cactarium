@@ -6,6 +6,7 @@
 mod audit;
 mod auth;
 mod config;
+mod curate;
 mod error;
 mod git;
 mod markdown;
@@ -57,6 +58,9 @@ enum Command {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
+    /// as the given admin.
+    Curate { username: String, file: std::path::PathBuf },
     /// Publish a .sim file on behalf of a user.
     PublishSim {
         username: String,
@@ -224,6 +228,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Curate { username, file } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            curate::run(&state, &user, &file).await
         }
         Command::Sync { slug } => {
             let state = make_state(cfg, db)?;

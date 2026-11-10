@@ -182,9 +182,15 @@ pub async fn resolve(
         .ok_or(AppError::NotFound)?
     } else {
         let req = slug.req().map_err(AppError::bad)?;
+        // An exact request (`=1.2.3`) still reaches a yanked version, which the response marks
+        // `yanked`; a range never chooses one.
+        let exact = req.req.comparators.len() == 1 && {
+            let c = &req.req.comparators[0];
+            c.op == semver::Op::Exact && c.minor.is_some() && c.patch.is_some()
+        };
         versions
             .iter()
-            .filter(|v| v.usable())
+            .filter(|v| v.usable() || (exact && v.yanked && v.approved() && v.state != "invalid"))
             .filter_map(|v| model::tracked(v).map(|t| (t, v)))
             .filter(|(t, _)| req.matches(t))
             .max_by(|a, b| a.0.version.cmp(&b.0.version))

@@ -272,6 +272,9 @@ if vid:
     check("yank", s == 303, s)
     s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@^1")
     check("resolve skips the yanked version", s == 200 and json.loads(body)["slug"] != "max/carpetx@1.1.0", body[:200])
+    s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@%3D1.1.0")
+    check("an exact request still reaches it, marked yanked",
+          s == 200 and json.loads(body)["slug"] == "max/carpetx@1.1.0" and '"yanked":true' in body, body[:300])
     maxv.get("/max/carpetx?tab=versions")
     s, _, _ = maxv.post("/max/carpetx/yank", {"version_id": vid.group(1), "yank": "0"})
     check("unyank", s == 303, s)
@@ -488,6 +491,88 @@ maxv.get("/admin/site")
 maxv.post("/admin/site", {"trust_granted_by": "superadmin"})
 maxv.get("/admin/users")
 maxv.post(f"/admin/users/{aid}", {"action": "revoke-admin"})
+
+# Curated packages in bulk: a repo that is one thorn, versions from a tag pattern, a version by
+# commit, then a hand-over once the repo carries its own cactarium.toml.
+import os, tempfile
+work = tempfile.mkdtemp()
+lib = os.path.join(work, "fakelib")
+os.makedirs(lib)
+def sh(*args, cwd=lib):
+    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+sh("git", "init", "-q", "-b", "master")
+for f, t in [("interface.ccl", "IMPLEMENTS: FakeLib\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n"), ("configuration.ccl", "PROVIDES FakeLib\n{\n}\n")]:
+    open(os.path.join(lib, f), "w").write(t)
+ident = ["-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid"]
+sh("git", "add", "-A"); sh("git", *ident, "commit", "-q", "-m", "FakeLib"); sh("git", "tag", "XT_2025_11_v0")
+open(os.path.join(lib, "README.md"), "w").write("FakeLib\n")
+sh("git", "add", "-A"); sh("git", *ident, "commit", "-q", "-m", "2026.05"); sh("git", "tag", "XT_2026_05_v0"); sh("git", "tag", "v9.9.9")
+bare = ENV["DEMO_REPOS"] + "/fakelib.git"
+subprocess.run(["rm", "-rf", bare], check=True)
+sh("git", "clone", "-q", "--bare", lib, bare, cwd=work)
+cdir = os.path.join(work, "curated")
+os.makedirs(os.path.join(cdir, "manifests"))
+open(os.path.join(cdir, "manifests", "fakelib.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "fakelib"\nowners = ["et"]\ndescription = "A one-thorn library repo"\n'
+    'arrangement = "ExternalLibraries"\nthorns = ["FakeLib"]\ntag-pattern = "XT_{major}_{minor}_v{patch}"\nsince = "2026.5.0"\n')
+open(os.path.join(cdir, "manifests", "cbase.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "cbase"\nowners = ["et"]\ndescription = "CactusBase, by commit"\narrangement = "CactusBase"\n')
+cb_head = git("cactusbase", "rev-parse", "master")
+open(os.path.join(cdir, "curate.toml"), "w").write(
+    f'[[package]]\nowner = "et"\nurl = "{REPOS}/fakelib.git"\nmanifest = "manifests/fakelib.toml"\n\n'
+    f'[[package]]\nowner = "et"\nurl = "{REPOS}/cactusbase.git"\nmanifest = "manifests/cbase.toml"\n\n'
+    f'[[package.version]]\nversion = "1.0.0"\ncommit = "{cb_head}"\n')
+run = subprocess.run(["just", "curate", "max", os.path.join(cdir, "curate.toml")], capture_output=True, text=True)
+check("just curate creates the packages", run.returncode == 0 and "et/fakelib: created; versions: 2026.5.0" in run.stdout
+      and "et/cbase: created, 1 added by commit" in run.stdout, run.stdout[-600:] + run.stderr[-300:])
+# (et/cbase also takes cactusbase's v1.1.0 tag from the tag-pin checks above: no pattern means vX.Y.Z tags.)
+run = subprocess.run(["just", "curate", "max", os.path.join(cdir, "curate.toml")], capture_output=True, text=True)
+check("running it again only updates", run.returncode == 0 and "et/fakelib: updated; versions: 2026.5.0" in run.stdout
+      and "added by commit" not in run.stdout, run.stdout[-600:])
+s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions")
+d = json.loads(body) if s == 200 else {"versions": []}
+check("only tags matching the pattern, from since on, become versions",
+      [v["version"] for v in d["versions"]] == ["2026.5.0"], body[:300])
+check("a one-thorn repo publishes its thorn", '"thorn":"FakeLib"' in body and '"arrangement":"ExternalLibraries"' in body and '"repo-path":"."' in body, body[:400])
+page(maxv, "/admin/curated", contains="versions from tags matching XT_{major}_{minor}_v{patch}, from 2026.5.0 on")
+text = page(maxv, "/admin/curated")
+fid = re.search(r'href="/et/fakelib">et/fakelib</a>.*?action="/admin/curated/(\d+)/hand-over"', text, re.S).group(1)
+s, text, _ = maxv.post(f"/admin/curated/{fid}/hand-over", {})
+check("no hand-over before the repo has a cactarium.toml", s == 200 and "has no cactarium.toml yet" in text, text[text.find("alert"):][:300])
+open(os.path.join(lib, "cactarium.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "fakelib"\nowners = ["et"]\ndescription = "FakeLib, from its own manifest"\n'
+    'arrangement = "ExternalLibraries"\nthorns = ["FakeLib"]\ntag-pattern = "XT_{major}_{minor}_v{patch}"\n')
+sh("git", "add", "-A"); sh("git", *ident, "commit", "-q", "-m", "cactarium.toml"); sh("git", "tag", "XT_2026_11_v0")
+sh("git", "push", "-q", bare, "master", "--tags")
+maxv.get("/admin/curated")
+s, _, _ = maxv.post(f"/admin/curated/{fid}/hand-over", {})
+check("hand over to the repo's manifest", s == 303, s)
+text = page(maxv, "/admin/curated")
+check("it is no longer curated", 'href="/et/fakelib"' not in text)
+s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions")
+check("its versions stay", s == 200 and '"version":"2026.5.0"' in body, body[:300])
+text = page(maxv, "/et/fakelib?tab=versions")
+check("its next tag follows the repo manifest's own tag-pattern (et isn't trusted, so it waits for review)",
+      "2026.11.0" in text and "awaiting review" in text, text[text.find("<table"):][:500])
+
+# A repo whose cactarium.toml gives a tag-pattern registers like any other, though it has no vX.Y.Z tag.
+plib = os.path.join(work, "patlib")
+os.makedirs(os.path.join(plib, "PatThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: PatThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(plib, "PatThorn", f), "w").write(t)
+open(os.path.join(plib, "cactarium.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "patlib"\nowners = ["et"]\ndescription = "Released with ET-style tags"\n'
+    'arrangement = "PatArr"\ntag-pattern = "XT_{major}_{minor}_v{patch}"\n')
+sh("git", "init", "-q", "-b", "master", cwd=plib)
+sh("git", "add", "-A", cwd=plib); sh("git", *ident, "commit", "-q", "-m", "patlib", cwd=plib); sh("git", "tag", "XT_2026_05_v1", cwd=plib)
+pbare = ENV["DEMO_REPOS"] + "/patlib.git"
+subprocess.run(["rm", "-rf", pbare], check=True)
+sh("git", "clone", "-q", "--bare", plib, pbare, cwd=work)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/patlib.git", "owner": "et"})
+check("a repo with only pattern tags registers", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+s, body, _ = anon.get("/api/v1/packages/et/patlib/versions")
+check("its pattern tag is its version", s == 200 and '"version":"2026.5.1"' in body and '"tag":"XT_2026_05_v1"' in body, body[:300])
 
 print()
 if FAILED:

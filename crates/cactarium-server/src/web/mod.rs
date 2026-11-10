@@ -67,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/entries/{id}", post(admin::entry_action))
         .route("/admin/curated", get(admin::curated).post(admin::create_curated))
         .route("/admin/curated/{id}/version", post(admin::add_virtual))
+        .route("/admin/curated/{id}/hand-over", post(admin::hand_over))
         .route("/admin/tags", get(admin::tags))
         .route("/admin/tags/{id}/ack", post(admin::ack_tag))
         .route("/admin/users", get(admin::users))
