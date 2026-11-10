@@ -533,7 +533,9 @@ s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions")
 d = json.loads(body) if s == 200 else {"versions": []}
 check("only tags matching the pattern, from since on, become versions",
       [v["version"] for v in d["versions"]] == ["2026.5.0"], body[:300])
-check("a one-thorn repo publishes its thorn", '"thorn":"FakeLib"' in body and '"arrangement":"ExternalLibraries"' in body and '"repo-path":"."' in body, body[:400])
+check("a one-thorn repo publishes its thorn, reached as the ET does (../$1-$2)", '"thorn":"FakeLib"' in body and '"arrangement":"ExternalLibraries"' in body and '"repo-path":"../$1-$2"' in body, body[:400])
+s, body, _ = anon.get("/api/v1/packages/max/carpetx/versions")
+check("a thorn at the repo root is reached as $2", '"thorn":"Arith","repo-path":"$2"' in body.replace('"arrangement":"CarpetX",', ''), body[:400])
 page(maxv, "/admin/curated", contains="versions from tags matching XT_{major}_{minor}_v{patch}, from 2026.5.0 on")
 text = page(maxv, "/admin/curated")
 fid = re.search(r'href="/et/fakelib">et/fakelib</a>.*?action="/admin/curated/(\d+)/hand-over"', text, re.S).group(1)
@@ -587,6 +589,20 @@ s, _, _ = maxv.post(f"/admin/entries/{feid}", {"action": "move-repo", "new_url":
 check("the same repo at a new URL is accepted", s == 303, s)
 s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions")
 check("versions now name the new URL", s == 200 and "fakelib-moved.git" in body, body[:300])
+
+# A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
+# untrusted package unless the site allows untrusted tips.
+head = git("carpetx", "rev-parse", "master")
+s, body, hdrs = anon.get("/api/v1/packages/max/carpetx/versions/head")
+check("a package's @head is its default branch's tip, with its thorns",
+      s == 200 and f'"commit":"{head}"' in body and '"version":"head"' in body and '"thorn":"Arith"' in body
+      and hdrs.get("x-cactarium-unpinned") == "true" and hdrs.get("x-cactarium-untrusted") == "false", f"{s} {body[:300]} {hdrs}")
+s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@master")
+check("resolve takes a package's @master", s == 200 and '"slug":"max/carpetx@master"' in body and head in body, body[:300])
+s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions/head")
+check("an untrusted package's @head is refused by default", s == 403 and "isn't trusted" in body, f"{s} {body[:200]}")
+s, _, _ = anon.get("/api/v1/packages/max/carpetx/versions/tip")
+check("only head and master are tips", s == 404, s)
 
 print()
 if FAILED:

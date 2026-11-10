@@ -135,9 +135,9 @@ pub async fn package_versions(
             thorns: thorns
                 .into_iter()
                 .map(|(arrangement, thorn, dir, facts)| ThornInfo {
+                    repo_path: crl_repo_path(&arrangement, &thorn, &dir),
                     arrangement,
                     thorn,
-                    repo_path: dir,
                     facts: serde_json::from_value::<ThornFacts>(facts).unwrap_or_default(),
                 })
                 .collect(),
@@ -163,16 +163,32 @@ pub struct ResolveQ {
 /// `owner/name@[track:]range` → the highest usable matching version, with its frozen commit.
 pub async fn resolve(
     State(state): State<AppState>,
+    ip: ClientIp,
     Query(q): Query<ResolveQ>,
-) -> ApiResult<Json<Resolved>> {
+) -> ApiResult<Response> {
     let slug: Slug = q.req.parse().map_err(AppError::bad)?;
-    if slug.tip().is_some() {
-        return Err(AppError::bad(
-            "@head and @master are not versions; fetch the stack's releases/head or releases/master",
-        )
-        .into());
-    }
     let e = public_entry(&state, slug.owner.as_str(), slug.name.as_str(), None).await?;
+    if let Some(tip) = slug.tip() {
+        if e.kind != "package" {
+            return Err(AppError::bad(
+                "a stack's @head and @master are not versions; fetch its releases/head or releases/master",
+            )
+            .into());
+        }
+        let label = tip_label(tip);
+        let trusted = tip_trusted(&state, &e, label).await?;
+        let t = package_tip_cached(&state, &e, ip).await?;
+        let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
+        let contact = model::entry_contact(&state, &e, url.as_deref()).await?;
+        let body = Resolved {
+            slug: format!("{}@{label}", e.slug()),
+            kind: e.kind.clone(),
+            url,
+            contact,
+            version: tip_version_info(&e, label, &t),
+        };
+        return Ok((tip_headers(trusted), Json(body)).into_response());
+    }
     let versions = model::versions(&state, e.id).await?;
     let best = if e.kind == "sim" {
         match slug.number().map_err(AppError::bad)? {
@@ -209,7 +225,143 @@ pub async fn resolve(
         url,
         contact,
         version: version_info(best),
-    }))
+    })
+    .into_response())
+}
+
+/// `GET /packages/{owner}/{name}/versions/{head|master}`: the package at its default branch's tip,
+/// read now, in the shape of one released version.
+pub async fn package_tip(
+    State(state): State<AppState>,
+    ip: ClientIp,
+    Path((owner, name, tip)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    let label = match tip.as_str() {
+        "head" => "head",
+        "master" => "master",
+        _ => return Err(AppError::NotFound.into()),
+    };
+    let e = public_entry(&state, &owner, &name, Some("package")).await?;
+    let trusted = tip_trusted(&state, &e, label).await?;
+    let t = package_tip_cached(&state, &e, ip).await?;
+    let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
+    let body = PackageVersion {
+        version: tip_version_info(&e, label, &t),
+        url,
+        thorns: t
+            .thorns
+            .iter()
+            .map(|(arrangement, thorn, dir, facts)| ThornInfo {
+                repo_path: crl_repo_path(arrangement, thorn, dir),
+                arrangement: arrangement.clone(),
+                thorn: thorn.clone(),
+                facts: facts.clone(),
+            })
+            .collect(),
+        claims: t
+            .claims
+            .iter()
+            .map(|(kind, target, range, note)| ClaimInfo {
+                kind: kind.clone(),
+                target: target.clone(),
+                range: range.clone(),
+                note: note.clone(),
+            })
+            .collect(),
+    };
+    Ok((tip_headers(trusted), Json(body)).into_response())
+}
+
+/// The `!REPO_PATH` a thornlist section cloning the package's repo writes for thorn `arr/name`
+/// found at `dir` in the repo (see `ThornInfo::repo_path`). Thorns are named after their folders,
+/// so `dir` is `.` (the repo is the thorn) or ends in the thorn's name.
+fn crl_repo_path(arr: &str, name: &str, dir: &str) -> String {
+    if dir.is_empty() || dir == "." {
+        "../$1-$2".to_owned()
+    } else if dir == format!("{arr}/{name}") {
+        "$1/$2".to_owned()
+    } else if dir == name {
+        "$2".to_owned()
+    } else if let Some(parent) = dir.strip_suffix(&format!("/{name}")) {
+        format!("{parent}/$2")
+    } else {
+        // Not reachable for thorns this server recorded; keep the checkout at its own folder.
+        format!("$2/../{dir}")
+    }
+}
+
+fn tip_label(tip: Tip) -> &'static str {
+    match tip {
+        Tip::Head => "head",
+        Tip::Master => "master",
+    }
+}
+
+/// Whether `@head`/`@master` of `e` may be served: always for a trusted entry (the entry or its
+/// owner); for others, only when the site allows untrusted tips. Returns whether it is trusted.
+async fn tip_trusted(state: &AppState, e: &Entry, label: &str) -> ApiResult<bool> {
+    let trusted = crate::publish::entry_trusted(state, e).await?;
+    if !trusted && !crate::site::untrusted_tips_allowed(state).await? {
+        let what = if e.kind == "stack" {
+            "Install a release instead (owner/stack@X.Y.Z or a range)."
+        } else {
+            "Add a release instead (owner/pkg@X.Y.Z or a range)."
+        };
+        return Err(AppError::Denied(format!(
+            "{}@{label} is not served: the {} isn't trusted, and its branch tips are never reviewed. {what}",
+            e.slug(),
+            e.kind
+        ))
+        .into());
+    }
+    Ok(trusted)
+}
+
+fn tip_headers(trusted: bool) -> [(header::HeaderName, header::HeaderValue); 2] {
+    [
+        (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true")),
+        (
+            header::HeaderName::from_static(UNTRUSTED_HEADER),
+            header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
+        ),
+    ]
+}
+
+/// The package read at its default branch's current commit, cached by commit.
+async fn package_tip_cached(
+    state: &AppState,
+    e: &Entry,
+    ip: ClientIp,
+) -> ApiResult<std::sync::Arc<tracker::PackageTip>> {
+    // Resolving a tip reads the remote repo; keep anonymous callers from turning that into a flood.
+    state.limiter.check("tip", ip.0, 12)?;
+    let commit = tracker::package_tip_commit(state, e).await?;
+    let key = (e.id, commit.clone());
+    if let Some(t) = state.package_tips.lock().expect("package tips lock").get(&key) {
+        return Ok(t.clone());
+    }
+    let t = std::sync::Arc::new(tracker::package_tip(state, e, &commit).await?);
+    let mut cache = state.package_tips.lock().expect("package tips lock");
+    if cache.len() > 512 {
+        cache.clear();
+    }
+    cache.insert(key, t.clone());
+    Ok(t)
+}
+
+fn tip_version_info(e: &Entry, label: &str, t: &tracker::PackageTip) -> VersionInfo {
+    VersionInfo {
+        version: label.to_owned(),
+        track: None,
+        tag: None,
+        commit: Some(t.commit.clone()),
+        tree: Some(t.tree.clone()),
+        yanked: false,
+        yank_reason: None,
+        state: "ok".to_owned(),
+        curated: e.curated,
+        published: time::OffsetDateTime::now_utc().unix_timestamp(),
+    }
 }
 
 pub async fn stack_releases(
@@ -246,15 +398,7 @@ pub async fn stack_release(
     };
     // A tip is whatever the branches hold now and never passes review: only a trusted stack's is
     // served freely. Otherwise the site setting refuses it, or serves it marked untrusted.
-    let trusted = crate::publish::entry_trusted(&state, &e).await?;
-    if !trusted && !crate::site::untrusted_tips_allowed(&state).await? {
-        return Err(AppError::Denied(format!(
-            "{}@{version} is not served: the stack isn't trusted, and its branch tips are never reviewed. \
-             Install a release instead (owner/stack@X.Y.Z or a range).",
-            e.slug()
-        ))
-        .into());
-    }
+    let trusted = tip_trusted(&state, &e, &version).await?;
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
     let (definition, own) = current_definition(&state, &e).await?;

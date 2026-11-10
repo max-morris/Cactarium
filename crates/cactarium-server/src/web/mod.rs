@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/entries/{owner}/{name}", get(api::entry))
         .route("/packages/{owner}/{name}/versions", get(api::package_versions))
+        .route("/packages/{owner}/{name}/versions/{tip}", get(api::package_tip))
         .route("/packages/{owner}/{name}/refresh", post(api::package_refresh))
         .route("/resolve", get(api::resolve))
         .route("/stacks/{owner}/{name}/releases", get(api::stack_releases).post(api::stack_publish))

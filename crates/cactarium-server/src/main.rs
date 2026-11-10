@@ -394,6 +394,7 @@ fn make_state(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<AppState> {
             .build()?,
         limiter: Arc::new(security::RateLimiter::default()),
         definitions: Arc::default(),
+        package_tips: Arc::default(),
         cfg: Arc::new(cfg),
     })
 }

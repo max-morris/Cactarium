@@ -687,6 +687,53 @@ async fn ingest(
     Ok(())
 }
 
+/// A package's default-branch tip, read now: what `owner/pkg@head` (and `@master`) mean for a
+/// package. Nothing is stored; the API caches it by commit.
+pub struct PackageTip {
+    pub commit: String,
+    pub tree: String,
+    pub thorns: Vec<(String, String, String, ccl::ThornFacts)>,
+    /// (kind, target, range, note)
+    pub claims: Vec<(String, String, Option<String>, Option<String>)>,
+}
+
+/// The commit a package's default branch names now.
+pub async fn package_tip_commit(state: &AppState, entry: &Entry) -> AppResult<String> {
+    let repo = repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
+    git::resolve_ref(policy(state), &repo.url, None).await.map_err(AppError::bad)
+}
+
+/// Reads a package at `commit` (its default branch's tip) the way a release is read: the manifest
+/// (the curated one, for a curated package) and the thorns there.
+pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppResult<PackageTip> {
+    if entry.kind != "package" {
+        return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
+    }
+    let repo = repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
+    let co = git::checkout(policy(state), &repo.url, commit, None)
+        .await
+        .map_err(AppError::bad)?;
+    let r = RemoteRef { name: "HEAD".into(), commit: commit.to_owned() };
+    let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
+    let p = prepare(state, entry, &repo, &co, &r, &tv)
+        .await
+        .map_err(|e| AppError::bad(format!("{}'s default branch: {e}", entry.slug())))?;
+    Ok(PackageTip {
+        commit: commit.to_owned(),
+        tree: co.tree.clone(),
+        thorns: p.thorns,
+        claims: p
+            .claims
+            .into_iter()
+            .map(|(k, t, range, note)| (k.to_owned(), format!("{}/{}", t.owner, t.name), range, note))
+            .collect(),
+    })
+}
+
 struct Prepared {
     manifest_json: serde_json::Value,
     readme_html: Option<String>,
