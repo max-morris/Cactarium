@@ -75,6 +75,19 @@ enum Command {
     },
     /// Check an entry's repo for new and moved tags now.
     Sync { slug: String },
+    /// Yank a version on behalf of a user who manages the entry (or an admin): it stays
+    /// downloadable by exact version, but no range chooses it.
+    Yank {
+        username: String,
+        /// owner/name
+        slug: String,
+        /// `1.2.0`, `track:1.2.0`, or a sim's number
+        version: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Undo a yank.
+    Unyank { username: String, slug: String, version: String },
     /// Point an entry at its repo's new URL (after a move such as a GitHub transfer), as the given
     /// admin; refused unless the new URL holds the same tags at the same commits.
     MoveRepo { username: String, slug: String, url: String },
@@ -254,6 +267,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{} now reads {url}", e.slug());
             Ok(())
         }
+        Command::Yank { username, slug, version, reason } => {
+            yank_cli(cfg, db, &username, &slug, &version, true, reason.as_deref()).await
+        }
+        Command::Unyank { username, slug, version } => {
+            yank_cli(cfg, db, &username, &slug, &version, false, None).await
+        }
         Command::Sync { slug } => {
             let state = make_state(cfg, db)?;
             let (owner, name) = slug.split_once('/').context("give owner/name")?;
@@ -355,6 +374,37 @@ async fn admin(db: &sqlx::PgPool, action: AdminAction) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn yank_cli(
+    cfg: Config,
+    db: sqlx::PgPool,
+    username: &str,
+    slug: &str,
+    version: &str,
+    yank: bool,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let state = make_state(cfg, db)?;
+    let user = cli_user(&state, username).await?;
+    let err = |e: error::AppError| anyhow::anyhow!("{e}");
+    let (owner, name) = slug.split_once('/').context("give owner/name")?;
+    let e = model::find_entry(&state, owner, name)
+        .await
+        .map_err(err)?
+        .context("no such entry")?;
+    let v = model::any_version_by_label(&state, e.id, version)
+        .await
+        .map_err(err)?
+        .with_context(|| format!("{slug} has no version {version}"))?;
+    publish::set_yanked(&state, &user, &e, v.id, yank, reason, "cli")
+        .await
+        .map_err(|err| match err {
+            error::AppError::Forbidden => anyhow::anyhow!("{username} doesn't manage {slug}"),
+            other => anyhow::anyhow!("{other}"),
+        })?;
+    println!("{} {slug}@{}", if yank { "Yanked" } else { "Unyanked" }, v.label());
+    Ok(())
 }
 
 /// Trusts or untrusts `name`: an entry if it is `owner/name`, else the user or organization of

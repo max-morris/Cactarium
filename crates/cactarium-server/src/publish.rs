@@ -211,3 +211,41 @@ pub async fn touch(state: &AppState, entry_id: i64) -> AppResult<()> {
         .await?;
     Ok(())
 }
+
+/// Yanks a version (or unyanks it, with `yank` false): it stays downloadable by exact version but
+/// no range chooses it. Whoever manages the entry may do this; the reason is shown with it.
+pub async fn set_yanked(
+    state: &AppState,
+    user: &User,
+    entry: &Entry,
+    version_id: i64,
+    yank: bool,
+    reason: Option<&str>,
+    via: &str,
+) -> AppResult<()> {
+    if !entry.manageable_by(Some(user)) {
+        return Err(AppError::Forbidden);
+    }
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    let n =
+        sqlx::query("UPDATE versions SET yanked = $3, yank_reason = $4 WHERE id = $1 AND entry_id = $2")
+            .bind(version_id)
+            .bind(entry.id)
+            .bind(yank)
+            .bind(if yank { reason } else { None })
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+    if n == 0 {
+        return Err(AppError::NotFound);
+    }
+    audit(
+        state,
+        Some(user.id),
+        if yank { "version.yank" } else { "version.unyank" },
+        Some(&entry.slug()),
+        json!({ "version_id": version_id, "reason": reason, "via": via }),
+        None,
+    )
+    .await
+}

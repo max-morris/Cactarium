@@ -442,29 +442,8 @@ pub async fn yank(
 ) -> AppResult<Response> {
     s.session.check_csrf(&f.csrf)?;
     let e = managed(&state, &s, &owner, &name).await?;
-    let yank = f.yank == "1";
-    let reason = f.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
-    let n =
-        sqlx::query("UPDATE versions SET yanked = $3, yank_reason = $4 WHERE id = $1 AND entry_id = $2")
-            .bind(f.version_id)
-            .bind(e.id)
-            .bind(yank)
-            .bind(if yank { reason } else { None })
-            .execute(&state.db)
-            .await?
-            .rows_affected();
-    if n == 0 {
-        return Err(AppError::NotFound);
-    }
-    audit(
-        &state,
-        Some(s.user.id),
-        if yank { "version.yank" } else { "version.unyank" },
-        Some(&e.slug()),
-        json!({ "version_id": f.version_id, "reason": reason }),
-        None,
-    )
-    .await?;
+    publish::set_yanked(&state, &s.user, &e, f.version_id, f.yank == "1", f.reason.as_deref(), "site")
+        .await?;
     Ok(Redirect::to(&format!("{}?tab=versions", e.url())).into_response())
 }
 

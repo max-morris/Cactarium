@@ -70,8 +70,9 @@ curate admin file:
     status=0; {{compose}} exec -T app cactarium curate {{admin}} "/tmp/curate/$(basename "{{file}}")" || status=$?; {{compose}} exec -T -u 0 app rm -rf /tmp/curate; exit $status
 
 # Run the server's command line inside the app container, e.g. `just cli admin list`
+[positional-arguments]
 cli *args:
-    {{compose}} exec app cactarium {{args}}
+    {{compose}} exec -T app cactarium "$@"
 
 # Make a user an admin (only the superadmin can do this on the site)
 admin-grant user:

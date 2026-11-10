@@ -278,6 +278,15 @@ if vid:
     maxv.get("/max/carpetx?tab=versions")
     s, _, _ = maxv.post("/max/carpetx/yank", {"version_id": vid.group(1), "yank": "0"})
     check("unyank", s == 303, s)
+    # The same from the command line, by someone who manages the entry.
+    run = subprocess.run(["just", "cli", "yank", "max", "max/carpetx", "1.1.0", "--reason", "from the cli"], capture_output=True, text=True)
+    check("just cli yank", run.returncode == 0 and "Yanked max/carpetx@1.1.0" in run.stdout, run.stdout + run.stderr[-300:])
+    s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@%3D1.1.0")
+    check("the cli yank shows, with its reason", '"yanked":true' in body and "from the cli" in body, body[:300])
+    run = subprocess.run(["just", "cli", "yank", "alice", "max/carpetx", "1.1.0"], capture_output=True, text=True)
+    check("only someone who manages the entry can yank it", run.returncode != 0 and "doesn't manage" in run.stdout + run.stderr, run.stdout + run.stderr[-300:])
+    run = subprocess.run(["just", "cli", "unyank", "max", "max/carpetx", "1.1.0"], capture_output=True, text=True)
+    check("just cli unyank", run.returncode == 0 and "Unyanked max/carpetx@1.1.0" in run.stdout, run.stdout + run.stderr[-300:])
 
 # A snapshot release of a stack defined on the site.
 maxv.get("/new/stack")
