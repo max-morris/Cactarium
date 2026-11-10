@@ -97,12 +97,12 @@ description = "CCTK_REAL4 and CCTK_REAL2 grid functions; needs a mixed-precision
 target = "et/carpetx"
 
 [[depends-on]]
-target = "et/et"
+target = "et/et-stack"
 range = "^2026"
 note = "the flesh and CactusBase from this stack"
 
 [[incompatible-with]]
-target = "et/et"
+target = "et/et-stack"
 range = "<2026"
 
 [[caveat]]
@@ -174,7 +174,7 @@ cat > "$R/cactarium-stack.toml" <<'EOF'
 format = 1
 
 [stack]
-name = "et"
+name = "et-stack"
 owners = ["et"]
 description = "The Einstein Toolkit's component list (a demo stand-in), one stack among many"
 contact = "https://bitbucket.org/einsteintoolkit/tickets/issues"
@@ -192,7 +192,7 @@ format = 1
 name = "carpetx-mp"
 owners = ["max"]
 description = "The ET stack with CarpetX switched to its mixed-precision track"
-extends = ["et/et@2026.5.0"]
+extends = ["et/et-stack@2026.5.0"]
 enable = ["CarpetX/TestReal4"]
 
 [[stack.override]]
@@ -200,7 +200,7 @@ repo = "carpetx"
 package = "max/carpetx@mixed-precision:^1"
 
 [[incompatible-with]]
-target = "et/et"
+target = "et/et-stack"
 note = "use one or the other"
 EOF
 commit "$R" "carpetx-mp 1.0.0"; g "$R" tag v1.0.0; publish carpetx-mp
@@ -288,7 +288,7 @@ walltime = "24:00:00"
 exported-by = "dev-seed"
 machine = "qbd"
 flavor = "cpu"
-base = "et/et@2026.5.0"
+base = "et/et-stack@2026.5.0"
 EOF
 cli publish-sim max /demo/qc0.sim
 

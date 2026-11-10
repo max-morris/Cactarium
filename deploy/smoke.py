@@ -92,7 +92,7 @@ for p in ["/", "/search", "/search?kind=package", "/search?kind=stack", "/search
           "/implementations/driver", "/sources?url=" + REPOS + "/cactus.git", "/max", "/et",
           "/max/carpetx", "/max/carpetx?tab=thorns", "/max/carpetx?tab=versions", "/max/carpetx?tab=usedby",
           "/max/carpetx?track=default", "/max/carpetx/mixed-precision:1.0.0", "/max/carpetx/1.0.0",
-          "/et/et", "/et/et/2026.5.0", "/max/carpetx-mp", "/max/qc0-demo", "/max/qc0-demo/1?tab=pins",
+          "/et/et-stack", "/et/et-stack/2026.5.0", "/max/carpetx-mp", "/max/qc0-demo", "/max/qc0-demo/1?tab=pins",
           "/max/qc0-demo/1?tab=thornlist", "/max/qc0-demo/1?tab=inputs", "/max/qc0-demo/1?tab=run",
           "/max/carpetx-mp/1.0.0/download.th", "/max/qc0-demo/1/download.sim", "/auth/login"]:
     page(anon, p)
@@ -104,7 +104,7 @@ page(anon, "/compare?a=et/carpetx&b=max/carpetx", contains="CarpetX/TestReal4")
 page(anon, "/search?q=TestReal4&kind=stack", contains="max/carpetx-mp")
 page(anon, "/thorns/CarpetX/TestReal4", contains="max/carpetx-mp")
 # Contacts: declared, or the repo.
-page(anon, "/et/et", contains="bitbucket.org/einsteintoolkit/tickets/issues")
+page(anon, "/et/et-stack", contains="bitbucket.org/einsteintoolkit/tickets/issues")
 s, body, _ = anon.get("/api/v1/entries/max/carpetx")
 check("the API gives a contact (the repo, when none is declared)", s == 200 and json.loads(body)["contact"].endswith("/carpetx"), body[:200])
 page(anon, "/max/carpetx/1.0.0", contains="tag moved upstream")
@@ -158,7 +158,7 @@ if sub:
 # Security regressions (from the review).
 # A stack can't extend someone else's pending stack, and can't tell that it exists.
 alice.get("/new/stack")
-pend = 'format = 1\n\n[stack]\nname = "alice-private"\nextends = ["et/et@2026.5.0"]\n'
+pend = 'format = 1\n\n[stack]\nname = "alice-private"\nextends = ["et/et-stack@2026.5.0"]\n'
 s, _, _ = alice.post("/new/stack", {"definition": pend, "thornlist": "", "version": "1.0.0"})
 check("alice cuts a (pending) stack release", s == 303, s)
 page(anon, "/alice/alice-private", expect=404)
@@ -181,7 +181,7 @@ v.get("/auth/login")
 s, _, hdrs = v.post("/auth/dev", {"username": "orgx", "next": "/dashboard"})
 check("signing in as that owner must choose another name", hdrs.get("location") == "/auth/choose-name", hdrs.get("location"))
 # The unpinned forms are rate-limited.
-codes = [anon.get("/api/v1/stacks/et/et/releases/head")[0] for _ in range(14)]
+codes = [anon.get("/api/v1/stacks/et/et-stack/releases/head")[0] for _ in range(14)]
 check("@head requests are rate-limited", codes[0] == 200 and codes[-1] == 429, codes)
 
 # Hearts: save, count, un-save.
@@ -235,7 +235,7 @@ if vid:
 
 # A snapshot release of a stack defined on the site.
 maxv.get("/new/stack")
-definition = 'format = 1\n\n[stack]\nname = "smoke-stack"\nextends = ["et/et@2026.5.0"]\ndisable = ["CarpetX/Loop"]\n'
+definition = 'format = 1\n\n[stack]\nname = "smoke-stack"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CarpetX/Loop"]\n'
 s, text, hdrs = maxv.post("/new/stack", {"definition": definition, "thornlist": "", "version": "0.1.0"})
 check("cut a snapshot release", s == 303, f"{s} {text[:300]}")
 s, body, _ = anon.get("/api/v1/stacks/max/smoke-stack/releases/0.1.0")
