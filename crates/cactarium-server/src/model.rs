@@ -18,13 +18,15 @@ pub struct Entry {
     pub description: Option<String>,
     pub visibility: String,
     pub verified: bool,
+    /// New releases publish without review (see `publish::release_review`).
+    pub trusted: bool,
     pub curated: bool,
     pub created_by: Option<i64>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
 
-pub const ENTRY_COLS: &str = "id, kind, owner, name, summary, description, visibility, verified, curated, created_by, created_at, updated_at";
+pub const ENTRY_COLS: &str = "id, kind, owner, name, summary, description, visibility, verified, trusted, curated, created_by, created_at, updated_at";
 
 impl Entry {
     pub fn slug(&self) -> String {
@@ -62,13 +64,15 @@ pub struct Version {
     pub invalid_reason: Option<String>,
     pub yanked: bool,
     pub yank_reason: Option<String>,
+    /// `approved`, or `pending`/`rejected` in review (seen only by the entry's managers).
+    pub review: String,
     pub manifest: Option<serde_json::Value>,
     pub readme_html: Option<String>,
     pub created_at: OffsetDateTime,
 }
 
 pub const VERSION_COLS: &str = "id, entry_id, track, version, sort_key, tag, commit, tree, is_virtual, state, \
-     invalid_reason, yanked, yank_reason, manifest, readme_html, created_at";
+     invalid_reason, yanked, yank_reason, review, manifest, readme_html, created_at";
 
 impl Version {
     /// `1.2.3`, `mixed-precision:1.2.3`, or a sim's `3`.
@@ -84,8 +88,12 @@ impl Version {
         self.commit.as_deref().map(|c| c.chars().take(10).collect()).unwrap_or_default()
     }
 
+    pub fn approved(&self) -> bool {
+        self.review == "approved"
+    }
+
     pub fn usable(&self) -> bool {
-        !self.yanked && self.state != "invalid"
+        self.approved() && !self.yanked && self.state != "invalid"
     }
 }
 
@@ -135,8 +143,18 @@ pub async fn entry_by_id(state: &AppState, id: i64) -> AppResult<Entry> {
         .ok_or(AppError::NotFound)
 }
 
-/// All versions, newest first within each track; the default track first.
+/// The published (review-approved) versions, newest first within each track; the default track
+/// first. This is what everyone sees and what resolution uses.
 pub async fn versions(state: &AppState, entry_id: i64) -> AppResult<Vec<Version>> {
+    Ok(all_versions(state, entry_id)
+        .await?
+        .into_iter()
+        .filter(Version::approved)
+        .collect())
+}
+
+/// Every version, including those pending or rejected in review: for managers and admins only.
+pub async fn all_versions(state: &AppState, entry_id: i64) -> AppResult<Vec<Version>> {
     Ok(sqlx::query_as::<_, Version>(&format!(
         "SELECT {VERSION_COLS} FROM versions WHERE entry_id = $1 ORDER BY track, sort_key DESC"
     ))
@@ -145,7 +163,22 @@ pub async fn versions(state: &AppState, entry_id: i64) -> AppResult<Vec<Version>
     .await?)
 }
 
+/// The versions `user` may see: all of them for the entry's managers, the published ones otherwise.
+pub async fn versions_for(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<Vec<Version>> {
+    if e.manageable_by(user) { all_versions(state, e.id).await } else { versions(state, e.id).await }
+}
+
+/// A published version by label (`1.2.3`, `track:1.2.3`, a sim's `3`).
 pub async fn version_by_label(
+    state: &AppState,
+    entry_id: i64,
+    label: &str,
+) -> AppResult<Option<Version>> {
+    Ok(any_version_by_label(state, entry_id, label).await?.filter(Version::approved))
+}
+
+/// A version by label whatever its review state: callers check who may see it.
+pub async fn any_version_by_label(
     state: &AppState,
     entry_id: i64,
     label: &str,
@@ -211,7 +244,7 @@ pub async fn entry_contact(
 ) -> AppResult<Option<String>> {
     let declared = if e.kind == "sim" {
         let content: Option<String> = sqlx::query_scalar(
-            "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 ORDER BY v.sort_key DESC LIMIT 1",
+            "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND v.review = 'approved' ORDER BY v.sort_key DESC LIMIT 1",
         )
         .bind(e.id)
         .fetch_optional(&state.db)
@@ -221,7 +254,7 @@ pub async fn entry_contact(
             .and_then(|s| s.sim.contact)
     } else {
         let m: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND NOT yanked AND state <> 'invalid' ORDER BY created_at DESC LIMIT 1",
+            "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND NOT yanked AND state <> 'invalid' AND review = 'approved' ORDER BY created_at DESC LIMIT 1",
         )
         .bind(e.id)
         .fetch_optional(&state.db)

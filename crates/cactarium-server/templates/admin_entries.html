@@ -4,22 +4,24 @@
 {% block content %}
 {% include "_admin_nav.html" %}
 <section class="stack">
+  <p class="small muted">Verified is a public badge. A trusted entry's new releases publish without review, as do those of a trusted owner (user or organization).</p>
   <form class="row-wrap" method="get" action="/admin/entries"><label class="sr-only" for="eq">Filter</label><input id="eq" name="q" value="{{ q }}" placeholder="owner or name"><button class="button small" type="submit">Filter</button></form>
   {% for e in entries %}
   <div class="card stack-sm">
     <div class="row-wrap between">
       <span><a class="mono strong" href="{{ e.url }}">{{ e.slug }}</a> <span class="muted small">{{ e.kind }}</span>
         <span class="badge {% if e.visibility == "public" %}good{% else %}warn{% endif %}">{{ e.visibility }}</span>
-        {% if e.verified %}<span class="badge good">verified</span>{% endif %}{% if e.curated %}<span class="badge quiet">curated</span>{% endif %}</span>
+        {% if e.verified %}<span class="badge good">verified</span>{% endif %}{% if e.trusted %}<span class="badge good">trusted</span>{% endif %}{% if e.curated %}<span class="badge quiet">curated</span>{% endif %}</span>
       <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap">
         <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
         {% if e.visibility == "hidden" %}<button class="button small ghost" name="action" value="unhide">Unhide</button>{% else %}<button class="button small ghost" name="action" value="hide">Hide</button>{% endif %}
         {% if e.verified %}<button class="button small ghost" name="action" value="unverify">Remove verified</button>{% else %}<button class="button small ghost" name="action" value="verify">Mark verified</button>{% endif %}
+        {% if can_trust %}{% if e.trusted %}<button class="button small ghost" name="action" value="untrust">Untrust</button>{% else %}<button class="button small ghost" name="action" value="trust" title="New releases publish without review">Trust</button>{% endif %}{% endif %}
         <label class="sr-only" for="to{{ e.id }}">Transfer to</label><input id="to{{ e.id }}" name="new_owner" class="small-input mono" placeholder="new owner">
         <button class="button small ghost" name="action" value="transfer">Transfer</button>
       </form>
     </div>
-    {% if !e.versions.is_empty() %}<p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span>{% if v.yanked %} (yanked){% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+    {% if !e.versions.is_empty() %}<p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span>{% if v.yanked %} (yanked){% endif %}{% if v.pending %} (awaiting review){% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
   </div>
   {% else %}<p class="muted">No entries.</p>{% endfor %}
 </section>

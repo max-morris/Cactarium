@@ -9,7 +9,7 @@
   <li><strong>Stacks</strong>: versioned thornlists. Every release pins every repo to a commit.</li>
   <li><strong>Sims</strong>: a parfile plus the exact configuration it ran on, as one <code>.sim</code> file.</li>
 </ul>
-<p>Browsing and downloading need no account. Publishing needs one: sign in with GitHub or ORCID. A new entry is reviewed by an admin before it is public; later versions of an approved entry publish on their own.</p>
+<p>Browsing and downloading need no account. Publishing needs one: sign in with GitHub or ORCID. A new entry is reviewed by an admin before it is public, and so is each new release of it (a pushed tag, a stack release, a new sim version): until it is approved, only you and the admins see it, and resolving a range skips it. Admins can trust users, organizations and individual entries. Anything published by a trusted user or under a trusted organization, and every new release of a trusted entry, publishes at once without review.</p>
 
 <h2 id="versions">Versions and tracks</h2>
 <p>Tag releases <code>v1.2.3</code>. A repo can carry independent version lines, called tracks, as tag prefixes: <code>mixed-precision/v1.2.3</code> is version <code>1.2.3</code> on track <code>mixed-precision</code>, written <code>owner/pkg@mixed-precision:1.2.3</code>. Ranges such as <code>@mixed-precision:^1.2</code> never cross tracks.</p>

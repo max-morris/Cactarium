@@ -158,7 +158,7 @@ pub async fn publish(
     owner: Option<&str>,
     name: Option<&str>,
     checked: Checked,
-) -> AppResult<(Entry, u32)> {
+) -> AppResult<(Entry, u32, &'static str)> {
     let Checked { mut sim, index } = checked;
     let owner = owner
         .map(str::trim)
@@ -203,14 +203,16 @@ pub async fn publish(
     sim.sim.cactarium = Some(format!("{}@{n}", entry.slug()).parse().map_err(AppError::bad)?);
     let stored = sim.to_toml().map_err(AppError::bad)?;
     let sha = hex::encode(Sha256::digest(stored.as_bytes()));
+    let review = publish::release_review(state, &entry, Some(user)).await?;
     let mut tx = state.db.begin().await?;
     let vid: i64 = sqlx::query_scalar(
-        "INSERT INTO versions (entry_id, track, version, sort_key, published_by) VALUES ($1, '', $2, $3, $4) RETURNING id",
+        "INSERT INTO versions (entry_id, track, version, sort_key, published_by, review) VALUES ($1, '', $2, $3, $4, $5) RETURNING id",
     )
     .bind(entry.id)
     .bind(n.to_string())
     .bind(number_sort_key(n))
     .bind(user.id)
+    .bind(review)
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO sim_files (version_id, sha256, content, index) VALUES ($1, $2, $3, $4)")
@@ -220,13 +222,17 @@ pub async fn publish(
         .bind(serde_json::to_value(&index).map_err(anyhow::Error::from)?)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE entries SET summary = COALESCE($2, summary), description = COALESCE($3, description), updated_at = now() WHERE id = $1")
-        .bind(entry.id)
-        .bind(&sim.sim.summary)
-        .bind(&sim.sim.description)
-        .execute(&mut *tx)
-        .await?;
+    // A release waiting in review doesn't change what the public page says yet.
+    if review == "approved" {
+        sqlx::query("UPDATE entries SET summary = COALESCE($2, summary), description = COALESCE($3, description), updated_at = now() WHERE id = $1")
+            .bind(entry.id)
+            .bind(&sim.sim.summary)
+            .bind(&sim.sim.description)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
+    publish::submit_release(state, &entry, vid, review, Some(user)).await?;
     tracker::store_pins(state, vid, &sim.repos).await?;
     tracker::store_built_thorns(state, vid, &sim.thornlist.text).await?;
     audit(
@@ -234,11 +240,11 @@ pub async fn publish(
         Some(user.id),
         "sim.publish",
         Some(&entry.slug()),
-        json!({ "version": n, "sha256": sha }),
+        json!({ "version": n, "sha256": sha, "review": review }),
         None,
     )
     .await?;
-    Ok((entry, n))
+    Ok((entry, n, review))
 }
 
 #[cfg(test)]

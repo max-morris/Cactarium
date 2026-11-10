@@ -283,7 +283,7 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
         return Ok((def, own));
     }
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT s.recipe, s.own_thornlist FROM stack_releases s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 ORDER BY v.created_at DESC LIMIT 1",
+        "SELECT s.recipe, s.own_thornlist FROM stack_releases s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND v.review = 'approved' ORDER BY v.created_at DESC LIMIT 1",
     )
     .bind(e.id)
     .fetch_optional(&state.db)
@@ -330,13 +330,18 @@ pub async fn sim_publish(
     state.limiter.check("upload", ip.0, 20)?;
     let checked = sims::check(&body)?;
     let warnings = checked.index.warnings.clone();
-    let (entry, n) = sims::publish(&state, &user, Some(&owner), Some(&name), checked).await?;
+    let (entry, n, review) = sims::publish(&state, &user, Some(&owner), Some(&name), checked).await?;
     Ok(Json(Published {
         slug: format!("{}@{n}", entry.slug()),
         url: state.cfg.url(&format!("{}/{n}", entry.url())),
-        visibility: entry.visibility,
+        visibility: published_visibility(&entry, review),
         warnings,
     }))
+}
+
+/// `pending` while either the new entry or the new release waits for review, else `public`.
+fn published_visibility(e: &Entry, review: &str) -> String {
+    if review == "pending" { "pending".into() } else { e.visibility.clone() }
 }
 
 pub async fn stack_publish(
@@ -351,7 +356,7 @@ pub async fn stack_publish(
     if m.stack.as_ref().map(|s| s.name.as_str()) != Some(name.as_str()) {
         return Err(AppError::bad(format!("the definition's [stack] name is not '{name}'")).into());
     }
-    let e = crate::web::account::cut_release(
+    let (e, review) = crate::web::account::cut_release(
         &state,
         &user,
         Some(&owner),
@@ -363,7 +368,7 @@ pub async fn stack_publish(
     Ok(Json(Published {
         slug: format!("{}@{}", e.slug(), b.version.trim()),
         url: state.cfg.url(&format!("{}/{}", e.url(), b.version.trim())),
-        visibility: e.visibility,
+        visibility: published_visibility(&e, review),
         warnings: vec![],
     }))
 }

@@ -151,8 +151,9 @@ pub async fn register(
         attach_repo(state, &entry, &found.url, file, None).await?;
         entries.push(entry);
     }
+    // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
     for e in &entries {
-        sync(state, e).await?;
+        sync_as(state, e, Some(user)).await?;
     }
     Ok(entries)
 }
@@ -182,6 +183,9 @@ pub async fn register_curated(
     )
     .await?;
     attach_repo(state, &entry, &url, PACKAGE_FILE, Some(overlay)).await?;
+    // The admin vouches for the tags that exist now; later upstream tags are reviewed unless the
+    // entry or its owner is trusted. A failure is kept as the repo's poll error.
+    let _ = sync_as(state, &entry, Some(admin)).await;
     Ok(entry)
 }
 
@@ -228,8 +232,14 @@ struct Known {
     state: String,
 }
 
-/// Brings an entry up to date with its repo's tags. Returns how many versions were added.
+/// Brings an entry up to date with its repo's tags. Returns how many versions were added. A new
+/// tag is reviewed unless the entry or its owner is trusted (see `publish::release_review`).
 pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
+    sync_as(state, entry, None).await
+}
+
+/// `sync`, with the tags found counted as published by `actor` (the user registering the repo).
+async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppResult<usize> {
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
     let banned: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND banned)")
@@ -239,7 +249,7 @@ pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
     if banned || entry.visibility == "hidden" {
         return Ok(0);
     }
-    let result = sync_inner(state, entry, &repo).await;
+    let result = sync_inner(state, entry, &repo, actor).await;
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
         .bind(entry.id)
@@ -249,7 +259,12 @@ pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
     result
 }
 
-async fn sync_inner(state: &AppState, entry: &Entry, repo: &RepoRow) -> AppResult<usize> {
+async fn sync_inner(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    actor: Option<&User>,
+) -> AppResult<usize> {
     let refs = git::ls_tags(policy(state), &repo.url).await.map_err(AppError::bad)?;
     let remote: BTreeMap<String, String> =
         refs.iter().map(|r| (r.name.clone(), r.commit.clone())).collect();
@@ -289,7 +304,7 @@ async fn sync_inner(state: &AppState, entry: &Entry, repo: &RepoRow) -> AppResul
         if added == MAX_NEW_PER_SYNC {
             break;
         }
-        ingest(state, entry, repo, &r, &tv).await?;
+        ingest(state, entry, repo, &r, &tv, actor).await?;
         added += 1;
     }
     if added > 0 {
@@ -341,6 +356,7 @@ async fn ingest(
     repo: &RepoRow,
     r: &RemoteRef,
     tv: &TrackedVersion,
+    actor: Option<&User>,
 ) -> AppResult<()> {
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let base = |reason: Option<String>, tree: Option<String>| (reason, tree);
@@ -357,9 +373,15 @@ async fn ingest(
     };
     let manifest_json = prepared.as_ref().map(|p| p.manifest_json.clone());
     let readme = prepared.as_ref().and_then(|p| p.readme_html.clone());
+    // An invalid tag is never served, so it needs no review.
+    let review = if invalid.is_some() {
+        "approved"
+    } else {
+        publish::release_review(state, entry, actor).await?
+    };
     let vid: i64 = sqlx::query_scalar(
-        "INSERT INTO versions (entry_id, track, version, sort_key, tag, commit, tree, state, invalid_reason, manifest, readme_html)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+        "INSERT INTO versions (entry_id, track, version, sort_key, tag, commit, tree, state, invalid_reason, manifest, readme_html, review)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
     )
     .bind(entry.id)
     .bind(&track)
@@ -372,17 +394,19 @@ async fn ingest(
     .bind(&invalid)
     .bind(&manifest_json)
     .bind(&readme)
+    .bind(review)
     .fetch_one(&state.db)
     .await?;
     if let Some(p) = prepared {
         store_prepared(state, entry, vid, &track, p).await?;
     }
+    publish::submit_release(state, entry, vid, review, actor).await?;
     audit(
         state,
         None,
         "version.ingest",
         Some(&entry.slug()),
-        json!({ "tag": r.name, "commit": r.commit, "invalid": invalid }),
+        json!({ "tag": r.name, "commit": r.commit, "invalid": invalid, "review": review }),
         None,
     )
     .await?;
@@ -543,16 +567,18 @@ async fn store_prepared(
             .await?;
     }
     if p.summary.is_some() {
-        sqlx::query("UPDATE entries SET summary = $2 WHERE id = $1")
+        // Only a published release updates the public summary.
+        sqlx::query("UPDATE entries SET summary = $2 WHERE id = $1 AND (SELECT review FROM versions WHERE id = $3) = 'approved'")
             .bind(entry.id)
             .bind(&p.summary)
+            .bind(vid)
             .execute(&state.db)
             .await?;
     }
     Ok(())
 }
 
-/// Stores a stack release with its diff against the previous release on the same track.
+/// Stores a stack release with its diff against the previous published release on the same track.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_release(
     state: &AppState,
@@ -567,7 +593,8 @@ pub async fn store_release(
 ) -> AppResult<()> {
     let prev: Option<String> = sqlx::query_scalar(
         "SELECT s.frozen FROM stack_releases s JOIN versions v ON v.id = s.version_id
-         WHERE v.entry_id = $1 AND v.track = $2 AND v.id <> $3 AND v.sort_key < (SELECT sort_key FROM versions WHERE id = $3)
+         WHERE v.entry_id = $1 AND v.track = $2 AND v.id <> $3 AND v.review = 'approved'
+           AND v.sort_key < (SELECT sort_key FROM versions WHERE id = $3)
          ORDER BY v.sort_key DESC LIMIT 1",
     )
     .bind(entry.id)

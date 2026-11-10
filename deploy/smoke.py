@@ -11,7 +11,9 @@ library only. Exits non-zero on the first failure.
 import http.cookiejar
 import json
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -297,6 +299,101 @@ check("the last owner cannot step down", s == 400, s)
 text = page(alice, "/dashboard", contains="/orgs/et")
 check("the dashboard shows the organization's entries", "et/alice-et" in text)
 
+# Release review: a new release of a public entry is reviewed unless the entry, its owner (user or
+# organization) or the publisher is trusted.
+def queue_id(needle):
+    """The review queue's submission for `needle` (owner/name or owner/name@version)."""
+    _, text, _ = maxv.get("/admin")
+    for sid, body in re.findall(r'href="/admin\?s=(\d+)">(.*?)</a>', text, re.S):
+        if f">{needle}<" in body:
+            return sid
+    return None
+
+
+def decide(needle, decision, note=""):
+    sid = queue_id(needle)
+    check(f"the queue lists {needle}", sid is not None)
+    if sid is None:
+        return 0
+    maxv.get(f"/admin?s={sid}")
+    s, _, _ = maxv.post(f"/admin/review/{sid}", {"decision": decision, "note": note})
+    return s
+
+
+def cut(v, name, version, owner=""):
+    v.get("/new/stack")
+    d = f'format = 1\n\n[stack]\nname = "{name}"\nextends = ["et/et-stack@2026.5.0"]\n'
+    s, text, _ = v.post("/new/stack", {"owner": owner, "definition": d, "thornlist": "", "version": version})
+    check(f"{v.name} cuts {owner or v.name}/{name}@{version}", s == 303, f"{s} {text[text.find('alert'):][:200]}")
+
+
+# alice was made trusted above; untrust her for this part, and wait out the per-minute limit on
+# stack releases that the checks above used up.
+text = page(maxv, "/admin/users")
+alice_id = re.search(r'href="/alice">alice</a>.*?action="/admin/users/(\d+)"', text, re.S).group(1)
+s, _, _ = maxv.post(f"/admin/users/{alice_id}", {"action": "untrust"})
+check("untrust alice", s == 303, s)
+time.sleep(61)
+cut(alice, "alice-rel", "1.0.0")
+check("approve alice's new stack", decide("alice/alice-rel", "approve") == 303)
+page(anon, "/alice/alice-rel/1.0.0")
+cut(alice, "alice-rel", "1.1.0")
+page(anon, "/alice/alice-rel/1.1.0", expect=404)
+s, _, _ = anon.get("/api/v1/stacks/alice/alice-rel/releases/1.1.0")
+check("an unreviewed release is not served by the API", s == 404, s)
+s, body, _ = anon.get("/api/v1/stacks/alice/alice-rel/releases")
+check("nor listed by it", s == 200 and "1.1.0" not in body and "1.0.0" in body, body[:200])
+page(alice, "/alice/alice-rel?tab=versions", contains="awaiting review")
+page(alice, "/dashboard", contains="alice/alice-rel@1.1.0")
+check("a release cannot get 'changes requested'", decide("alice/alice-rel@1.1.0", "changes", "x") == 400)
+check("approve the release", decide("alice/alice-rel@1.1.0", "approve") == 303)
+page(anon, "/alice/alice-rel/1.1.0")
+cut(alice, "alice-rel", "1.2.0")
+check("reject a release", decide("alice/alice-rel@1.2.0", "reject", "Pin CarpetX.") == 303)
+page(anon, "/alice/alice-rel/1.2.0", expect=404)
+page(alice, "/dashboard", contains="Pin CarpetX.")
+
+# A pushed tag is reviewed too.
+subprocess.run(["git", "-C", ENV["DEMO_REPOS"] + "/spacetimex.git", "tag", "v0.2.0", "HEAD"], check=True)
+alice.get("/alice/spacetimex")
+s, _, _ = alice.post("/alice/spacetimex/refresh", {})
+check("alice checks for new tags", s == 303, s)
+page(anon, "/alice/spacetimex/0.2.0", expect=404)
+page(maxv, "/admin", contains="alice (pushed a tag)")
+check("approve the pushed tag", decide("alice/spacetimex@0.2.0", "approve") == 303)
+page(anon, "/alice/spacetimex/0.2.0")
+
+# A trusted entry's releases publish at once.
+text = page(maxv, "/admin/entries?q=alice-rel")
+eid = re.search(r'action="/admin/entries/(\d+)"', text).group(1)
+s, _, _ = maxv.post(f"/admin/entries/{eid}", {"action": "trust"})
+check("the superadmin trusts an entry", s == 303, s)
+page(maxv, "/admin/entries?q=alice-rel", contains="trusted")
+cut(alice, "alice-rel", "1.3.0")
+page(anon, "/alice/alice-rel/1.3.0")
+
+# So do a trusted organization's, and new entries under it.
+page(anon, "/et/alice-et")  # created above while alice was trusted, so already public
+cut(alice, "alice-et", "0.2.0", owner="et")
+page(anon, "/et/alice-et/0.2.0", expect=404)
+bob.get("/dashboard")
+s, _, _ = bob.post("/orgs/et/trust", {"trusted": "true"})
+check("only the superadmin trusts organizations by default", s == 403, s)
+maxv.get("/orgs/et")
+s, _, _ = maxv.post("/orgs/et/trust", {"trusted": "true"})
+check("the superadmin trusts et", s == 303, s)
+page(maxv, "/orgs/et", contains="Untrust organization")
+page(maxv, "/admin/site", contains="trusted")
+cut(alice, "alice-et", "0.3.0", owner="et")
+page(anon, "/et/alice-et/0.3.0")
+cut(alice, "alice-et2", "0.1.0", owner="et")
+page(anon, "/et/alice-et2/0.1.0")
+page(anon, "/et/alice-et/0.2.0", expect=404)  # trusting the owner later doesn't approve what waits
+maxv.get("/orgs/et")
+maxv.post("/orgs/et/trust", {"trusted": "false"})
+maxv.get("/admin/users")
+maxv.post(f"/admin/users/{alice_id}", {"action": "trust"})
+
 # Trust: only the superadmin by default; the Site panel lets admins do it too.
 text = page(maxv, "/admin/users")
 bid = re.search(r'href="/bob">bob</a>.*?action="/admin/users/(\d+)"', text, re.S).group(1)
@@ -309,7 +406,7 @@ check("an admin sees no trust buttons by default", 'value="trust"' not in text)
 s, _, _ = alice.post(f"/admin/users/{bid}", {"action": "trust"})
 check("an admin cannot trust users by default", s == 400, s)
 page(alice, "/admin/site", expect=403)
-page(maxv, "/admin/site", contains="Who can mark users trusted")
+page(maxv, "/admin/site", contains="Who can mark users, organizations and entries trusted")
 s, _, _ = maxv.post("/admin/site", {"trust_granted_by": "admins"})
 check("the superadmin lets admins grant trust", s == 303, s)
 alice.get("/admin/users")

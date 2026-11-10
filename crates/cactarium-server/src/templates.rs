@@ -89,6 +89,8 @@ pub struct VersionRow {
     pub date: String,
     pub id: i64,
     pub yanked: bool,
+    /// Waiting in review: seen only by the entry's managers and admins.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +416,8 @@ pub struct DocsPage {
 pub struct SubRow {
     pub id: i64,
     pub entry: String,
+    /// A new release of a public entry, not a new entry.
+    pub release: bool,
     pub kind: String,
     pub status: String,
     pub submitter: String,
@@ -424,6 +428,10 @@ pub struct SubRow {
 #[derive(Clone, Debug)]
 pub struct ReviewView {
     pub id: i64,
+    /// The release under review (`1.2.0`), or empty for a new entry.
+    pub release: String,
+    pub entry_trusted: bool,
+    pub owner: String,
     pub entry: String,
     pub entry_url: String,
     pub kind: String,
@@ -459,6 +467,7 @@ pub struct AdminEntryRow {
     pub kind: String,
     pub visibility: String,
     pub verified: bool,
+    pub trusted: bool,
     pub curated: bool,
     pub versions: Vec<VersionRow>,
 }
@@ -470,6 +479,7 @@ pub struct AdminEntriesPage {
     pub nav: String,
     pub q: String,
     pub entries: Vec<AdminEntryRow>,
+    pub can_trust: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -545,6 +555,8 @@ pub struct OrgPage {
     pub display: String,
     pub my_role: String,
     pub can_manage: bool,
+    pub can_trust: bool,
+    pub trusted: bool,
     /// (user id, username, role, added)
     pub members: Vec<(i64, String, String, String)>,
     pub entries: Vec<EntryRow>,
@@ -556,5 +568,6 @@ pub struct AdminSitePage {
     pub ctx: PageCtx,
     pub nav: String,
     pub trust_granted_by: String,
-    pub orgs: Vec<(String, String, i64)>,
+    /// (name, display name, members, trusted)
+    pub orgs: Vec<(String, String, i64, bool)>,
 }

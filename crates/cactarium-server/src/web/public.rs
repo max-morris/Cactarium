@@ -36,6 +36,11 @@ pub fn version_row(e: &Entry, v: &Version, current: Option<i64>) -> VersionRow {
     if v.is_virtual {
         status.push("curated".into());
     }
+    match v.review.as_str() {
+        "pending" => status.insert(0, "awaiting review (only you and admins see it)".into()),
+        "rejected" => status.insert(0, "rejected in review (only you and admins see it)".into()),
+        _ => {}
+    }
     VersionRow {
         label: v.label(),
         url: format!("{}/{}", e.url(), v.label()),
@@ -46,6 +51,7 @@ pub fn version_row(e: &Entry, v: &Version, current: Option<i64>) -> VersionRow {
         date: fmt_date(v.created_at),
         id: v.id,
         yanked: v.yanked,
+        pending: v.review == "pending",
     }
 }
 
@@ -53,7 +59,7 @@ pub fn version_row(e: &Entry, v: &Version, current: Option<i64>) -> VersionRow {
 async fn latest_labels(state: &AppState, ids: &[i64]) -> AppResult<BTreeMap<i64, String>> {
     let rows: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT DISTINCT ON (entry_id) entry_id, track, version FROM versions
-         WHERE entry_id = ANY($1) AND NOT yanked AND state <> 'invalid'
+         WHERE entry_id = ANY($1) AND NOT yanked AND state <> 'invalid' AND review = 'approved'
          ORDER BY entry_id, (track = '') DESC, sort_key DESC",
     )
     .bind(ids)
@@ -129,7 +135,7 @@ async fn thorn_hits(state: &AppState, filter: &str, arg: &str) -> AppResult<Vec<
     let rows: Vec<(String, String, Option<String>, String, String, String, String)> = sqlx::query_as(&format!(
         "SELECT DISTINCT ON (e.id, t.arrangement, t.name) t.arrangement, t.name, t.implements, e.owner, e.name, v.track, v.version
          FROM thorns t JOIN versions v ON v.id = t.version_id JOIN entries e ON e.id = v.entry_id
-         WHERE e.visibility = 'public' AND NOT v.yanked AND {filter}
+         WHERE e.visibility = 'public' AND NOT v.yanked AND v.review = 'approved' AND {filter}
          ORDER BY e.id, t.arrangement, t.name, (v.track = '') DESC, v.sort_key DESC LIMIT 200"
     ))
     .bind(arg)
@@ -165,8 +171,8 @@ pub async fn search(
             "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public'
              AND ($1 = '' OR kind = $1)
              AND ($2 = '%%' OR owner || '/' || name ILIKE $2 OR summary ILIKE $2
-                  OR id IN (SELECT v.entry_id FROM thorns t JOIN versions v ON v.id = t.version_id WHERE t.name ILIKE $2 OR t.implements ILIKE $2)
-                  OR id IN (SELECT v.entry_id FROM release_thorns r JOIN versions v ON v.id = r.version_id WHERE r.checkout ILIKE $2))
+                  OR id IN (SELECT v.entry_id FROM thorns t JOIN versions v ON v.id = t.version_id WHERE v.review = 'approved' AND (t.name ILIKE $2 OR t.implements ILIKE $2))
+                  OR id IN (SELECT v.entry_id FROM release_thorns r JOIN versions v ON v.id = r.version_id WHERE v.review = 'approved' AND r.checkout ILIKE $2))
              ORDER BY (name ILIKE $3) DESC, updated_at DESC LIMIT 100"
         ))
         .bind(&kind)
@@ -217,7 +223,7 @@ async fn building(state: &AppState, thorn: &str, by_name: bool) -> AppResult<Vec
     let entries = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries e WHERE visibility = 'public' AND kind IN ('stack', 'sim') AND id IN
          (SELECT v.entry_id FROM release_thorns r JOIN versions v ON v.id = r.version_id WHERE {cond}
-            AND v.id = (SELECT id FROM versions w WHERE w.entry_id = v.entry_id AND NOT w.yanked ORDER BY (w.track = '') DESC, w.sort_key DESC LIMIT 1))
+            AND v.id = (SELECT id FROM versions w WHERE w.entry_id = v.entry_id AND NOT w.yanked AND w.review = 'approved' ORDER BY (w.track = '') DESC, w.sort_key DESC LIMIT 1))
          ORDER BY (SELECT count(*) FROM hearts h WHERE h.entry_id = e.id) DESC, updated_at DESC LIMIT 100"
     ))
     .bind(thorn)
@@ -292,7 +298,7 @@ pub async fn sources(
 ) -> AppResult<Response> {
     let entries = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND id IN
-         (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1)
+         (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1 AND v.review = 'approved')
          ORDER BY updated_at DESC"
     ))
     .bind(normalize_url(&q.url))
@@ -498,7 +504,7 @@ async fn pin_rows(
             && let Some(c) = &p.commit
         {
             let label: Option<(String, String)> =
-                sqlx::query_as("SELECT track, version FROM versions WHERE entry_id = $1 AND commit = $2 ORDER BY sort_key DESC LIMIT 1")
+                sqlx::query_as("SELECT track, version FROM versions WHERE entry_id = $1 AND commit = $2 AND review = 'approved' ORDER BY sort_key DESC LIMIT 1")
                     .bind(id)
                     .bind(c)
                     .fetch_optional(&state.db)
@@ -571,7 +577,7 @@ async fn show(
 ) -> AppResult<Response> {
     let user = v.user();
     let e = model::visible_entry(state, owner, name, user).await?;
-    let versions = model::versions(state, e.id).await?;
+    let versions = model::versions_for(state, &e, user).await?;
     let ctx = PageCtx::new(state, v.0.as_ref());
     let head = head_of(state, &e, user).await?;
     match e.kind.as_str() {
@@ -652,7 +658,7 @@ async fn package_page(
     };
     let used_by = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND kind <> 'package' AND id IN
-         (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1) ORDER BY updated_at DESC LIMIT 50"
+         (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1 AND v.review = 'approved') ORDER BY updated_at DESC LIMIT 50"
     ))
     .bind(normalize_url(&e.repo_url))
     .fetch_all(&state.db)
@@ -680,7 +686,7 @@ async fn package_page(
     let forks = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND kind = 'package' AND id IN
          (SELECT v.entry_id FROM claims c JOIN versions v ON v.id = c.version_id
-          WHERE c.kind = 'fork-of' AND c.target_owner = $1 AND c.target_name = $2) ORDER BY owner, name"
+          WHERE c.kind = 'fork-of' AND c.target_owner = $1 AND c.target_name = $2 AND v.review = 'approved') ORDER BY owner, name"
     ))
     .bind(&entry.owner)
     .bind(&entry.name)
@@ -777,7 +783,7 @@ async fn stack_page(
         .unwrap_or_default();
     let used_by = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND kind = 'stack' AND id <> $2 AND id IN
-         (SELECT v.entry_id FROM stack_releases s JOIN versions v ON v.id = s.version_id WHERE s.recipe LIKE $1)"
+         (SELECT v.entry_id FROM stack_releases s JOIN versions v ON v.id = s.version_id WHERE s.recipe LIKE $1 AND v.review = 'approved')"
     ))
     .bind(format!("%\"{}@%", entry.slug()))
     .bind(entry.id)
@@ -949,7 +955,10 @@ pub async fn download(
     Path((owner, name, label, file)): Path<(String, String, String, String)>,
 ) -> AppResult<Response> {
     let e = model::visible_entry(&state, &owner, &name, v.user()).await?;
-    let ver = model::version_by_label(&state, e.id, &label).await?.ok_or(AppError::NotFound)?;
+    let ver = model::any_version_by_label(&state, e.id, &label)
+        .await?
+        .filter(|ver| ver.approved() || e.manageable_by(v.user()))
+        .ok_or(AppError::NotFound)?;
     let (body, filename) = match (e.kind.as_str(), file.as_str()) {
         ("sim", "download.sim") => (sim_file(&state, ver.id).await?.0, format!("{name}-{label}.sim")),
         ("stack", "download.th") => {

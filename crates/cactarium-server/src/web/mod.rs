@@ -77,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/orgs/{name}", get(orgs::manage_page))
         .route("/orgs/{name}/members", post(orgs::add_member))
         .route("/orgs/{name}/members/{uid}", post(orgs::member_action))
+        .route("/orgs/{name}/trust", post(orgs::set_trust))
         .route("/hooks/{provider}/{entry_id}", post(hooks::receive))
         .nest("/api/v1", api)
         .nest_service("/static", ServeDir::new(&state.cfg.static_dir))

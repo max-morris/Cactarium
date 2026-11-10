@@ -26,10 +26,12 @@ pub struct Org {
     pub id: i64,
     pub name: String,
     pub display_name: Option<String>,
+    /// Releases of the org's entries, and entries created under it, publish without review.
+    pub trusted: bool,
 }
 
 pub async fn find_org(state: &AppState, name: &str) -> AppResult<Option<Org>> {
-    Ok(sqlx::query_as::<_, Org>("SELECT id, name, display_name FROM orgs WHERE name = $1")
+    Ok(sqlx::query_as::<_, Org>("SELECT id, name, display_name, trusted FROM orgs WHERE name = $1")
         .bind(name)
         .fetch_optional(&state.db)
         .await?)
@@ -86,7 +88,7 @@ pub async fn create(
     }
     let display = display.map(str::trim).filter(|d| !d.is_empty());
     let mut tx = state.db.begin().await?;
-    let org = sqlx::query_as::<_, Org>("INSERT INTO orgs (name, display_name, created_by) VALUES ($1, $2, $3) RETURNING id, name, display_name")
+    let org = sqlx::query_as::<_, Org>("INSERT INTO orgs (name, display_name, created_by) VALUES ($1, $2, $3) RETURNING id, name, display_name, trusted")
         .bind(name)
         .bind(display)
         .bind(by.map(|b| b.id))
@@ -170,6 +172,8 @@ pub async fn manage_page(
     let p = OrgPage {
         ctx: PageCtx::new(&state, Some(&s.session)),
         can_manage: manages(&state, &org, &s.user).await?,
+        can_trust: crate::site::may_grant_trust(&state, &s.user).await?,
+        trusted: org.trusted,
         my_role: role.unwrap_or_default(),
         members: members(&state, org.id).await?,
         entries: entry_rows(&state, entries).await?,
@@ -283,4 +287,35 @@ pub async fn member_action(
     .await?;
     let back = if leaving { "/settings".to_owned() } else { format!("/orgs/{}", org.name) };
     Ok(Redirect::to(&back).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct TrustForm {
+    trusted: bool,
+    #[serde(rename = "_csrf")]
+    csrf: String,
+}
+
+/// Trusts or untrusts an organization: whoever may mark users trusted (see Admin, Site).
+pub async fn set_trust(
+    State(state): State<AppState>,
+    s: SignedIn,
+    Path(name): Path<String>,
+    Form(f): Form<TrustForm>,
+) -> AppResult<Response> {
+    s.session.check_csrf(&f.csrf)?;
+    if !crate::site::may_grant_trust(&state, &s.user).await? {
+        return Err(AppError::Denied(
+            "only the superadmin can change what is trusted (see Admin, Site)".into(),
+        ));
+    }
+    let org = find_org(&state, &name).await?.ok_or(AppError::NotFound)?;
+    sqlx::query("UPDATE orgs SET trusted = $2 WHERE id = $1")
+        .bind(org.id)
+        .bind(f.trusted)
+        .execute(&state.db)
+        .await?;
+    let action = if f.trusted { "org.trust" } else { "org.untrust" };
+    audit(&state, Some(s.user.id), action, Some(&org.name), json!({}), None).await?;
+    Ok(Redirect::to(&format!("/orgs/{}", org.name)).into_response())
 }

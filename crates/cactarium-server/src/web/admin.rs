@@ -52,6 +52,8 @@ pub struct QueueQ {
 struct SubFull {
     id: i64,
     entry_id: i64,
+    /// Set for a new release of a public entry; NULL for a new entry.
+    version_id: Option<i64>,
     status: String,
     note: Option<String>,
     checklist: serde_json::Value,
@@ -66,7 +68,7 @@ pub async fn queue(
     Query(q): Query<QueueQ>,
 ) -> AppResult<Response> {
     let subs: Vec<SubFull> = sqlx::query_as(
-        "SELECT s.id, s.entry_id, s.status, s.note, s.checklist, s.created_at, u.username AS submitter, u.trusted
+        "SELECT s.id, s.entry_id, s.version_id, s.status, s.note, s.checklist, s.created_at, u.username AS submitter, u.trusted
          FROM submissions s LEFT JOIN users u ON u.id = s.submitter
          WHERE s.status IN ('open', 'changes-requested') ORDER BY (s.status = 'open') DESC, s.created_at",
     )
@@ -77,12 +79,17 @@ pub async fn queue(
     let mut review = None;
     for s in &subs {
         let e = model::entry_by_id(&state, s.entry_id).await?;
+        let release = release_label(&state, s.version_id).await?;
         open.push(SubRow {
             id: s.id,
-            entry: e.slug(),
+            entry: match &release {
+                Some(l) => format!("{}@{l}", e.slug()),
+                None => e.slug(),
+            },
+            release: release.is_some(),
             kind: e.kind.clone(),
             status: s.status.clone(),
-            submitter: s.submitter.clone().unwrap_or_default(),
+            submitter: s.submitter.clone().unwrap_or_else(|| format!("{} (pushed a tag)", e.owner)),
             when: fmt_time(s.created_at),
             selected: Some(s.id) == selected,
         });
@@ -100,9 +107,24 @@ pub async fn queue(
     .into_response())
 }
 
+/// The label of a release under review, if the submission is for one.
+async fn release_label(state: &AppState, version_id: Option<i64>) -> AppResult<Option<String>> {
+    let Some(vid) = version_id else { return Ok(None) };
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT track, version FROM versions WHERE id = $1")
+            .bind(vid)
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(row.map(|(t, v)| if t.is_empty() { v } else { format!("{t}:{v}") }))
+}
+
 async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<ReviewView> {
-    let versions = model::versions(state, e.id).await?;
-    let latest = versions.iter().find(|v| v.usable()).or(versions.first());
+    let versions = model::all_versions(state, e.id).await?;
+    // A release under review shows that release; a new entry shows its newest usable version.
+    let latest = match s.version_id {
+        Some(vid) => versions.iter().find(|v| v.id == vid),
+        None => versions.iter().find(|v| v.usable()).or(versions.first()),
+    };
     let mut warnings: Vec<String> = versions
         .iter()
         .filter(|v| v.state == "invalid")
@@ -118,6 +140,21 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
             "stack" => {
                 if let Ok(f) = crate::stacks::frozen_of(state, v).await {
                     detail = f.thornlist.text;
+                }
+                if s.version_id.is_some() {
+                    let diff: Option<serde_json::Value> =
+                        sqlx::query_scalar("SELECT diff FROM stack_releases WHERE version_id = $1")
+                            .bind(v.id)
+                            .fetch_optional(&state.db)
+                            .await?;
+                    for d in diff.and_then(|d| d.as_array().cloned()).unwrap_or_default() {
+                        warnings.push(format!(
+                            "changed since the last published release: {} {} -> {}",
+                            d["repo"].as_str().unwrap_or("?"),
+                            d["from"].as_str().unwrap_or("(new)"),
+                            d["to"].as_str().unwrap_or("(removed)"),
+                        ));
+                    }
                 }
             }
             _ => {
@@ -138,14 +175,18 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
             None => vec![],
         };
     let checked: HashMap<String, bool> = serde_json::from_value(s.checklist.clone()).unwrap_or_default();
+    let release = latest.filter(|_| s.version_id.is_some()).map(|v| v.label());
     Ok(ReviewView {
         id: s.id,
+        release: release.unwrap_or_default(),
+        entry_trusted: e.trusted,
         entry: e.slug(),
         entry_url: e.url(),
         kind: e.kind.clone(),
         status: s.status.clone(),
         submitter: s.submitter.clone().unwrap_or_default(),
         submitter_trusted: s.trusted.unwrap_or(false),
+        owner: e.owner.clone(),
         summary: e.summary.clone().unwrap_or_default(),
         versions: versions.iter().map(|v| version_row(e, v, None)).collect(),
         thorns,
@@ -177,8 +218,8 @@ pub async fn decide(
     Form(f): Form<HashMap<String, String>>,
 ) -> AppResult<Response> {
     a.session.check_csrf(f.get("_csrf").map(String::as_str).unwrap_or(""))?;
-    let (entry_id, submitter): (i64, Option<i64>) =
-        sqlx::query_as("SELECT entry_id, submitter FROM submissions WHERE id = $1")
+    let (entry_id, version_id, submitter): (i64, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT entry_id, version_id, submitter FROM submissions WHERE id = $1")
             .bind(id)
             .fetch_optional(&state.db)
             .await?
@@ -199,6 +240,11 @@ pub async fn decide(
     if status == "changes-requested" && note.is_none() {
         return Err(AppError::bad("say what needs to change in the note"));
     }
+    if status == "changes-requested" && version_id.is_some() {
+        return Err(AppError::bad(
+            "a release never changes: reject it with a note, and the owner tags a new one",
+        ));
+    }
     sqlx::query("UPDATE submissions SET status = $2, note = $3, checklist = $4, reviewer = $5, decided_at = now() WHERE id = $1")
         .bind(id)
         .bind(status)
@@ -207,11 +253,31 @@ pub async fn decide(
         .bind(a.user.id)
         .execute(&state.db)
         .await?;
-    if status == "approved" {
-        sqlx::query("UPDATE entries SET visibility = 'public', updated_at = now() WHERE id = $1 AND visibility = 'pending'")
+    match version_id {
+        Some(vid) if status != "changes-requested" => {
+            sqlx::query("UPDATE versions SET review = $2 WHERE id = $1")
+                .bind(vid)
+                .bind(status)
+                .execute(&state.db)
+                .await?;
+            if status == "approved" {
+                crate::publish::touch(&state, entry_id).await?;
+            }
+        }
+        None if status == "approved" => {
+            sqlx::query("UPDATE entries SET visibility = 'public', updated_at = now() WHERE id = $1 AND visibility = 'pending'")
+                .bind(entry_id)
+                .execute(&state.db)
+                .await?;
+        }
+        _ => {}
+    }
+    if f.contains_key("trust_entry") && site::may_grant_trust(&state, &a.user).await? {
+        sqlx::query("UPDATE entries SET trusted = TRUE WHERE id = $1")
             .bind(entry_id)
             .execute(&state.db)
             .await?;
+        audit(&state, Some(a.user.id), "entry.trust", Some(&e.slug()), json!({}), None).await?;
     }
     if f.contains_key("trust_submitter")
         && let Some(uid) = submitter
@@ -228,7 +294,7 @@ pub async fn decide(
         Some(a.user.id),
         &format!("review.{status}"),
         Some(&e.slug()),
-        json!({ "submission": id, "note": note }),
+        json!({ "submission": id, "version_id": version_id, "note": note }),
         None,
     )
     .await?;
@@ -246,7 +312,7 @@ pub struct FilterQ {
 async fn admin_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<AdminEntryRow>> {
     let mut out = Vec::new();
     for e in entries {
-        let versions = model::versions(state, e.id).await?;
+        let versions = model::all_versions(state, e.id).await?;
         out.push(AdminEntryRow {
             id: e.id,
             slug: e.slug(),
@@ -254,6 +320,7 @@ async fn admin_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<Admi
             kind: e.kind.clone(),
             visibility: e.visibility.clone(),
             verified: e.verified,
+            trusted: e.trusted,
             curated: e.curated,
             versions: versions.iter().take(12).map(|v| version_row(&e, v, None)).collect(),
         });
@@ -278,6 +345,7 @@ pub async fn entries(
         nav: "entries".into(),
         q: q.q,
         entries,
+        can_trust: site::may_grant_trust(&state, &a.user).await?,
     })?
     .into_response())
 }
@@ -303,6 +371,13 @@ pub async fn entry_action(
         "unhide" => "UPDATE entries SET visibility = 'public' WHERE id = $1",
         "verify" => "UPDATE entries SET verified = TRUE WHERE id = $1",
         "unverify" => "UPDATE entries SET verified = FALSE WHERE id = $1",
+        "trust" | "untrust" if !site::may_grant_trust(&state, &a.user).await? => {
+            return Err(AppError::Denied(
+                "only the superadmin can change what is trusted (see Admin, Site)".into(),
+            ));
+        }
+        "trust" => "UPDATE entries SET trusted = TRUE WHERE id = $1",
+        "untrust" => "UPDATE entries SET trusted = FALSE WHERE id = $1",
         "transfer" => {
             let to = f.new_owner.as_deref().map(str::trim).unwrap_or("");
             to.parse::<Owner>().map_err(AppError::bad)?;
@@ -572,8 +647,8 @@ pub async fn site_page(State(state): State<AppState>, Admin(a): Admin) -> AppRes
     if !a.user.is_superadmin() {
         return Err(AppError::Forbidden);
     }
-    let orgs: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT o.name, o.display_name, (SELECT count(*) FROM org_members m WHERE m.org_id = o.id) FROM orgs o ORDER BY o.name",
+    let orgs: Vec<(String, Option<String>, i64, bool)> = sqlx::query_as(
+        "SELECT o.name, o.display_name, (SELECT count(*) FROM org_members m WHERE m.org_id = o.id), o.trusted FROM orgs o ORDER BY o.name",
     )
     .fetch_all(&state.db)
     .await?;
@@ -583,7 +658,7 @@ pub async fn site_page(State(state): State<AppState>, Admin(a): Admin) -> AppRes
         trust_granted_by: site::get(&state, site::TRUST_GRANTED_BY)
             .await?
             .unwrap_or_else(|| "superadmin".into()),
-        orgs: orgs.into_iter().map(|(n, d, c)| (n, d.unwrap_or_default(), c)).collect(),
+        orgs: orgs.into_iter().map(|(n, d, c, t)| (n, d.unwrap_or_default(), c, t)).collect(),
     })?
     .into_response())
 }

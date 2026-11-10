@@ -51,8 +51,11 @@ pub async fn dashboard(State(state): State<AppState>, s: SignedIn) -> AppResult<
     .bind(&mine)
     .fetch_all(&state.db)
     .await?;
+    // New entries and new releases; a release shows as owner/name@version.
     let reviews: Vec<(String, String, String, Option<String>, time::OffsetDateTime)> = sqlx::query_as(
-        "SELECT e.owner, e.name, s.status, s.note, COALESCE(s.decided_at, s.created_at) FROM submissions s JOIN entries e ON e.id = s.entry_id
+        "SELECT e.owner, e.name || COALESCE('@' || NULLIF(v.track, '') || ':' || v.version, '@' || v.version, ''),
+                s.status, s.note, COALESCE(s.decided_at, s.created_at)
+         FROM submissions s JOIN entries e ON e.id = s.entry_id LEFT JOIN versions v ON v.id = s.version_id
          WHERE e.owner = ANY($1) AND s.status <> 'auto-approved' ORDER BY s.created_at DESC LIMIT 20",
     )
     .bind(&mine)
@@ -177,7 +180,7 @@ pub async fn new_sim(
     }
     .await;
     match result {
-        Ok((entry, n)) => Ok(Redirect::to(&format!("{}/{n}", entry.url())).into_response()),
+        Ok((entry, n, _)) => Ok(Redirect::to(&format!("{}/{n}", entry.url())).into_response()),
         Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
             Ok(page(&NewSimPage { ctx: PageCtx::new(&state, Some(&s.session)), error: Some(m) })?
                 .into_response())
@@ -248,7 +251,7 @@ pub async fn cut_release(
     definition: &str,
     thornlist: Option<&str>,
     version: &str,
-) -> AppResult<Entry> {
+) -> AppResult<(Entry, &'static str)> {
     let owner = owner
         .map(str::trim)
         .filter(|o| !o.is_empty())
@@ -274,7 +277,7 @@ pub async fn cut_release(
                 e.slug()
             )));
         }
-        if model::version_by_label(state, e.id, &label).await?.is_some() {
+        if model::any_version_by_label(state, e.id, &label).await?.is_some() {
             return Err(AppError::Conflict(format!(
                 "{}@{label} already exists; releases never change",
                 e.slug()
@@ -310,8 +313,9 @@ pub async fn cut_release(
     let toml = toml::to_string(&frozen).map_err(anyhow::Error::from)?;
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let manifest_json = serde_json::to_value(&m).map_err(anyhow::Error::from)?;
+    let review = publish::release_review(state, &entry, Some(user)).await?;
     let vid: i64 = sqlx::query_scalar(
-        "INSERT INTO versions (entry_id, track, version, sort_key, manifest, published_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO versions (entry_id, track, version, sort_key, manifest, published_by, review) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(entry.id)
     .bind(&track)
@@ -319,6 +323,7 @@ pub async fn cut_release(
     .bind(semver_sort_key(&tv.version))
     .bind(&manifest_json)
     .bind(user.id)
+    .bind(review)
     .fetch_one(&state.db)
     .await?;
     tracker::store_release(
@@ -351,9 +356,17 @@ pub async fn cut_release(
         }
     }
     publish::touch(state, entry.id).await?;
-    audit(state, Some(user.id), "stack.release", Some(&entry.slug()), json!({ "version": label }), None)
-        .await?;
-    Ok(entry)
+    publish::submit_release(state, &entry, vid, review, Some(user)).await?;
+    audit(
+        state,
+        Some(user.id),
+        "stack.release",
+        Some(&entry.slug()),
+        json!({ "version": label, "review": review }),
+        None,
+    )
+    .await?;
+    Ok((entry, review))
 }
 
 pub async fn new_stack(
@@ -367,7 +380,7 @@ pub async fn new_stack(
     match cut_release(&state, &s.user, Some(&f.owner), &f.definition, Some(&f.thornlist), &f.version)
         .await
     {
-        Ok(e) => Ok(Redirect::to(&e.url()).into_response()),
+        Ok((e, _)) => Ok(Redirect::to(&e.url()).into_response()),
         Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
             Ok(page(&NewStackPage {
                 ctx: PageCtx::new(&state, Some(&s.session)),

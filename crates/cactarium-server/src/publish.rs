@@ -1,9 +1,15 @@
 //! Creating entries and recording submissions: who goes through review and who does not.
 //!
-//! A new entry from an ordinary user is `pending` (visible to its owner and admins) with an open
-//! submission in the review queue. Trusted users and admins publish straight to `public`; their
-//! submission is recorded as auto-approved so the audit trail stays complete. Once an entry is
-//! public, its new versions publish without review.
+//! Users, organizations and entries can be trusted. A new entry is `pending` (visible to its
+//! owner and admins) with an open submission in the review queue, unless the user creating it is
+//! trusted or an admin, or it goes under a trusted organization: then it goes straight to `public`
+//! and its submission is recorded as auto-approved, so the audit trail stays complete.
+//!
+//! Once an entry is public, each new release (a pushed tag, a snapshot stack release, a new sim
+//! version) is reviewed the same way: it publishes at once when the entry itself, its owner (the
+//! user or organization), or the user publishing it is trusted. Otherwise it is stored as
+//! `pending`, hidden from everyone but the entry's managers and admins, with its own submission in
+//! the queue. While the entry itself is still pending, its releases ride on the entry's review.
 
 use serde_json::json;
 
@@ -58,6 +64,68 @@ fn skips_review(user: &User) -> bool {
     user.trusted || user.is_admin()
 }
 
+/// Whether the namespace `owner` is trusted: a trusted (or admin) user who isn't banned, or a
+/// trusted organization.
+pub async fn owner_trusted(state: &AppState, owner: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND NOT banned AND (trusted OR role <> 'user'))
+             OR EXISTS (SELECT 1 FROM orgs WHERE name = $1 AND trusted)",
+    )
+    .bind(owner)
+    .fetch_one(&state.db)
+    .await?)
+}
+
+/// The review state a new release of `entry` starts in: `approved` or `pending`. `actor` is the
+/// user publishing it, if any (a tag found by polling or a webhook has none: the owner pushed it).
+pub async fn release_review(
+    state: &AppState,
+    entry: &Entry,
+    actor: Option<&User>,
+) -> AppResult<&'static str> {
+    // Re-read: the caller's copy may predate an approval or a change of trust.
+    let (visibility, trusted): (String, bool) =
+        sqlx::query_as("SELECT visibility, trusted FROM entries WHERE id = $1")
+            .bind(entry.id)
+            .fetch_one(&state.db)
+            .await?;
+    let approved = visibility == "pending"
+        || trusted
+        || actor.is_some_and(skips_review)
+        || owner_trusted(state, &entry.owner).await?;
+    Ok(if approved { "approved" } else { "pending" })
+}
+
+/// Queues a new release stored as `pending` for review; does nothing for an approved one.
+pub async fn submit_release(
+    state: &AppState,
+    entry: &Entry,
+    version_id: i64,
+    review: &str,
+    actor: Option<&User>,
+) -> AppResult<()> {
+    if review != "pending" {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO submissions (entry_id, version_id, submitter, status) VALUES ($1, $2, $3, 'open')",
+    )
+    .bind(entry.id)
+    .bind(version_id)
+    .bind(actor.map(|u| u.id))
+    .execute(&state.db)
+    .await?;
+    audit(
+        state,
+        actor.map(|u| u.id),
+        "release.submit",
+        Some(&entry.slug()),
+        json!({ "version_id": version_id }),
+        None,
+    )
+    .await
+}
+
 pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> AppResult<Entry> {
     n.owner.parse::<Owner>().map_err(AppError::bad)?;
     n.name.parse::<Name>().map_err(AppError::bad)?;
@@ -70,7 +138,8 @@ pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> App
     if find_conflict(state, n.owner, n.name).await? {
         return Err(AppError::Conflict(format!("{}/{} already exists", n.owner, n.name)));
     }
-    let visibility = if skips_review(user) { "public" } else { "pending" };
+    let skip = skips_review(user) || owner_trusted(state, n.owner).await?;
+    let visibility = if skip { "public" } else { "pending" };
     let entry = sqlx::query_as::<_, Entry>(&format!(
         "INSERT INTO entries (kind, owner, name, summary, description, visibility, curated, created_by)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {ENTRY_COLS}"
@@ -85,7 +154,7 @@ pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> App
     .bind(user.id)
     .fetch_one(&state.db)
     .await?;
-    let status = if skips_review(user) { "auto-approved" } else { "open" };
+    let status = if skip { "auto-approved" } else { "open" };
     sqlx::query("INSERT INTO submissions (entry_id, submitter, status, decided_at) VALUES ($1, $2, $3, CASE WHEN $3 = 'open' THEN NULL ELSE now() END)")
         .bind(entry.id)
         .bind(user.id)

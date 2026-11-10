@@ -8,6 +8,14 @@
       <h1 class="mono">{{ name }}</h1>
       {% if !display.is_empty() %}<p class="lead">{{ display }}</p>{% endif %}
       {% if !my_role.is_empty() %}<p class="small muted">You are {% if my_role == "owner" %}an owner{% else %}a member{% endif %}.</p>{% endif %}
+      <p class="small">{% if trusted %}<span class="badge good">trusted</span> New entries and releases under <span class="mono">{{ name }}/</span> publish without review.{% else %}<span class="muted">New entries and releases under <span class="mono">{{ name }}/</span> are reviewed unless the entry or the member publishing is trusted.</span>{% endif %}</p>
+      {% if can_trust %}
+      <form method="post" action="/orgs/{{ name }}/trust" class="row-wrap">
+        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+        {% if trusted %}<input type="hidden" name="trusted" value="false"><button class="button small ghost" type="submit">Untrust organization</button>
+        {% else %}<input type="hidden" name="trusted" value="true"><button class="button small ghost" type="submit">Trust organization</button>{% endif %}
+      </form>
+      {% endif %}
     </div>
     <a class="button ghost" href="/{{ name }}">Public page</a>
   </div>

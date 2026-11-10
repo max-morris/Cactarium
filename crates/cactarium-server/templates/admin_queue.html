@@ -8,22 +8,22 @@
     <h1 class="h-medium">Review queue</h1>
     {% for s in open %}
       <a class="queue-item {% if s.selected %}selected{% endif %}" href="/admin?s={{ s.id }}">
-        <span class="small"><strong class="{% if s.status == "changes-requested" %}warn-text{% else %}good-text{% endif %}">{{ s.status }}</strong> · {{ s.kind }}</span>
+        <span class="small"><strong class="{% if s.status == "changes-requested" %}warn-text{% else %}good-text{% endif %}">{{ s.status }}</strong> · {% if s.release %}new release of a {{ s.kind }}{% else %}{{ s.kind }}{% endif %}</span>
         <span class="mono strong">{{ s.entry }}</span>
         <span class="small muted">by {{ s.submitter }} · {{ s.when }}</span>
       </a>
     {% else %}
       <p class="muted">Nothing waiting.</p>
     {% endfor %}
-    <p class="small muted">Trusted users skip this queue; their submissions are recorded as auto-approved.</p>
+    <p class="small muted">Trusted users and organizations skip this queue, and so do new releases of trusted entries; their submissions are recorded as auto-approved. Releases of other public entries come here as they appear.</p>
   </section>
   <section class="split-main stack" aria-label="Review">
   {% if let Some(r) = review %}
     <div class="stack-sm">
-      <span class="eyebrow">{{ r.kind }} · {{ r.status }}</span>
-      <h2 class="mono"><a href="{{ r.entry_url }}">{{ r.entry }}</a></h2>
+      <span class="eyebrow">{% if r.release.is_empty() %}{{ r.kind }}{% else %}new release of a public {{ r.kind }}{% endif %} · {{ r.status }}</span>
+      <h2 class="mono"><a href="{{ r.entry_url }}">{{ r.entry }}</a>{% if !r.release.is_empty() %}@{{ r.release }}{% endif %}</h2>
       {% if !r.summary.is_empty() %}<p class="lead">{{ r.summary }}</p>{% endif %}
-      <p class="small muted">Submitted by <span class="mono">{{ r.submitter }}</span>{% if r.submitter_trusted %} (trusted){% endif %}</p>
+      <p class="small muted">{% if r.submitter.is_empty() %}A tag pushed to <span class="mono">{{ r.owner }}</span>'s repo{% else %}Submitted by <span class="mono">{{ r.submitter }}</span>{% if r.submitter_trusted %} (trusted){% endif %}{% endif %}</p>
     </div>
     <div class="split">
       <div class="split-main stack">
@@ -51,11 +51,15 @@
         <label for="note">Note to the submitter</label>
         <textarea id="note" name="note" rows="4">{{ r.note }}</textarea>
         <button class="button" name="decision" value="approve" type="submit">Approve and publish</button>
-        <button class="button ghost" name="decision" value="changes" type="submit">Request changes</button>
+        {% if r.release.is_empty() %}<button class="button ghost" name="decision" value="changes" type="submit">Request changes</button>{% endif %}
         <button class="button danger" name="decision" value="reject" type="submit">Reject</button>
-        {% if !r.submitter_trusted && can_trust %}
+        {% if !r.submitter_trusted && !r.submitter.is_empty() && can_trust %}
         <label class="check small"><input type="checkbox" name="trust_submitter"> <span>Also mark <strong>{{ r.submitter }}</strong> as trusted (future submissions publish without review)</span></label>
         {% endif %}
+        {% if !r.entry_trusted && can_trust %}
+        <label class="check small"><input type="checkbox" name="trust_entry"> <span>Also trust <strong>{{ r.entry }}</strong> (its future releases publish without review)</span></label>
+        {% endif %}
+        {% if !r.release.is_empty() %}<p class="small muted">A release never changes. To ask for a fix, reject it with a note; the owner tags a new release.</p>{% endif %}
       </form>
     </div>
   {% else %}

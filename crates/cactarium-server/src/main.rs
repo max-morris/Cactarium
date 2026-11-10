@@ -111,11 +111,12 @@ enum AdminAction {
     Grant { username: String },
     /// Make an admin an ordinary user.
     Revoke { username: String },
-    /// Mark a user trusted (their submissions skip review).
-    Trust { username: String },
-    /// Mark a user untrusted again.
-    Untrust { username: String },
-    /// List admins and trusted users.
+    /// Mark a user, an organization, or an entry (owner/name) trusted: new entries and releases
+    /// they publish, or new releases of the entry, skip review.
+    Trust { name: String },
+    /// Mark a user, organization or entry untrusted again.
+    Untrust { name: String },
+    /// List admins and trusted users, organizations and entries.
     List,
 }
 
@@ -180,10 +181,13 @@ async fn main() -> anyhow::Result<()> {
                 Some((o, n)) => (Some(o.to_owned()), Some(n.to_owned())),
                 None => (None, name),
             };
-            let (e, n) = sims::publish(&state, &user, owner.as_deref(), name.as_deref(), checked)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("Published {}@{n} ({})", e.slug(), e.visibility);
+            let (e, n, review) =
+                sims::publish(&state, &user, owner.as_deref(), name.as_deref(), checked)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let shown =
+                if review == "pending" { "release awaiting review" } else { e.visibility.as_str() };
+            println!("Published {}@{n} ({shown})", e.slug());
             Ok(())
         }
         Command::Org { action } => {
@@ -294,12 +298,8 @@ async fn admin(db: &sqlx::PgPool, action: AdminAction) -> anyhow::Result<()> {
         AdminAction::Revoke { username } => {
             set("UPDATE users SET role = 'user' WHERE username = $1 AND role = 'admin'", username).await
         }
-        AdminAction::Trust { username } => {
-            set("UPDATE users SET trusted = TRUE WHERE username = $1", username).await
-        }
-        AdminAction::Untrust { username } => {
-            set("UPDATE users SET trusted = FALSE WHERE username = $1", username).await
-        }
+        AdminAction::Trust { name } => set_trust(db, &name, true).await,
+        AdminAction::Untrust { name } => set_trust(db, &name, false).await,
         AdminAction::List => {
             let rows: Vec<(String, String, bool)> =
                 sqlx::query_as("SELECT username, role, trusted FROM users WHERE role <> 'user' OR trusted ORDER BY role DESC, username")
@@ -308,9 +308,52 @@ async fn admin(db: &sqlx::PgPool, action: AdminAction) -> anyhow::Result<()> {
             for (u, r, t) in rows {
                 println!("{u}\t{r}{}", if t { "\ttrusted" } else { "" });
             }
+            let orgs: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM orgs WHERE trusted ORDER BY name")
+                    .fetch_all(db)
+                    .await?;
+            for o in orgs {
+                println!("{o}\torganization\ttrusted");
+            }
+            let entries: Vec<String> = sqlx::query_scalar(
+                "SELECT owner || '/' || name FROM entries WHERE trusted ORDER BY owner, name",
+            )
+            .fetch_all(db)
+            .await?;
+            for e in entries {
+                println!("{e}\tentry\ttrusted");
+            }
             Ok(())
         }
     }
+}
+
+/// Trusts or untrusts `name`: an entry if it is `owner/name`, else the user or organization of
+/// that name (they share one namespace).
+async fn set_trust(db: &sqlx::PgPool, name: &str, trusted: bool) -> anyhow::Result<()> {
+    let (sql, kind) = if name.contains('/') {
+        ("UPDATE entries SET trusted = $2 WHERE owner || '/' || name = $1", "entry")
+    } else if sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM orgs WHERE name = $1)")
+        .bind(name)
+        .fetch_one(db)
+        .await?
+    {
+        ("UPDATE orgs SET trusted = $2 WHERE name = $1", "org")
+    } else {
+        ("UPDATE users SET trusted = $2 WHERE username = $1", "user")
+    };
+    let n = sqlx::query(sql).bind(name).bind(trusted).execute(db).await?.rows_affected();
+    if n == 0 {
+        bail!("no user, organization or entry '{name}'");
+    }
+    let action = format!("{kind}.{}", if trusted { "trust" } else { "untrust" });
+    sqlx::query("INSERT INTO audit_log (action, target, details) VALUES ($1, $2, '{\"via\":\"cli\"}')")
+        .bind(&action)
+        .bind(name)
+        .execute(db)
+        .await?;
+    println!("{} {kind} {name}", if trusted { "Trusted" } else { "Untrusted" });
+    Ok(())
 }
 
 fn make_state(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<AppState> {
