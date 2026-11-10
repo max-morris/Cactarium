@@ -37,7 +37,8 @@ pub async fn receive(
     let ok = match provider.as_str() {
         "github" => signed(&repo.webhook_secret, &body, h("x-hub-signature-256")),
         "bitbucket" => signed(&repo.webhook_secret, &body, h("x-hub-signature")),
-        "gitlab" => h("x-gitlab-token").is_some_and(|t| bool::from(t.as_bytes().ct_eq(repo.webhook_secret.as_bytes()))),
+        "gitlab" => h("x-gitlab-token")
+            .is_some_and(|t| bool::from(t.as_bytes().ct_eq(repo.webhook_secret.as_bytes()))),
         _ => return Err(AppError::NotFound.into()),
     };
     if !ok {

@@ -19,6 +19,17 @@
   {% endfor %}
   {% let rows = entries %}
   {% include "_entry_table.html" %}
+  <div class="row-wrap between">
+    <h2>Organizations</h2>
+    <a class="button small ghost" href="/orgs/new">New organization</a>
+  </div>
+  {% if orgs.is_empty() %}
+  <p class="muted">You are in no organizations. An organization is a namespace that several people publish under and manage together.</p>
+  {% else %}
+  <ul class="plain stack-sm">
+    {% for o in orgs %}<li><a class="mono strong" href="/orgs/{{ o.0 }}">{{ o.0 }}</a>{% if !o.1.is_empty() %} <span class="muted">{{ o.1 }}</span>{% endif %} <span class="small muted">({{ o.2 }})</span></li>{% endfor %}
+  </ul>
+  {% endif %}
   <h2>Saved</h2>
   {% let rows = saved %}
   {% include "_entry_table.html" %}

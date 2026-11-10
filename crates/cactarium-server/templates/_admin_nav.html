@@ -5,4 +5,5 @@
   <a href="/admin/tags" {% if nav == "tags" %}class="selected" aria-current="page"{% endif %}>Tag alerts</a>
   <a href="/admin/users" {% if nav == "users" %}class="selected" aria-current="page"{% endif %}>Users</a>
   <a href="/admin/audit" {% if nav == "audit" %}class="selected" aria-current="page"{% endif %}>Audit log</a>
+  {% if ctx.is_superadmin() %}<a href="/admin/site" {% if nav == "site" %}class="selected" aria-current="page"{% endif %}>Site</a>{% endif %}
 </nav>

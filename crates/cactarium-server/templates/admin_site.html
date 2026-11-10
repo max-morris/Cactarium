@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Site · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<section class="stack-lg">
+  <section class="card stack-sm">
+    <h2 class="h-small">Who can mark users trusted</h2>
+    <p class="muted small">Trusted users' submissions skip review and go public at once.</p>
+    <form method="post" action="/admin/site" class="stack-sm">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label class="row-wrap"><input type="radio" name="trust_granted_by" value="superadmin" {% if trust_granted_by != "admins" %}checked{% endif %}> Only the superadmin</label>
+      <label class="row-wrap"><input type="radio" name="trust_granted_by" value="admins" {% if trust_granted_by == "admins" %}checked{% endif %}> Any admin</label>
+      <div><button class="button small" type="submit">Save</button></div>
+    </form>
+  </section>
+  <section class="stack-sm">
+    <h2 class="h-small">Organizations</h2>
+    <div class="table-box"><table>
+      <thead><tr><th scope="col">Name</th><th scope="col">Display name</th><th scope="col">Members</th></tr></thead>
+      <tbody>
+      {% for o in orgs %}<tr><td><a class="mono strong" href="/orgs/{{ o.0 }}">{{ o.0 }}</a></td><td>{{ o.1 }}</td><td>{{ o.2 }}</td></tr>
+      {% else %}<tr><td colspan="3" class="muted">No organizations.</td></tr>{% endfor %}
+      </tbody>
+    </table></div>
+    <p class="small muted"><a href="/orgs/new">Create one</a>. Admins may take reserved names such as <span class="mono">et</span>; an organization made for a namespace that already holds entries takes them over.</p>
+  </section>
+</section>
+{% endblock %}

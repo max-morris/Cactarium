@@ -22,7 +22,10 @@ use crate::tracker;
 pub fn version_row(e: &Entry, v: &Version, current: Option<i64>) -> VersionRow {
     let mut status = Vec::new();
     if v.yanked {
-        status.push(format!("yanked{}", v.yank_reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()));
+        status.push(format!(
+            "yanked{}",
+            v.yank_reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
+        ));
     }
     match v.state.as_str() {
         "invalid" => status.push(format!("invalid: {}", v.invalid_reason.as_deref().unwrap_or("?"))),
@@ -56,19 +59,23 @@ async fn latest_labels(state: &AppState, ids: &[i64]) -> AppResult<BTreeMap<i64,
     .bind(ids)
     .fetch_all(&state.db)
     .await?;
-    Ok(rows.into_iter().map(|(id, t, v)| (id, if t.is_empty() { v } else { format!("{t}:{v}") })).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(id, t, v)| (id, if t.is_empty() { v } else { format!("{t}:{v}") }))
+        .collect())
 }
 
 pub async fn entry_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<EntryRow>> {
     let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
     let latest = latest_labels(state, &ids).await?;
-    let hearts: BTreeMap<i64, i64> =
-        sqlx::query_as::<_, (i64, i64)>("SELECT entry_id, count(*) FROM hearts WHERE entry_id = ANY($1) GROUP BY entry_id")
-            .bind(&ids)
-            .fetch_all(&state.db)
-            .await?
-            .into_iter()
-            .collect();
+    let hearts: BTreeMap<i64, i64> = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT entry_id, count(*) FROM hearts WHERE entry_id = ANY($1) GROUP BY entry_id",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
     Ok(entries
         .into_iter()
         .map(|e| EntryRow {
@@ -92,7 +99,9 @@ pub async fn home(State(state): State<AppState>, v: Visitor) -> AppResult<Respon
     .fetch_all(&state.db)
     .await?;
     let counts: Vec<(String, i64)> =
-        sqlx::query_as("SELECT kind, count(*) FROM entries WHERE visibility = 'public' GROUP BY kind").fetch_all(&state.db).await?;
+        sqlx::query_as("SELECT kind, count(*) FROM entries WHERE visibility = 'public' GROUP BY kind")
+            .fetch_all(&state.db)
+            .await?;
     let count = |k: &str| counts.iter().find(|c| c.0 == k).map(|c| c.1).unwrap_or(0);
     let p = HomePage {
         ctx: PageCtx::new(&state, v.0.as_ref()),
@@ -138,9 +147,17 @@ async fn thorn_hits(state: &AppState, filter: &str, arg: &str) -> AppResult<Vec<
         .collect())
 }
 
-pub async fn search(State(state): State<AppState>, v: Visitor, Query(q): Query<SearchQ>) -> AppResult<Response> {
+pub async fn search(
+    State(state): State<AppState>,
+    v: Visitor,
+    Query(q): Query<SearchQ>,
+) -> AppResult<Response> {
     let term = q.q.trim().to_owned();
-    let kind = if ["package", "stack", "sim", "thorn"].contains(&q.kind.as_str()) { q.kind.clone() } else { String::new() };
+    let kind = if ["package", "stack", "sim", "thorn"].contains(&q.kind.as_str()) {
+        q.kind.clone()
+    } else {
+        String::new()
+    };
     let results = if kind == "thorn" {
         vec![]
     } else {
@@ -160,7 +177,12 @@ pub async fn search(State(state): State<AppState>, v: Visitor, Query(q): Query<S
         entry_rows(&state, entries).await?
     };
     let thorns = if (kind.is_empty() && !term.is_empty()) || kind == "thorn" {
-        thorn_hits(&state, "(t.name ILIKE $1 OR t.implements ILIKE $1 OR t.arrangement ILIKE $1)", &like(&term)).await?
+        thorn_hits(
+            &state,
+            "(t.name ILIKE $1 OR t.implements ILIKE $1 OR t.arrangement ILIKE $1)",
+            &like(&term),
+        )
+        .await?
     } else {
         vec![]
     };
@@ -173,13 +195,25 @@ pub async fn search(State(state): State<AppState>, v: Visitor, Query(q): Query<S
         _ => "Search",
     }
     .to_owned();
-    Ok(page(&SearchPage { ctx: PageCtx::new(&state, v.0.as_ref()), q: term, kind, results, thorns, title })?.into_response())
+    Ok(page(&SearchPage {
+        ctx: PageCtx::new(&state, v.0.as_ref()),
+        q: term,
+        kind,
+        results,
+        thorns,
+        title,
+    })?
+    .into_response())
 }
 
 /// Public stacks and sims whose newest version builds a thorn (`Arrangement/Thorn`, or just the
 /// thorn's name when `by_name`).
 async fn building(state: &AppState, thorn: &str, by_name: bool) -> AppResult<Vec<EntryRow>> {
-    let cond = if by_name { "lower(split_part(r.checkout, '/', 2)) = lower($1)" } else { "lower(r.checkout) = lower($1)" };
+    let cond = if by_name {
+        "lower(split_part(r.checkout, '/', 2)) = lower($1)"
+    } else {
+        "lower(r.checkout) = lower($1)"
+    };
     let entries = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries e WHERE visibility = 'public' AND kind IN ('stack', 'sim') AND id IN
          (SELECT v.entry_id FROM release_thorns r JOIN versions v ON v.id = r.version_id WHERE {cond}
@@ -192,7 +226,11 @@ async fn building(state: &AppState, thorn: &str, by_name: bool) -> AppResult<Vec
     entry_rows(state, entries).await
 }
 
-pub async fn thorn(State(state): State<AppState>, v: Visitor, Path((arr, name)): Path<(String, String)>) -> AppResult<Response> {
+pub async fn thorn(
+    State(state): State<AppState>,
+    v: Visitor,
+    Path((arr, name)): Path<(String, String)>,
+) -> AppResult<Response> {
     let full = format!("{arr}/{name}");
     let thorns = thorn_hits(&state, "lower(t.arrangement || '/' || t.name) = lower($1)", &full).await?;
     Ok(page(&SearchPage {
@@ -206,13 +244,29 @@ pub async fn thorn(State(state): State<AppState>, v: Visitor, Path((arr, name)):
     .into_response())
 }
 
-pub async fn thorn_by_name(State(state): State<AppState>, v: Visitor, Path(name): Path<String>) -> AppResult<Response> {
+pub async fn thorn_by_name(
+    State(state): State<AppState>,
+    v: Visitor,
+    Path(name): Path<String>,
+) -> AppResult<Response> {
     let thorns = thorn_hits(&state, "lower(t.name) = lower($1)", &name).await?;
     let results = building(&state, &name, true).await?;
-    Ok(page(&SearchPage { ctx: PageCtx::new(&state, v.0.as_ref()), q: name.clone(), kind: "thorn".into(), results, thorns, title: format!("Thorn {name}: packages that provide it, stacks and sims that build it") })?.into_response())
+    Ok(page(&SearchPage {
+        ctx: PageCtx::new(&state, v.0.as_ref()),
+        q: name.clone(),
+        kind: "thorn".into(),
+        results,
+        thorns,
+        title: format!("Thorn {name}: packages that provide it, stacks and sims that build it"),
+    })?
+    .into_response())
 }
 
-pub async fn implementation(State(state): State<AppState>, v: Visitor, Path(name): Path<String>) -> AppResult<Response> {
+pub async fn implementation(
+    State(state): State<AppState>,
+    v: Visitor,
+    Path(name): Path<String>,
+) -> AppResult<Response> {
     let thorns = thorn_hits(&state, "lower(t.implements) = lower($1)", &name).await?;
     Ok(page(&SearchPage {
         ctx: PageCtx::new(&state, v.0.as_ref()),
@@ -231,7 +285,11 @@ pub struct SourcesQ {
 }
 
 /// Everything that pins a repo, registered on the Cactarium or not.
-pub async fn sources(State(state): State<AppState>, v: Visitor, Query(q): Query<SourcesQ>) -> AppResult<Response> {
+pub async fn sources(
+    State(state): State<AppState>,
+    v: Visitor,
+    Query(q): Query<SourcesQ>,
+) -> AppResult<Response> {
     let entries = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND id IN
          (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1)
@@ -251,28 +309,74 @@ pub async fn sources(State(state): State<AppState>, v: Visitor, Query(q): Query<
     .into_response())
 }
 
-pub async fn owner(State(state): State<AppState>, v: Visitor, Path(owner): Path<String>) -> AppResult<Response> {
-    let display: Option<Option<String>> = sqlx::query_scalar("SELECT display_name FROM users WHERE username = $1")
-        .bind(&owner)
-        .fetch_optional(&state.db)
-        .await?;
+pub async fn owner(
+    State(state): State<AppState>,
+    v: Visitor,
+    Path(owner): Path<String>,
+) -> AppResult<Response> {
+    let display: Option<Option<String>> =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE username = $1")
+            .bind(&owner)
+            .fetch_optional(&state.db)
+            .await?;
+    let org = crate::web::orgs::find_org(&state, &owner).await?;
     let user = v.user();
-    let entries: Vec<Entry> = sqlx::query_as::<_, Entry>(&format!("SELECT {ENTRY_COLS} FROM entries WHERE owner = $1 ORDER BY kind, name"))
-        .bind(&owner)
-        .fetch_all(&state.db)
-        .await?
-        .into_iter()
-        .filter(|e| e.visible_to(user))
-        .collect();
-    if display.is_none() && entries.is_empty() {
+    let entries: Vec<Entry> = sqlx::query_as::<_, Entry>(&format!(
+        "SELECT {ENTRY_COLS} FROM entries WHERE owner = $1 ORDER BY kind, name"
+    ))
+    .bind(&owner)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .filter(|e| e.visible_to(user))
+    .collect();
+    if display.is_none() && org.is_none() && entries.is_empty() {
         return Err(AppError::NotFound);
     }
-    let display = display.flatten().unwrap_or_else(|| owner.clone());
-    Ok(page(&OwnerPage { ctx: PageCtx::new(&state, v.0.as_ref()), owner, display, entries: entry_rows(&state, entries).await? })?.into_response())
+    let (members, orgs, can_manage_org) = match &org {
+        Some(o) => (
+            crate::web::orgs::members(&state, o.id)
+                .await?
+                .into_iter()
+                .map(|(_, u, r, _)| (u, r))
+                .collect(),
+            vec![],
+            user.is_some_and(|u| u.is_admin() || u.orgs.contains(&o.name)),
+        ),
+        None => {
+            let orgs: Vec<String> = sqlx::query_scalar(
+                "SELECT o.name FROM org_members m JOIN orgs o ON o.id = m.org_id JOIN users u ON u.id = m.user_id WHERE u.username = $1 ORDER BY o.name",
+            )
+            .bind(&owner)
+            .fetch_all(&state.db)
+            .await?;
+            (vec![], orgs, false)
+        }
+    };
+    let display = match &org {
+        Some(o) => o.display_name.clone(),
+        None => display.flatten(),
+    }
+    .unwrap_or_else(|| owner.clone());
+    Ok(page(&OwnerPage {
+        ctx: PageCtx::new(&state, v.0.as_ref()),
+        is_org: org.is_some(),
+        members,
+        orgs,
+        can_manage_org,
+        owner,
+        display,
+        entries: entry_rows(&state, entries).await?,
+    })?
+    .into_response())
 }
 
 pub async fn docs(State(state): State<AppState>, v: Visitor) -> AppResult<Response> {
-    Ok(page(&DocsPage { ctx: PageCtx::new(&state, v.0.as_ref()), base_url: state.cfg.base_url.as_str().trim_end_matches('/').to_owned() })?.into_response())
+    Ok(page(&DocsPage {
+        ctx: PageCtx::new(&state, v.0.as_ref()),
+        base_url: state.cfg.base_url.as_str().trim_end_matches('/').to_owned(),
+    })?
+    .into_response())
 }
 
 async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<EntryHead> {
@@ -292,11 +396,15 @@ async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<
     let repo_url = repo.as_ref().map(|r| r.url.clone());
     let contact = model::entry_contact(state, e, repo_url.as_deref()).await?.unwrap_or_default();
     let hearted = match user {
-        Some(u) => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM hearts WHERE user_id = $1 AND entry_id = $2)")
+        Some(u) => {
+            sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM hearts WHERE user_id = $1 AND entry_id = $2)",
+            )
             .bind(u.id)
             .bind(e.id)
             .fetch_one(&state.db)
-            .await?,
+            .await?
+        }
         None => false,
     };
     Ok(EntryHead {
@@ -338,14 +446,20 @@ async fn claims_of(state: &AppState, version_id: i64) -> AppResult<Vec<ClaimRow>
         .collect())
 }
 
-pub async fn thorn_rows(state: &AppState, version_id: i64, caveats: &[(String, String)]) -> AppResult<Vec<ThornRow>> {
+pub async fn thorn_rows(
+    state: &AppState,
+    version_id: i64,
+    caveats: &[(String, String)],
+) -> AppResult<Vec<ThornRow>> {
     let rows: Vec<(String, String, Option<String>, serde_json::Value)> =
         sqlx::query_as("SELECT arrangement, name, implements, facts FROM thorns WHERE version_id = $1 ORDER BY arrangement, name")
             .bind(version_id)
             .fetch_all(&state.db)
             .await?;
     let list = |f: &serde_json::Value, k: &str| {
-        f[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+        f[k].as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
     };
     Ok(rows
         .into_iter()
@@ -367,7 +481,10 @@ pub async fn thorn_rows(state: &AppState, version_id: i64, caveats: &[(String, S
 }
 
 /// Matches pinned repos against registered packages, by URL and frozen commit.
-async fn pin_rows(state: &AppState, pins: &[cactup_ecosystem_common::sim::RepoPin]) -> AppResult<Vec<PinRow>> {
+async fn pin_rows(
+    state: &AppState,
+    pins: &[cactup_ecosystem_common::sim::RepoPin],
+) -> AppResult<Vec<PinRow>> {
     let repos: Vec<(i64, String, String, String)> = sqlx::query_as(
         "SELECT e.id, e.owner, e.name, r.url FROM entry_repos r JOIN entries e ON e.id = r.entry_id WHERE e.kind = 'package' AND e.visibility = 'public'",
     )
@@ -398,7 +515,12 @@ async fn pin_rows(state: &AppState, pins: &[cactup_ecosystem_common::sim::RepoPi
             repo: p.name.clone(),
             url: p.url.clone(),
             git_ref: p.git_ref.clone().unwrap_or_default(),
-            commit: p.commit.as_deref().or(p.sha256.as_deref()).map(|c| c.chars().take(12).collect()).unwrap_or_else(|| "unpinned".into()),
+            commit: p
+                .commit
+                .as_deref()
+                .or(p.sha256.as_deref())
+                .map(|c| c.chars().take(12).collect())
+                .unwrap_or_else(|| "unpinned".into()),
             registered,
         });
     }
@@ -407,7 +529,11 @@ async fn pin_rows(state: &AppState, pins: &[cactup_ecosystem_common::sim::RepoPi
 
 fn tabs(base: &str, list: &[(&str, &str)], selected: &str) -> Vec<Tab> {
     list.iter()
-        .map(|(id, label)| Tab { label: label.to_string(), url: format!("{base}?tab={id}"), selected: *id == selected })
+        .map(|(id, label)| Tab {
+            label: label.to_string(),
+            url: format!("{base}?tab={id}"),
+            selected: *id == selected,
+        })
         .collect()
 }
 
@@ -417,7 +543,12 @@ pub struct EntryQ {
     track: Option<String>,
 }
 
-pub async fn entry(State(state): State<AppState>, v: Visitor, Path((owner, name)): Path<(String, String)>, Query(q): Query<EntryQ>) -> AppResult<Response> {
+pub async fn entry(
+    State(state): State<AppState>,
+    v: Visitor,
+    Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<EntryQ>,
+) -> AppResult<Response> {
     show(&state, &v, &owner, &name, None, q).await
 }
 
@@ -430,7 +561,14 @@ pub async fn entry_version(
     show(&state, &v, &owner, &name, Some(&version), q).await
 }
 
-async fn show(state: &AppState, v: &Visitor, owner: &str, name: &str, label: Option<&str>, q: EntryQ) -> AppResult<Response> {
+async fn show(
+    state: &AppState,
+    v: &Visitor,
+    owner: &str,
+    name: &str,
+    label: Option<&str>,
+    q: EntryQ,
+) -> AppResult<Response> {
     let user = v.user();
     let e = model::visible_entry(state, owner, name, user).await?;
     let versions = model::versions(state, e.id).await?;
@@ -443,16 +581,32 @@ async fn show(state: &AppState, v: &Visitor, owner: &str, name: &str, label: Opt
     }
 }
 
-fn pick<'a>(versions: &'a [Version], label: Option<&str>, track: Option<&str>, default_track: Option<&str>) -> AppResult<Option<&'a Version>> {
+fn pick<'a>(
+    versions: &'a [Version],
+    label: Option<&str>,
+    track: Option<&str>,
+    default_track: Option<&str>,
+) -> AppResult<Option<&'a Version>> {
     if let Some(l) = label {
         return versions.iter().find(|v| v.label() == l).map(Some).ok_or(AppError::NotFound);
     }
     let tracks = model::tracks_of(versions, default_track);
-    let track = track.map(|t| if t == "default" { "" } else { t }).or(tracks.first().map(String::as_str)).unwrap_or("");
+    let track = track
+        .map(|t| if t == "default" { "" } else { t })
+        .or(tracks.first().map(String::as_str))
+        .unwrap_or("");
     Ok(model::latest_on(versions, track))
 }
 
-async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry, versions: Vec<Version>, label: Option<&str>, q: EntryQ) -> AppResult<Response> {
+async fn package_page(
+    state: &AppState,
+    ctx: PageCtx,
+    e: EntryHead,
+    entry: &Entry,
+    versions: Vec<Version>,
+    label: Option<&str>,
+    q: EntryQ,
+) -> AppResult<Response> {
     // The most recently published manifest decides the default track and the track descriptions.
     let newest_manifest: Option<Manifest> = versions
         .iter()
@@ -460,10 +614,18 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
         .max_by_key(|v| v.created_at)
         .and_then(|v| v.manifest.clone())
         .and_then(|m| serde_json::from_value(m).ok());
-    let default_track = newest_manifest.as_ref().and_then(|m| m.package.as_ref()).and_then(|p| p.default_track.clone());
+    let default_track = newest_manifest
+        .as_ref()
+        .and_then(|m| m.package.as_ref())
+        .and_then(|p| p.default_track.clone());
     let current = pick(&versions, label, q.track.as_deref(), default_track.as_deref())?;
-    let manifest: Option<Manifest> = current.and_then(|v| v.manifest.clone()).and_then(|m| serde_json::from_value(m).ok());
-    let caveats: Vec<(String, String)> = manifest.as_ref().map(|m| m.caveats.iter().map(|c| (c.thorn.clone(), c.note.clone())).collect()).unwrap_or_default();
+    let manifest: Option<Manifest> = current
+        .and_then(|v| v.manifest.clone())
+        .and_then(|m| serde_json::from_value(m).ok());
+    let caveats: Vec<(String, String)> = manifest
+        .as_ref()
+        .map(|m| m.caveats.iter().map(|c| (c.thorn.clone(), c.note.clone())).collect())
+        .unwrap_or_default();
     let track_names = model::tracks_of(&versions, default_track.as_deref());
     let current_track = current.map(|v| v.track.clone()).unwrap_or_default();
     let tracks = track_names
@@ -474,7 +636,12 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
             selected: *t == current_track,
             description: newest_manifest
                 .as_ref()
-                .and_then(|m| m.tracks.iter().find(|(k, _)| k.as_str() == t).and_then(|(_, i)| i.description.clone()))
+                .and_then(|m| {
+                    m.tracks
+                        .iter()
+                        .find(|(k, _)| k.as_str() == t)
+                        .and_then(|(_, i)| i.description.clone())
+                })
                 .unwrap_or_default(),
         })
         .collect();
@@ -491,15 +658,22 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
     .fetch_all(&state.db)
     .await?;
     let repo = tracker::repo_of(state, entry.id).await?;
-    let poll_error: String = sqlx::query_scalar::<_, Option<String>>("SELECT poll_error FROM entry_repos WHERE entry_id = $1")
-        .bind(entry.id)
-        .fetch_optional(&state.db)
-        .await?
-        .flatten()
-        .unwrap_or_default();
+    let poll_error: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT poll_error FROM entry_repos WHERE entry_id = $1",
+    )
+    .bind(entry.id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten()
+    .unwrap_or_default();
     let version_note = match current {
-        Some(v) if v.state == "invalid" => format!("This tag could not be published: {}", v.invalid_reason.as_deref().unwrap_or("")),
-        Some(v) if v.yanked => "This version is yanked: still downloadable by exact version, never chosen by a range.".into(),
+        Some(v) if v.state == "invalid" => {
+            format!("This tag could not be published: {}", v.invalid_reason.as_deref().unwrap_or(""))
+        }
+        Some(v) if v.yanked => {
+            "This version is yanked: still downloadable by exact version, never chosen by a range."
+                .into()
+        }
         _ => String::new(),
     };
     // Packages that call themselves forks of this one, and the ones this one forks.
@@ -525,7 +699,16 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
     let p = PackagePage {
         version: current.map(|v| version_row(entry, v, None)),
         readme_html: current.and_then(|v| v.readme_html.clone()).unwrap_or_default(),
-        tabs: tabs(&entry.url(), &[("readme", "README"), ("thorns", "Thorns"), ("versions", "Versions"), ("usedby", "Used by")], &tab),
+        tabs: tabs(
+            &entry.url(),
+            &[
+                ("readme", "README"),
+                ("thorns", "Thorns"),
+                ("versions", "Versions"),
+                ("usedby", "Used by"),
+            ],
+            &tab,
+        ),
         tab,
         thorns,
         claims,
@@ -537,7 +720,11 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
         version_note,
         poll_error,
         webhook_url: state.cfg.url(&format!("/hooks/github/{}", entry.id)),
-        webhook_secret: if e.can_manage { repo.map(|r| r.webhook_secret).unwrap_or_default() } else { String::new() },
+        webhook_secret: if e.can_manage {
+            repo.map(|r| r.webhook_secret).unwrap_or_default()
+        } else {
+            String::new()
+        },
         forks: entry_rows(state, forks).await?,
         upstreams,
         ctx,
@@ -546,17 +733,27 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
     Ok(page(&p)?.into_response())
 }
 
-async fn stack_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry, versions: Vec<Version>, label: Option<&str>) -> AppResult<Response> {
+async fn stack_page(
+    state: &AppState,
+    ctx: PageCtx,
+    e: EntryHead,
+    entry: &Entry,
+    versions: Vec<Version>,
+    label: Option<&str>,
+) -> AppResult<Response> {
     let current = pick(&versions, label, None, None)?;
     let (frozen, how, diff, recipe) = match current {
         Some(v) => {
-            let row: Option<(String, String, serde_json::Value, Option<String>)> =
-                sqlx::query_as("SELECT frozen, how, diff, recipe FROM stack_releases WHERE version_id = $1")
-                    .bind(v.id)
-                    .fetch_optional(&state.db)
-                    .await?;
+            let row: Option<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(
+                "SELECT frozen, how, diff, recipe FROM stack_releases WHERE version_id = $1",
+            )
+            .bind(v.id)
+            .fetch_optional(&state.db)
+            .await?;
             match row {
-                Some((f, how, d, r)) => (toml::from_str::<cactup_ecosystem_common::stack::FrozenStack>(&f).ok(), how, d, r),
+                Some((f, how, d, r)) => {
+                    (toml::from_str::<cactup_ecosystem_common::stack::FrozenStack>(&f).ok(), how, d, r)
+                }
                 None => (None, String::new(), serde_json::Value::Null, None),
             }
         }
@@ -566,7 +763,17 @@ async fn stack_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry,
         .as_deref()
         .and_then(|r| Manifest::from_toml(r).ok())
         .and_then(|m| m.stack)
-        .map(|s| s.extends.iter().map(|b| (b.to_string(), format!("/{}/{}/{}", b.owner, b.name, b.at.clone().unwrap_or_default()))).collect())
+        .map(|s| {
+            s.extends
+                .iter()
+                .map(|b| {
+                    (
+                        b.to_string(),
+                        format!("/{}/{}/{}", b.owner, b.name, b.at.clone().unwrap_or_default()),
+                    )
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let used_by = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND kind = 'stack' AND id <> $2 AND id IN
@@ -584,12 +791,14 @@ async fn stack_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry,
         Some(v) => claims_of(state, v.id).await?,
         None => vec![],
     };
-    let poll_error: String = sqlx::query_scalar::<_, Option<String>>("SELECT poll_error FROM entry_repos WHERE entry_id = $1")
-        .bind(entry.id)
-        .fetch_optional(&state.db)
-        .await?
-        .flatten()
-        .unwrap_or_default();
+    let poll_error: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT poll_error FROM entry_repos WHERE entry_id = $1",
+    )
+    .bind(entry.id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten()
+    .unwrap_or_default();
     let p = StackPage {
         version: current.map(|v| version_row(entry, v, None)),
         releases: versions.iter().map(|v| version_row(entry, v, current.map(|c| c.id))).collect(),
@@ -598,7 +807,9 @@ async fn stack_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry,
             "snapshot" => "snapshot release".into(),
             other => other.to_owned(),
         },
-        install_cmd: current.map(|v| format!("cactup install {}@{}", entry.slug(), v.label())).unwrap_or_default(),
+        install_cmd: current
+            .map(|v| format!("cactup install {}@{}", entry.slug(), v.label()))
+            .unwrap_or_default(),
         tip_cmd: format!("cactup install {}@head", entry.slug()),
         master_cmd: format!("cactup install {}@master", entry.slug()),
         frozen_text: frozen.as_ref().map(|f| f.thornlist.text.clone()).unwrap_or_default(),
@@ -617,18 +828,28 @@ async fn stack_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry,
 }
 
 pub async fn sim_file(state: &AppState, version_id: i64) -> AppResult<(String, crate::sims::SimIndex)> {
-    let (content, index): (String, serde_json::Value) = sqlx::query_as("SELECT content, index FROM sim_files WHERE version_id = $1")
-        .bind(version_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let (content, index): (String, serde_json::Value) =
+        sqlx::query_as("SELECT content, index FROM sim_files WHERE version_id = $1")
+            .bind(version_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
     Ok((content, serde_json::from_value(index).unwrap_or_default()))
 }
 
-async fn sim_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry, versions: Vec<Version>, label: Option<&str>, q: EntryQ) -> AppResult<Response> {
+async fn sim_page(
+    state: &AppState,
+    ctx: PageCtx,
+    e: EntryHead,
+    entry: &Entry,
+    versions: Vec<Version>,
+    label: Option<&str>,
+    q: EntryQ,
+) -> AppResult<Response> {
     let current = pick(&versions, label, None, None)?.ok_or(AppError::NotFound)?;
     let (content, index) = sim_file(state, current.id).await?;
-    let sim = SimFile::from_toml(&content).map_err(|e| AppError::Internal(anyhow::anyhow!("stored sim unreadable: {e}")))?;
+    let sim = SimFile::from_toml(&content)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("stored sim unreadable: {e}")))?;
     let tab = q.tab.unwrap_or_else(|| "parfile".into());
     let mut run = Vec::new();
     if let Some(r) = &sim.run {
@@ -671,7 +892,15 @@ async fn sim_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry, v
             (
                 i.knob.clone(),
                 i.description.clone().unwrap_or_default(),
-                i.url.as_deref().map(|u| format!("{u}{}", i.sha256.as_deref().map(|s| format!(" · sha256 {s}")).unwrap_or_default())).unwrap_or_default(),
+                i.url
+                    .as_deref()
+                    .map(|u| {
+                        format!(
+                            "{u}{}",
+                            i.sha256.as_deref().map(|s| format!(" · sha256 {s}")).unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default(),
             )
         })
         .collect();
@@ -682,7 +911,14 @@ async fn sim_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entry, v
     let p = SimPage {
         tabs: tabs(
             &format!("{}/{}", entry.url(), current.label()),
-            &[("parfile", "Parfile"), ("thornlist", "Thornlist"), ("pins", "Pins"), ("inputs", "Inputs"), ("run", "Run hints"), ("versions", "Versions")],
+            &[
+                ("parfile", "Parfile"),
+                ("thornlist", "Thornlist"),
+                ("pins", "Pins"),
+                ("inputs", "Inputs"),
+                ("run", "Run hints"),
+                ("versions", "Versions"),
+            ],
             &tab,
         ),
         tab,
@@ -725,7 +961,10 @@ pub async fn download(
     Ok((
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_owned()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename.replace(['"', '\\'], ""))),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename.replace(['"', '\\'], "")),
+            ),
         ],
         body,
     )
@@ -738,11 +977,19 @@ pub struct CompareQ {
     b: String,
 }
 
-async fn compare_side(state: &AppState, user: Option<&crate::auth::User>, slug: &str) -> AppResult<(CompareSide, std::collections::BTreeSet<String>)> {
+async fn compare_side(
+    state: &AppState,
+    user: Option<&crate::auth::User>,
+    slug: &str,
+) -> AppResult<(CompareSide, std::collections::BTreeSet<String>)> {
     let (owner, name) = slug.split_once('/').ok_or(AppError::NotFound)?;
     let e = model::visible_entry(state, owner, name, user).await?;
     if e.kind != "package" {
-        return Err(AppError::bad(format!("{} is a {}; only packages can be compared", e.slug(), e.kind)));
+        return Err(AppError::bad(format!(
+            "{} is a {}; only packages can be compared",
+            e.slug(),
+            e.kind
+        )));
     }
     let versions = model::versions(state, e.id).await?;
     let newest_manifest: Option<Manifest> = versions
@@ -751,15 +998,20 @@ async fn compare_side(state: &AppState, user: Option<&crate::auth::User>, slug: 
         .max_by_key(|v| v.created_at)
         .and_then(|v| v.manifest.clone())
         .and_then(|m| serde_json::from_value(m).ok());
-    let default_track = newest_manifest.as_ref().and_then(|m| m.package.as_ref()).and_then(|p| p.default_track.clone());
+    let default_track = newest_manifest
+        .as_ref()
+        .and_then(|m| m.package.as_ref())
+        .and_then(|p| p.default_track.clone());
     let current = pick(&versions, None, None, default_track.as_deref())?;
     let thorns: std::collections::BTreeSet<String> = match current {
-        Some(v) => sqlx::query_scalar::<_, String>("SELECT arrangement || '/' || name FROM thorns WHERE version_id = $1")
-            .bind(v.id)
-            .fetch_all(&state.db)
-            .await?
-            .into_iter()
-            .collect(),
+        Some(v) => sqlx::query_scalar::<_, String>(
+            "SELECT arrangement || '/' || name FROM thorns WHERE version_id = $1",
+        )
+        .bind(v.id)
+        .fetch_all(&state.db)
+        .await?
+        .into_iter()
+        .collect(),
         None => Default::default(),
     };
     let repo = tracker::repo_of(state, e.id).await?.map(|r| r.url);
@@ -785,7 +1037,11 @@ async fn compare_side(state: &AppState, user: Option<&crate::auth::User>, slug: 
 
 /// Two packages side by side, typically an upstream and its fork: their newest versions, tracks,
 /// claims and which thorns each has.
-pub async fn compare(State(state): State<AppState>, v: Visitor, Query(q): Query<CompareQ>) -> AppResult<Response> {
+pub async fn compare(
+    State(state): State<AppState>,
+    v: Visitor,
+    Query(q): Query<CompareQ>,
+) -> AppResult<Response> {
     let (a, ta) = compare_side(&state, v.user(), q.a.trim()).await?;
     let (b, tb) = compare_side(&state, v.user(), q.b.trim()).await?;
     let p = ComparePage {

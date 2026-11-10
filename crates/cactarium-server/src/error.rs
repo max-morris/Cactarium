@@ -16,6 +16,9 @@ pub enum AppError {
     Unauthorized,
     #[error("you are not allowed to do that")]
     Forbidden,
+    /// Forbidden, with the reason shown.
+    #[error("{0}")]
+    Denied(String),
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -41,7 +44,7 @@ impl AppError {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
-            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::Forbidden | AppError::Denied(_) => StatusCode::FORBIDDEN,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
@@ -64,7 +67,11 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let page = ErrorPage { ctx: PageCtx::anonymous(), status: status.as_u16(), message: self.public_message() };
+        let page = ErrorPage {
+            ctx: PageCtx::anonymous(),
+            status: status.as_u16(),
+            message: self.public_message(),
+        };
         match render(&page) {
             Ok(html) => (status, Html(html)).into_response(),
             Err(_) => (status, "error").into_response(),
@@ -78,7 +85,8 @@ pub type AppResult<T> = Result<T, AppError>;
 /// version, a quoted name, an identifier.
 fn capitalize(m: &str) -> String {
     let first = m.split_whitespace().next().unwrap_or("");
-    let literal = first.contains(['/', '@', ':', '.', '_', '\'', '"', '`']) || first.chars().skip(1).any(|c| c.is_uppercase());
+    let literal = first.contains(['/', '@', ':', '.', '_', '\'', '"', '`'])
+        || first.chars().skip(1).any(|c| c.is_uppercase());
     let mut c = m.chars();
     match c.next() {
         Some(f) if !literal => f.to_uppercase().collect::<String>() + c.as_str(),
@@ -90,7 +98,10 @@ fn capitalize(m: &str) -> String {
 mod tests {
     #[test]
     fn slugs_keep_their_case() {
-        assert_eq!(super::capitalize("max/et-lite@1.0.0 already exists"), "max/et-lite@1.0.0 already exists");
+        assert_eq!(
+            super::capitalize("max/et-lite@1.0.0 already exists"),
+            "max/et-lite@1.0.0 already exists"
+        );
         assert_eq!(super::capitalize("the form expired"), "The form expired");
         assert_eq!(super::capitalize("'carpetx' is taken"), "'carpetx' is taken");
     }
@@ -112,13 +123,14 @@ impl IntoResponse for ApiError {
         let code = match &self.0 {
             AppError::NotFound => "not-found",
             AppError::Unauthorized => "unauthorized",
-            AppError::Forbidden => "forbidden",
+            AppError::Forbidden | AppError::Denied(_) => "forbidden",
             AppError::BadRequest(_) => "bad-request",
             AppError::Conflict(_) => "conflict",
             AppError::TooManyRequests => "rate-limited",
             AppError::Internal(_) => "internal",
         };
-        let body = ErrorBody { error: ErrorDetail { code: code.into(), message: self.0.public_message() } };
+        let body =
+            ErrorBody { error: ErrorDetail { code: code.into(), message: self.0.public_message() } };
         (status, Json(body)).into_response()
     }
 }

@@ -52,7 +52,8 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     if bytes.len() > MAX_SIM_BYTES {
         return Err(AppError::bad("the .sim file is larger than 1 MB"));
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| AppError::bad("the .sim file is not UTF-8 text"))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| AppError::bad("the .sim file is not UTF-8 text"))?;
     let sim = SimFile::from_toml(text).map_err(AppError::bad)?;
     let problems = sim.unspecified();
     if !problems.is_empty() {
@@ -62,9 +63,14 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
             list.join("; ")
         )));
     }
-    let list = crl::parse(&sim.thornlist.text).map_err(|e| AppError::bad(format!("the thornlist does not parse: {e:#}")))?;
-    let crl_repos: BTreeSet<String> =
-        list.components().iter().filter(|c| c.ty != ComponentType::Ignore).map(|c| c.repo.clone()).collect();
+    let list = crl::parse(&sim.thornlist.text)
+        .map_err(|e| AppError::bad(format!("the thornlist does not parse: {e:#}")))?;
+    let crl_repos: BTreeSet<String> = list
+        .components()
+        .iter()
+        .filter(|c| c.ty != ComponentType::Ignore)
+        .map(|c| c.repo.clone())
+        .collect();
     let pinned: BTreeSet<String> = sim.repos.iter().map(|r| r.name.clone()).collect();
     let missing: Vec<&String> = crl_repos.difference(&pinned).collect();
     if !missing.is_empty() {
@@ -81,7 +87,11 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
         )));
     }
     if list.root() != sim.sim.root && !(list.root() == "." && sim.sim.root.is_empty()) {
-        return Err(AppError::bad(format!("[sim] root is '{}' but the thornlist's ROOT is '{}'", sim.sim.root, list.root())));
+        return Err(AppError::bad(format!(
+            "[sim] root is '{}' but the thornlist's ROOT is '{}'",
+            sim.sim.root,
+            list.root()
+        )));
     }
     let mut warnings = Vec::new();
     let par = &sim.parfile.text;
@@ -98,7 +108,8 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
         ));
     }
     if sim.sim.license.is_none() {
-        warnings.push("no license: others can view it but may not know whether they can reuse it".into());
+        warnings
+            .push("no license: others can view it but may not know whether they can reuse it".into());
     }
     // Exactly cactup's lexing: comments and @@ escapes are not uses, and a knob with a default in
     // every use is optional.
@@ -106,7 +117,10 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
         Ok(refs) if sim.parfile.kind == cactup_ecosystem_common::sim::ParfileKind::Par => {
             for k in refs.knobs.iter().filter(|k| !k.optional) {
                 if !sim.inputs.iter().any(|i| i.knob == k.name) {
-                    warnings.push(format!("the parfile needs @KNOB({})@ but declares no [[input]] for it", k.name));
+                    warnings.push(format!(
+                        "the parfile needs @KNOB({})@ but declares no [[input]] for it",
+                        k.name
+                    ));
                 }
             }
             for e in refs.env.iter().filter(|e| !e.optional) {
@@ -121,7 +135,12 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     }
     let index = SimIndex {
         // The thorns the build compiles: checkout-only ones (on a !CHECKOUT line) are fetched, not built.
-        thorns: list.components().iter().filter(|c| c.checkout.contains('/') && !c.fetch_only).map(|c| c.checkout.clone()).collect(),
+        thorns: list
+            .components()
+            .iter()
+            .filter(|c| c.checkout.contains('/') && !c.fetch_only)
+            .map(|c| c.checkout.clone())
+            .collect(),
         repos: crl_repos.into_iter().collect(),
         inputs: sim.inputs.iter().map(|i| i.knob.clone()).collect(),
         vars: sim.parfile.vars.clone(),
@@ -130,13 +149,33 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     Ok(Checked { sim, index })
 }
 
-/// Publishes a checked sim as the next version of `user`'s `name` (creating the entry if new).
-pub async fn publish(state: &AppState, user: &User, name: Option<&str>, checked: Checked) -> AppResult<(Entry, u32)> {
+/// Publishes a checked sim as the next version of `owner/name`: `owner` is the user or one of
+/// their organizations (default: the user), `name` defaults to the file's (creating the entry if
+/// new).
+pub async fn publish(
+    state: &AppState,
+    user: &User,
+    owner: Option<&str>,
+    name: Option<&str>,
+    checked: Checked,
+) -> AppResult<(Entry, u32)> {
     let Checked { mut sim, index } = checked;
-    let name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).unwrap_or_else(|| sim.sim.name.clone());
+    let owner = owner
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .unwrap_or(&user.username)
+        .to_owned();
+    publish::check_namespace(state, user, &owner).await?;
+    let name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| sim.sim.name.clone());
     name.parse::<Name>().map_err(AppError::bad)?;
-    let entry = match model::find_entry(state, &user.username, &name).await? {
-        Some(e) if e.kind != "sim" => return Err(AppError::Conflict(format!("{} is a {}, not a sim", e.slug(), e.kind))),
+    let entry = match model::find_entry(state, &owner, &name).await? {
+        Some(e) if e.kind != "sim" => {
+            return Err(AppError::Conflict(format!("{} is a {}, not a sim", e.slug(), e.kind)));
+        }
         Some(e) => e,
         None => {
             publish::create_entry(
@@ -144,7 +183,7 @@ pub async fn publish(state: &AppState, user: &User, name: Option<&str>, checked:
                 user,
                 NewEntry {
                     kind: "sim",
-                    owner: &user.username,
+                    owner: &owner,
                     name: &name,
                     summary: sim.sim.summary.clone(),
                     description: sim.sim.description.clone(),
@@ -154,10 +193,12 @@ pub async fn publish(state: &AppState, user: &User, name: Option<&str>, checked:
             .await?
         }
     };
-    let next: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version::bigint), 0) + 1 FROM versions WHERE entry_id = $1")
-        .bind(entry.id)
-        .fetch_one(&state.db)
-        .await?;
+    let next: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version::bigint), 0) + 1 FROM versions WHERE entry_id = $1",
+    )
+    .bind(entry.id)
+    .fetch_one(&state.db)
+    .await?;
     let n = u32::try_from(next).map_err(|_| AppError::bad("too many versions"))?;
     sim.sim.cactarium = Some(format!("{}@{n}", entry.slug()).parse().map_err(AppError::bad)?);
     let stored = sim.to_toml().map_err(AppError::bad)?;
@@ -188,7 +229,15 @@ pub async fn publish(state: &AppState, user: &User, name: Option<&str>, checked:
     tx.commit().await?;
     tracker::store_pins(state, vid, &sim.repos).await?;
     tracker::store_built_thorns(state, vid, &sim.thornlist.text).await?;
-    audit(state, Some(user.id), "sim.publish", Some(&entry.slug()), json!({ "version": n, "sha256": sha }), None).await?;
+    audit(
+        state,
+        Some(user.id),
+        "sim.publish",
+        Some(&entry.slug()),
+        json!({ "version": n, "sha256": sha }),
+        None,
+    )
+    .await?;
     Ok((entry, n))
 }
 
@@ -230,14 +279,17 @@ commit = "{SHA}"
 "#
         );
         if extra_repo {
-            s.push_str(&format!("[[repo]]\nname = \"Other\"\nurl = \"https://x/o.git\"\ncommit = \"{SHA}\"\n"));
+            s.push_str(&format!(
+                "[[repo]]\nname = \"Other\"\nurl = \"https://x/o.git\"\ncommit = \"{SHA}\"\n"
+            ));
         }
         s
     }
 
     #[test]
     fn accepts_a_consistent_sim_and_warns_about_paths() {
-        let c = check(sim(false, "x::f = \"/home/someone/id.info\"\ny = \"@KNOB(id)@\"").as_bytes()).unwrap();
+        let c = check(sim(false, "x::f = \"/home/someone/id.info\"\ny = \"@KNOB(id)@\"").as_bytes())
+            .unwrap();
         assert_eq!(c.index.repos, ["CarpetX"]);
         assert_eq!(c.index.thorns, ["CarpetX/CarpetX", "CarpetX/Loop"]);
         let w = c.index.warnings.join("\n");

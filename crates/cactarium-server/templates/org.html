@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} · Organization · Cactarium{% endblock %}
+{% block content %}
+<section class="stack-lg">
+  <div class="row-wrap between">
+    <div class="stack-sm">
+      <span class="eyebrow">Organization</span>
+      <h1 class="mono">{{ name }}</h1>
+      {% if !display.is_empty() %}<p class="lead">{{ display }}</p>{% endif %}
+      {% if !my_role.is_empty() %}<p class="small muted">You are {% if my_role == "owner" %}an owner{% else %}a member{% endif %}.</p>{% endif %}
+    </div>
+    <a class="button ghost" href="/{{ name }}">Public page</a>
+  </div>
+  <h2>Members</h2>
+  <div class="table-box"><table>
+    <thead><tr><th scope="col">User</th><th scope="col">Role</th><th scope="col">Added</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+    {% for m in members %}
+    <tr>
+      <td><a class="mono strong" href="/{{ m.1 }}">{{ m.1 }}</a></td>
+      <td>{% if m.2 == "owner" %}<span class="badge good">owner</span>{% else %}member{% endif %}</td>
+      <td class="small">{{ m.3 }}</td>
+      <td>
+        <form method="post" action="/orgs/{{ name }}/members/{{ m.0 }}" class="row-wrap">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          {% if can_manage %}
+            {% if m.2 == "owner" %}<button class="button small ghost" name="action" value="member">Make member</button>{% else %}<button class="button small ghost" name="action" value="owner">Make owner</button>{% endif %}
+            <button class="button small ghost" name="action" value="remove">Remove</button>
+          {% else if let Some(u) = ctx.user %}{% if u.username == m.1 %}
+            <button class="button small ghost" name="action" value="remove">Leave</button>
+          {% endif %}{% endif %}
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% if can_manage %}
+  <form class="card row-wrap" method="post" action="/orgs/{{ name }}/members">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <label class="sr-only" for="mu">Username</label>
+    <input id="mu" name="username" class="mono" placeholder="username" required>
+    <label class="sr-only" for="mr">Role</label>
+    <select id="mr" name="role"><option value="member" selected>member</option><option value="owner">owner</option></select>
+    <button class="button small" type="submit">Add member</button>
+  </form>
+  <p class="small muted">Members publish under <span class="mono">{{ name }}/</span> and manage its entries. Owners also add and remove members. There is always at least one owner.</p>
+  {% endif %}
+  <h2>Entries</h2>
+  {% let rows = entries %}
+  {% include "_entry_table.html" %}
+</section>
+{% endblock %}

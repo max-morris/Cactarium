@@ -143,6 +143,7 @@ tr.current td { background: var(--accent-soft); }
 .docs { max-width: 860px; }
 .docs h2 { margin-top: 36px; }
 .steps { padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }
+.plain { list-style: none; padding: 0; margin: 0; }
 
 /* admin */
 body.admin .site-header { background: var(--admin); border-color: var(--admin); }

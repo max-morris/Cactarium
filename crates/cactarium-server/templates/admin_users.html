@@ -18,7 +18,7 @@
       <td>
         <form method="post" action="/admin/users/{{ u.id }}" class="row-wrap">
           <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
-          {% if u.trusted %}<button class="button small ghost" name="action" value="untrust">Untrust</button>{% else %}<button class="button small ghost" name="action" value="trust">Trust</button>{% endif %}
+          {% if can_trust %}{% if u.trusted %}<button class="button small ghost" name="action" value="untrust">Untrust</button>{% else %}<button class="button small ghost" name="action" value="trust">Trust</button>{% endif %}{% endif %}
           {% if u.role != "superadmin" %}
             {% if u.banned %}<button class="button small ghost" name="action" value="unban">Unban</button>{% else %}<button class="button small ghost" name="action" value="ban">Ban</button>{% endif %}
             {% if ctx.is_superadmin() %}
@@ -31,6 +31,6 @@
     {% endfor %}
     </tbody>
   </table></div>
-  <p class="small muted">Trusted users publish without review. Only the superadmin can make or revoke admins.</p>
+  <p class="small muted">Trusted users publish without review. Only the superadmin can make or revoke admins{% if !can_trust %}, and for now only the superadmin marks users trusted{% endif %}.</p>
 </section>
 {% endblock %}

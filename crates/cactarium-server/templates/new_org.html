@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}New organization · Cactarium{% endblock %}
+{% block content %}
+<section class="narrow stack-lg">
+  <h1>New organization</h1>
+  <p class="lead">An organization is a namespace you share. Its members publish under it and manage its packages, stacks and sims; its owners also manage who is a member.</p>
+  {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
+  <form class="card stack" method="post" action="/orgs/new">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <label for="name">Name <span class="muted">(the namespace, as in <span class="mono">name/package</span>)</span></label>
+    <input id="name" name="name" class="mono" value="{{ name }}" placeholder="my-group" required>
+    <label for="display_name">Display name <span class="muted">(optional)</span></label>
+    <input id="display_name" name="display_name" value="{{ display }}" placeholder="My Research Group">
+    <button class="button" type="submit">Create</button>
+  </form>
+  <p class="muted small">Names share one namespace with usernames. Some names, and namespaces that already hold entries, are reserved; an admin can create those.</p>
+</section>
+{% endblock %}

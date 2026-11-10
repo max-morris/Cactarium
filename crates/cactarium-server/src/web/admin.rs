@@ -11,6 +11,7 @@ use crate::audit::audit;
 use crate::auth::Admin;
 use crate::error::{AppError, AppResult};
 use crate::model::{self, ENTRY_COLS, Entry, fmt_time};
+use crate::site;
 use crate::state::AppState;
 use crate::templates::*;
 use crate::tracker;
@@ -59,7 +60,11 @@ struct SubFull {
     trusted: Option<bool>,
 }
 
-pub async fn queue(State(state): State<AppState>, Admin(a): Admin, Query(q): Query<QueueQ>) -> AppResult<Response> {
+pub async fn queue(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Query(q): Query<QueueQ>,
+) -> AppResult<Response> {
     let subs: Vec<SubFull> = sqlx::query_as(
         "SELECT s.id, s.entry_id, s.status, s.note, s.checklist, s.created_at, u.username AS submitter, u.trusted
          FROM submissions s LEFT JOIN users u ON u.id = s.submitter
@@ -85,7 +90,14 @@ pub async fn queue(State(state): State<AppState>, Admin(a): Admin, Query(q): Que
             review = Some(review_view(&state, s, &e).await?);
         }
     }
-    Ok(page(&AdminQueuePage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "review".into(), open, review })?.into_response())
+    Ok(page(&AdminQueuePage {
+        ctx: PageCtx::new(&state, Some(&a.session)),
+        nav: "review".into(),
+        open,
+        review,
+        can_trust: site::may_grant_trust(&state, &a.user).await?,
+    })?
+    .into_response())
 }
 
 async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<ReviewView> {
@@ -115,13 +127,16 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
             }
         }
     }
-    let claims: Vec<(String, String, String, Option<String>, Option<String>)> = match latest {
-        Some(v) => sqlx::query_as("SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1")
+    let claims: Vec<(String, String, String, Option<String>, Option<String>)> =
+        match latest {
+            Some(v) => sqlx::query_as(
+                "SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1",
+            )
             .bind(v.id)
             .fetch_all(&state.db)
             .await?,
-        None => vec![],
-    };
+            None => vec![],
+        };
     let checked: HashMap<String, bool> = serde_json::from_value(s.checklist.clone()).unwrap_or_default();
     Ok(ReviewView {
         id: s.id,
@@ -148,7 +163,10 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
         readme_html,
         detail,
         note: s.note.clone().unwrap_or_default(),
-        checklist: checklist(&e.kind).into_iter().map(|(k, l)| (k.to_owned(), l.to_owned(), checked.get(k).copied().unwrap_or(false))).collect(),
+        checklist: checklist(&e.kind)
+            .into_iter()
+            .map(|(k, l)| (k.to_owned(), l.to_owned(), checked.get(k).copied().unwrap_or(false)))
+            .collect(),
     })
 }
 
@@ -159,14 +177,18 @@ pub async fn decide(
     Form(f): Form<HashMap<String, String>>,
 ) -> AppResult<Response> {
     a.session.check_csrf(f.get("_csrf").map(String::as_str).unwrap_or(""))?;
-    let (entry_id, submitter): (i64, Option<i64>) = sqlx::query_as("SELECT entry_id, submitter FROM submissions WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let (entry_id, submitter): (i64, Option<i64>) =
+        sqlx::query_as("SELECT entry_id, submitter FROM submissions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
     let e = model::entry_by_id(&state, entry_id).await?;
-    let checks: HashMap<String, bool> =
-        f.keys().filter_map(|k| k.strip_prefix("check_")).map(|k| (k.to_owned(), true)).collect();
+    let checks: HashMap<String, bool> = f
+        .keys()
+        .filter_map(|k| k.strip_prefix("check_"))
+        .map(|k| (k.to_owned(), true))
+        .collect();
     let note = f.get("note").map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
     let status = match f.get("decision").map(String::as_str) {
         Some("approve") => "approved",
@@ -193,11 +215,23 @@ pub async fn decide(
     }
     if f.contains_key("trust_submitter")
         && let Some(uid) = submitter
+        && site::may_grant_trust(&state, &a.user).await?
     {
-        sqlx::query("UPDATE users SET trusted = TRUE WHERE id = $1").bind(uid).execute(&state.db).await?;
+        sqlx::query("UPDATE users SET trusted = TRUE WHERE id = $1")
+            .bind(uid)
+            .execute(&state.db)
+            .await?;
         audit(&state, Some(a.user.id), "user.trust", None, json!({ "user_id": uid }), None).await?;
     }
-    audit(&state, Some(a.user.id), &format!("review.{status}"), Some(&e.slug()), json!({ "submission": id, "note": note }), None).await?;
+    audit(
+        &state,
+        Some(a.user.id),
+        &format!("review.{status}"),
+        Some(&e.slug()),
+        json!({ "submission": id, "note": note }),
+        None,
+    )
+    .await?;
     Ok(Redirect::to("/admin").into_response())
 }
 
@@ -227,7 +261,11 @@ async fn admin_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<Admi
     Ok(out)
 }
 
-pub async fn entries(State(state): State<AppState>, Admin(a): Admin, Query(q): Query<FilterQ>) -> AppResult<Response> {
+pub async fn entries(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Query(q): Query<FilterQ>,
+) -> AppResult<Response> {
     let list = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE $1 = '' OR owner || '/' || name ILIKE '%' || $1 || '%' ORDER BY updated_at DESC LIMIT 200"
     ))
@@ -235,7 +273,13 @@ pub async fn entries(State(state): State<AppState>, Admin(a): Admin, Query(q): Q
     .fetch_all(&state.db)
     .await?;
     let entries = admin_rows(&state, list).await?;
-    Ok(page(&AdminEntriesPage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "entries".into(), q: q.q, entries })?.into_response())
+    Ok(page(&AdminEntriesPage {
+        ctx: PageCtx::new(&state, Some(&a.session)),
+        nav: "entries".into(),
+        q: q.q,
+        entries,
+    })?
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -246,7 +290,12 @@ pub struct EntryAction {
     csrf: String,
 }
 
-pub async fn entry_action(State(state): State<AppState>, Admin(a): Admin, Path(id): Path<i64>, Form(f): Form<EntryAction>) -> AppResult<Response> {
+pub async fn entry_action(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Path(id): Path<i64>,
+    Form(f): Form<EntryAction>,
+) -> AppResult<Response> {
     a.session.check_csrf(&f.csrf)?;
     let e = model::entry_by_id(&state, id).await?;
     let sql = match f.action.as_str() {
@@ -260,23 +309,39 @@ pub async fn entry_action(State(state): State<AppState>, Admin(a): Admin, Path(i
             if model::find_entry(&state, to, &e.name).await?.is_some() {
                 return Err(AppError::Conflict(format!("{to}/{} already exists", e.name)));
             }
-            sqlx::query("UPDATE entries SET owner = $2 WHERE id = $1").bind(id).bind(to).execute(&state.db).await?;
-            audit(&state, Some(a.user.id), "entry.transfer", Some(&e.slug()), json!({ "to": to }), None).await?;
+            sqlx::query("UPDATE entries SET owner = $2 WHERE id = $1")
+                .bind(id)
+                .bind(to)
+                .execute(&state.db)
+                .await?;
+            audit(&state, Some(a.user.id), "entry.transfer", Some(&e.slug()), json!({ "to": to }), None)
+                .await?;
             return Ok(Redirect::to("/admin/entries").into_response());
         }
         _ => return Err(AppError::bad("unknown action")),
     };
     sqlx::query(sql).bind(id).execute(&state.db).await?;
-    audit(&state, Some(a.user.id), &format!("entry.{}", f.action), Some(&e.slug()), json!({}), None).await?;
+    audit(&state, Some(a.user.id), &format!("entry.{}", f.action), Some(&e.slug()), json!({}), None)
+        .await?;
     Ok(Redirect::to("/admin/entries").into_response())
 }
 
 // ---------- curated packages ----------
 
 async fn curated_page(state: &AppState, a: &Admin, error: Option<String>) -> AppResult<Response> {
-    let list = sqlx::query_as::<_, Entry>(&format!("SELECT {ENTRY_COLS} FROM entries WHERE curated ORDER BY owner, name")).fetch_all(&state.db).await?;
+    let list = sqlx::query_as::<_, Entry>(&format!(
+        "SELECT {ENTRY_COLS} FROM entries WHERE curated ORDER BY owner, name"
+    ))
+    .fetch_all(&state.db)
+    .await?;
     let curated = admin_rows(state, list).await?;
-    Ok(page(&AdminCuratedPage { ctx: PageCtx::new(state, Some(&a.0.session)), nav: "curated".into(), curated, error })?.into_response())
+    Ok(page(&AdminCuratedPage {
+        ctx: PageCtx::new(state, Some(&a.0.session)),
+        nav: "curated".into(),
+        curated,
+        error,
+    })?
+    .into_response())
 }
 
 pub async fn curated(State(state): State<AppState>, a: Admin) -> AppResult<Response> {
@@ -292,11 +357,17 @@ pub struct CuratedForm {
     csrf: String,
 }
 
-pub async fn create_curated(State(state): State<AppState>, a: Admin, Form(f): Form<CuratedForm>) -> AppResult<Response> {
+pub async fn create_curated(
+    State(state): State<AppState>,
+    a: Admin,
+    Form(f): Form<CuratedForm>,
+) -> AppResult<Response> {
     a.0.session.check_csrf(&f.csrf)?;
     match tracker::register_curated(&state, &a.0.user, f.owner.trim(), &f.url, &f.manifest).await {
         Ok(_) => Ok(Redirect::to("/admin/curated").into_response()),
-        Err(AppError::BadRequest(m) | AppError::Conflict(m)) => curated_page(&state, &a, Some(m)).await,
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+            curated_page(&state, &a, Some(m)).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -309,7 +380,12 @@ pub struct VirtualForm {
     csrf: String,
 }
 
-pub async fn add_virtual(State(state): State<AppState>, a: Admin, Path(id): Path<i64>, Form(f): Form<VirtualForm>) -> AppResult<Response> {
+pub async fn add_virtual(
+    State(state): State<AppState>,
+    a: Admin,
+    Path(id): Path<i64>,
+    Form(f): Form<VirtualForm>,
+) -> AppResult<Response> {
     a.0.session.check_csrf(&f.csrf)?;
     let e = model::entry_by_id(&state, id).await?;
     if !e.curated {
@@ -317,7 +393,9 @@ pub async fn add_virtual(State(state): State<AppState>, a: Admin, Path(id): Path
     }
     match tracker::add_virtual_version(&state, &a.0.user, &e, &f.version, &f.commit).await {
         Ok(()) => Ok(Redirect::to("/admin/curated").into_response()),
-        Err(AppError::BadRequest(m) | AppError::Conflict(m)) => curated_page(&state, &a, Some(m)).await,
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+            curated_page(&state, &a, Some(m)).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -326,7 +404,8 @@ pub async fn add_virtual(State(state): State<AppState>, a: Admin, Path(id): Path
 
 pub async fn tags(State(state): State<AppState>, Admin(a): Admin) -> AppResult<Response> {
     let alerts = tag_alerts(&state, None).await?;
-    Ok(page(&AdminTagsPage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "tags".into(), alerts })?.into_response())
+    Ok(page(&AdminTagsPage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "tags".into(), alerts })?
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -335,17 +414,39 @@ pub struct CsrfForm {
     csrf: String,
 }
 
-pub async fn ack_tag(State(state): State<AppState>, Admin(a): Admin, Path(id): Path<i64>, Form(f): Form<CsrfForm>) -> AppResult<Response> {
+pub async fn ack_tag(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Path(id): Path<i64>,
+    Form(f): Form<CsrfForm>,
+) -> AppResult<Response> {
     a.session.check_csrf(&f.csrf)?;
-    sqlx::query("UPDATE tag_events SET acknowledged_by = $2, acknowledged_at = now() WHERE id = $1").bind(id).bind(a.user.id).execute(&state.db).await?;
+    sqlx::query("UPDATE tag_events SET acknowledged_by = $2, acknowledged_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(a.user.id)
+        .execute(&state.db)
+        .await?;
     audit(&state, Some(a.user.id), "tag.acknowledge", None, json!({ "event": id }), None).await?;
     Ok(Redirect::to("/admin/tags").into_response())
 }
 
 // ---------- users ----------
 
-pub async fn users(State(state): State<AppState>, Admin(a): Admin, Query(q): Query<FilterQ>) -> AppResult<Response> {
-    let rows: Vec<(i64, String, Option<String>, String, bool, bool, time::OffsetDateTime, Option<String>)> = sqlx::query_as(
+pub async fn users(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Query(q): Query<FilterQ>,
+) -> AppResult<Response> {
+    let rows: Vec<(
+        i64,
+        String,
+        Option<String>,
+        String,
+        bool,
+        bool,
+        time::OffsetDateTime,
+        Option<String>,
+    )> = sqlx::query_as(
         "SELECT u.id, u.username, u.display_name, u.role, u.trusted, u.banned, u.created_at,
                 string_agg(i.provider || ':' || COALESCE(i.login, i.subject), ' ' ORDER BY i.provider)
          FROM users u LEFT JOIN identities i ON i.user_id = u.id
@@ -368,7 +469,14 @@ pub async fn users(State(state): State<AppState>, Admin(a): Admin, Query(q): Que
             created: fmt_time(created),
         })
         .collect();
-    Ok(page(&AdminUsersPage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "users".into(), q: q.q, users })?.into_response())
+    Ok(page(&AdminUsersPage {
+        ctx: PageCtx::new(&state, Some(&a.session)),
+        nav: "users".into(),
+        q: q.q,
+        users,
+        can_trust: site::may_grant_trust(&state, &a.user).await?,
+    })?
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -378,11 +486,18 @@ pub struct UserAction {
     csrf: String,
 }
 
-pub async fn user_action(State(state): State<AppState>, Admin(a): Admin, Path(id): Path<i64>, Form(f): Form<UserAction>) -> AppResult<Response> {
+pub async fn user_action(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Path(id): Path<i64>,
+    Form(f): Form<UserAction>,
+) -> AppResult<Response> {
     a.session.check_csrf(&f.csrf)?;
     let target = crate::auth::load_user(&state, id).await?.ok_or(AppError::NotFound)?;
     if target.is_superadmin() && f.action != "trust" && f.action != "untrust" {
-        return Err(AppError::bad("the superadmin's role and access are set in the server's configuration"));
+        return Err(AppError::bad(
+            "the superadmin's role and access are set in the server's configuration",
+        ));
     }
     let admin_only = matches!(f.action.as_str(), "grant-admin" | "revoke-admin");
     if admin_only && !a.user.is_superadmin() {
@@ -390,6 +505,11 @@ pub async fn user_action(State(state): State<AppState>, Admin(a): Admin, Path(id
     }
     if target.is_admin() && matches!(f.action.as_str(), "ban") && !a.user.is_superadmin() {
         return Err(AppError::Forbidden);
+    }
+    if matches!(f.action.as_str(), "trust" | "untrust")
+        && !site::may_grant_trust(&state, &a.user).await?
+    {
+        return Err(AppError::bad("only the superadmin can change who is trusted (see Admin, Site)"));
     }
     let sql = match f.action.as_str() {
         "trust" => "UPDATE users SET trusted = TRUE WHERE id = $1",
@@ -403,10 +523,24 @@ pub async fn user_action(State(state): State<AppState>, Admin(a): Admin, Path(id
     sqlx::query(sql).bind(id).execute(&state.db).await?;
     if f.action == "ban" {
         // Signed out everywhere, and their tokens stop working.
-        sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(id).execute(&state.db).await?;
-        sqlx::query("UPDATE api_tokens SET revoked = TRUE WHERE user_id = $1").bind(id).execute(&state.db).await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        sqlx::query("UPDATE api_tokens SET revoked = TRUE WHERE user_id = $1")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
     }
-    audit(&state, Some(a.user.id), &format!("user.{}", f.action), Some(&target.username), json!({}), None).await?;
+    audit(
+        &state,
+        Some(a.user.id),
+        &format!("user.{}", f.action),
+        Some(&target.username),
+        json!({}),
+        None,
+    )
+    .await?;
     Ok(Redirect::to("/admin/users").into_response())
 }
 
@@ -428,5 +562,61 @@ pub async fn audit_log(State(state): State<AppState>, Admin(a): Admin) -> AppRes
             details: if details == json!({}) { String::new() } else { details.to_string() },
         })
         .collect();
-    Ok(page(&AdminAuditPage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "audit".into(), rows })?.into_response())
+    Ok(page(&AdminAuditPage { ctx: PageCtx::new(&state, Some(&a.session)), nav: "audit".into(), rows })?
+        .into_response())
+}
+
+// ---------- site (superadmin) ----------
+
+pub async fn site_page(State(state): State<AppState>, Admin(a): Admin) -> AppResult<Response> {
+    if !a.user.is_superadmin() {
+        return Err(AppError::Forbidden);
+    }
+    let orgs: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT o.name, o.display_name, (SELECT count(*) FROM org_members m WHERE m.org_id = o.id) FROM orgs o ORDER BY o.name",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(page(&AdminSitePage {
+        ctx: PageCtx::new(&state, Some(&a.session)),
+        nav: "site".into(),
+        trust_granted_by: site::get(&state, site::TRUST_GRANTED_BY)
+            .await?
+            .unwrap_or_else(|| "superadmin".into()),
+        orgs: orgs.into_iter().map(|(n, d, c)| (n, d.unwrap_or_default(), c)).collect(),
+    })?
+    .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct SiteForm {
+    trust_granted_by: String,
+    #[serde(rename = "_csrf")]
+    csrf: String,
+}
+
+pub async fn site_save(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Form(f): Form<SiteForm>,
+) -> AppResult<Response> {
+    a.session.check_csrf(&f.csrf)?;
+    if !a.user.is_superadmin() {
+        return Err(AppError::Forbidden);
+    }
+    let value = match f.trust_granted_by.as_str() {
+        v @ ("superadmin" | "admins") => v,
+        _ => return Err(AppError::bad("trust_granted_by is superadmin or admins")),
+    };
+    site::set(&state, site::TRUST_GRANTED_BY, value).await?;
+    audit(
+        &state,
+        Some(a.user.id),
+        "site.set",
+        Some(site::TRUST_GRANTED_BY),
+        json!({ "value": value }),
+        None,
+    )
+    .await?;
+    Ok(Redirect::to("/admin/site").into_response())
 }

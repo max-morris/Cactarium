@@ -46,9 +46,14 @@ pub async fn load_release(state: &AppState, owner: &str, slug: &Slug) -> AppResu
     let exact = slug.exact().map_err(|_| unavailable())?;
     let entry = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
         .await?
-        .filter(|e| e.kind == "stack" && (e.visibility == "public" || (e.owner == owner && e.visibility != "hidden")))
+        .filter(|e| {
+            e.kind == "stack"
+                && (e.visibility == "public" || (e.owner == owner && e.visibility != "hidden"))
+        })
         .ok_or_else(unavailable)?;
-    let v = model::version_by_label(state, entry.id, &exact.to_string()).await?.ok_or_else(unavailable)?;
+    let v = model::version_by_label(state, entry.id, &exact.to_string())
+        .await?
+        .ok_or_else(unavailable)?;
     frozen_of(state, &v).await
 }
 
@@ -58,7 +63,8 @@ pub async fn frozen_of(state: &AppState, v: &Version) -> AppResult<FrozenStack> 
         .fetch_optional(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    toml::from_str(&text).map_err(|e| AppError::Internal(anyhow::anyhow!("stored release is unreadable: {e}")))
+    toml::from_str(&text)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("stored release is unreadable: {e}")))
 }
 
 fn enable_lines(text: &str, enable: &[String]) -> String {
@@ -123,15 +129,22 @@ pub async fn resolve(
         // only a #DISABLED line adds its checkout. Uncommenting the #DISABLED line of a
         // checkout-only thorn would check it out twice.
         let mut list = parse(text)?;
-        let missing: Vec<String> =
-            section.enable.iter().filter(|t| !list.components().iter().any(|c| &c.checkout == *t)).cloned().collect();
+        let missing: Vec<String> = section
+            .enable
+            .iter()
+            .filter(|t| !list.components().iter().any(|c| &c.checkout == *t))
+            .cloned()
+            .collect();
         if !missing.is_empty() {
             list = parse(&enable_lines(text, &missing))?;
         }
         match &root {
             None => root = Some(list.root().to_owned()),
             Some(r) if r != list.root() && list.root() != "." => {
-                return Err(AppError::bad(format!("{label} uses ROOT '{}', but an earlier source uses '{r}'", list.root())));
+                return Err(AppError::bad(format!(
+                    "{label} uses ROOT '{}', but an earlier source uses '{r}'",
+                    list.root()
+                )));
             }
             _ => {}
         }
@@ -208,7 +221,10 @@ pub async fn resolve(
     let mut by_repo: BTreeMap<String, &Component> = BTreeMap::new();
     for c in merged.iter().filter(|c| c.ty != ComponentType::Ignore) {
         match by_repo.get(&c.repo) {
-            Some(first) if (first.url.as_ref(), first.branch.as_ref(), first.commit.as_ref()) != (c.url.as_ref(), c.branch.as_ref(), c.commit.as_ref()) => {
+            Some(first)
+                if (first.url.as_ref(), first.branch.as_ref(), first.commit.as_ref())
+                    != (c.url.as_ref(), c.branch.as_ref(), c.commit.as_ref()) =>
+            {
                 return Err(AppError::bad(format!(
                     "repo '{}' is checked out from conflicting sources ({} and {})",
                     c.repo,
@@ -228,7 +244,15 @@ pub async fn resolve(
     let mut lookups: Vec<(usize, String, Option<String>)> = Vec::new();
     for (repo, c) in &by_repo {
         let url = c.url.clone().unwrap_or_default();
-        let mut pin = RepoPin { name: repo.clone(), url: url.clone(), git_ref: c.branch.clone(), commit: None, sha256: None, cactarium: None, dirty: false };
+        let mut pin = RepoPin {
+            name: repo.clone(),
+            url: url.clone(),
+            git_ref: c.branch.clone(),
+            commit: None,
+            sha256: None,
+            cactarium: None,
+            dirty: false,
+        };
         let deliberate = tip != Some(Tip::Master);
         if let Some(p) = def_pins.get(repo.as_str()).filter(|_| deliberate) {
             pin.commit = p.commit.clone();
@@ -253,7 +277,9 @@ pub async fn resolve(
                     )));
                 }
                 other => {
-                    return Err(AppError::bad(format!("repo '{repo}' is {other:?}; only git repos and downloads can be pinned")));
+                    return Err(AppError::bad(format!(
+                        "repo '{repo}' is {other:?}; only git repos and downloads can be pinned"
+                    )));
                 }
             }
         }
@@ -273,10 +299,15 @@ pub async fn resolve(
         let commit = result.map_err(|e| AppError::bad(format!("repo '{}': {e:#}", pins[i].name)))?;
         pins[i].commit = Some(commit);
     }
-    let resolved_commits: BTreeMap<String, String> =
-        pins.iter().filter_map(|p| p.commit.clone().map(|c| (p.name.clone(), c))).collect();
+    let resolved_commits: BTreeMap<String, String> = pins
+        .iter()
+        .filter_map(|p| p.commit.clone().map(|c| (p.name.clone(), c)))
+        .collect();
 
-    let untouched = tip.is_none() && section.extends.is_empty() && section.enable.is_empty() && section.disable.is_empty();
+    let untouched = tip.is_none()
+        && section.extends.is_empty()
+        && section.enable.is_empty()
+        && section.disable.is_empty();
     let text = match own_text {
         Some(t) if untouched => t.to_owned(),
         _ => {
@@ -301,7 +332,10 @@ fn describe(c: &Component) -> String {
         "{}{}{}",
         c.url.as_deref().unwrap_or("?"),
         c.branch.as_deref().map(|b| format!(" {b}")).unwrap_or_default(),
-        c.commit.as_deref().map(|b| format!(" @{}", &b[..10.min(b.len())])).unwrap_or_default()
+        c.commit
+            .as_deref()
+            .map(|b| format!(" @{}", &b[..10.min(b.len())]))
+            .unwrap_or_default()
     )
 }
 
@@ -309,7 +343,10 @@ fn describe(c: &Component) -> String {
 /// built. Checkout-only thorns (on a !CHECKOUT line) are not built, so they never collide.
 fn check_collisions(components: &[Component]) -> AppResult<()> {
     let mut by_name: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-    for c in components.iter().filter(|c| c.ty != ComponentType::Ignore && !c.fetch_only && c.checkout.contains('/')) {
+    for c in components
+        .iter()
+        .filter(|c| c.ty != ComponentType::Ignore && !c.fetch_only && c.checkout.contains('/'))
+    {
         let thorn = c.checkout.rsplit('/').next().unwrap_or_default();
         by_name.entry(thorn.to_ascii_lowercase()).or_default().insert(&c.checkout);
     }
@@ -349,12 +386,20 @@ pub async fn resolve_package(state: &AppState, slug: &Slug) -> AppResult<(String
         .fetch_one(&state.db)
         .await?;
     let tag = best.tag.clone().unwrap_or_else(|| best.label());
-    let commit = best.commit.clone().ok_or_else(|| AppError::bad("that package version has no commit"))?;
+    let commit = best
+        .commit
+        .clone()
+        .ok_or_else(|| AppError::bad("that package version has no commit"))?;
     Ok((url, tag, commit))
 }
 
 /// Wraps a resolution as a release.
-pub fn freeze(slug: Slug, filename: &str, r: Resolution, recipe: Option<String>) -> AppResult<FrozenStack> {
+pub fn freeze(
+    slug: Slug,
+    filename: &str,
+    r: Resolution,
+    recipe: Option<String>,
+) -> AppResult<FrozenStack> {
     let f = FrozenStack {
         format: 1,
         stack: slug,
@@ -371,8 +416,10 @@ pub fn freeze(slug: Slug, filename: &str, r: Resolution, recipe: Option<String>)
 pub fn diff(prev: Option<&FrozenStack>, next: &FrozenStack) -> Vec<RepoMove> {
     let Some(prev) = prev else { return Vec::new() };
     let pin = |p: &RepoPin| p.commit.clone().or(p.sha256.clone());
-    let old: BTreeMap<&str, Option<String>> = prev.repos.iter().map(|p| (p.name.as_str(), pin(p))).collect();
-    let new: BTreeMap<&str, Option<String>> = next.repos.iter().map(|p| (p.name.as_str(), pin(p))).collect();
+    let old: BTreeMap<&str, Option<String>> =
+        prev.repos.iter().map(|p| (p.name.as_str(), pin(p))).collect();
+    let new: BTreeMap<&str, Option<String>> =
+        next.repos.iter().map(|p| (p.name.as_str(), pin(p))).collect();
     let mut out = Vec::new();
     for (k, v) in &new {
         match old.get(k) {

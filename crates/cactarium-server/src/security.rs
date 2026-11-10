@@ -32,7 +32,11 @@ pub async fn headers(State(state): State<AppState>, req: Request<Body>, next: Ne
     set(h, header::REFERRER_POLICY, "strict-origin-when-cross-origin");
     set(h, header::X_FRAME_OPTIONS, "DENY");
     set(h, header::HeaderName::from_static("cross-origin-opener-policy"), "same-origin");
-    set(h, header::HeaderName::from_static("permissions-policy"), "camera=(), microphone=(), geolocation=()");
+    set(
+        h,
+        header::HeaderName::from_static("permissions-policy"),
+        "camera=(), microphone=(), geolocation=()",
+    );
     if state.cfg.secure_cookies() {
         set(h, header::STRICT_TRANSPORT_SECURITY, "max-age=31536000");
     }
@@ -63,7 +67,11 @@ pub async fn same_origin(State(state): State<AppState>, req: Request<Body>, next
 }
 
 /// The client's address: the connecting peer, or behind our proxy the last X-Forwarded-For hop.
-pub fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<&ConnectInfo<SocketAddr>>) -> Option<IpAddr> {
+pub fn client_ip(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<&ConnectInfo<SocketAddr>>,
+) -> Option<IpAddr> {
     if state.cfg.trust_proxy
         && let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
         && let Some(last) = xff.rsplit(',').next()
@@ -79,7 +87,10 @@ pub struct ClientIp(pub Option<IpAddr>);
 
 impl axum::extract::FromRequestParts<AppState> for ClientIp {
     type Rejection = std::convert::Infallible;
-    async fn from_request_parts(parts: &mut axum::http::request::Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>();
         Ok(ClientIp(client_ip(state, &parts.headers, peer)))
     }

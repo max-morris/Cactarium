@@ -8,8 +8,9 @@ use axum::http::header;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
-    API_GENERATION, ClaimInfo, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed, ReleaseRequest, Resolved,
-    CONTACT_HEADER, SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER, VersionInfo,
+    API_GENERATION, ClaimInfo, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed,
+    ReleaseRequest, Resolved, CONTACT_HEADER, SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER,
+    VersionInfo,
 };
 use cactup_ecosystem_common::ccl::ThornFacts;
 use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
@@ -60,7 +61,12 @@ impl FromRequestParts<AppState> for TokenUser {
 }
 
 /// Public entries only: the API never reveals pending or hidden ones.
-async fn public_entry(state: &AppState, owner: &str, name: &str, kind: Option<&str>) -> ApiResult<Entry> {
+async fn public_entry(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+    kind: Option<&str>,
+) -> ApiResult<Entry> {
     match model::find_entry(state, owner, name).await? {
         Some(e) if e.visibility == "public" && kind.is_none_or(|k| k == e.kind) => Ok(e),
         _ => Err(AppError::NotFound.into()),
@@ -82,7 +88,10 @@ fn version_info(v: &Version) -> VersionInfo {
     }
 }
 
-pub async fn entry(State(state): State<AppState>, Path((owner, name)): Path<(String, String)>) -> ApiResult<Json<EntryInfo>> {
+pub async fn entry(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+) -> ApiResult<Json<EntryInfo>> {
     let e = public_entry(&state, &owner, &name, None).await?;
     let versions = model::versions(&state, e.id).await?;
     let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
@@ -100,7 +109,10 @@ pub async fn entry(State(state): State<AppState>, Path((owner, name)): Path<(Str
     }))
 }
 
-pub async fn package_versions(State(state): State<AppState>, Path((owner, name)): Path<(String, String)>) -> ApiResult<Json<PackageVersions>> {
+pub async fn package_versions(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+) -> ApiResult<Json<PackageVersions>> {
     let e = public_entry(&state, &owner, &name, Some("package")).await?;
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
     let mut versions = Vec::new();
@@ -131,7 +143,12 @@ pub async fn package_versions(State(state): State<AppState>, Path((owner, name))
                 .collect(),
             claims: claims
                 .into_iter()
-                .map(|(kind, o, n, range, note)| ClaimInfo { kind, target: format!("{o}/{n}"), range, note })
+                .map(|(kind, o, n, range, note)| ClaimInfo {
+                    kind,
+                    target: format!("{o}/{n}"),
+                    range,
+                    note,
+                })
                 .collect(),
         });
     }
@@ -144,10 +161,16 @@ pub struct ResolveQ {
 }
 
 /// `owner/name@[track:]range` → the highest usable matching version, with its frozen commit.
-pub async fn resolve(State(state): State<AppState>, Query(q): Query<ResolveQ>) -> ApiResult<Json<Resolved>> {
+pub async fn resolve(
+    State(state): State<AppState>,
+    Query(q): Query<ResolveQ>,
+) -> ApiResult<Json<Resolved>> {
     let slug: Slug = q.req.parse().map_err(AppError::bad)?;
     if slug.tip().is_some() {
-        return Err(AppError::bad("@head and @master are not versions; fetch the stack's releases/head or releases/master").into());
+        return Err(AppError::bad(
+            "@head and @master are not versions; fetch the stack's releases/head or releases/master",
+        )
+        .into());
     }
     let e = public_entry(&state, slug.owner.as_str(), slug.name.as_str(), None).await?;
     let versions = model::versions(&state, e.id).await?;
@@ -171,12 +194,22 @@ pub async fn resolve(State(state): State<AppState>, Query(q): Query<ResolveQ>) -
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
     let contact = match e.kind.as_str() {
         "sim" => model::entry_contact(&state, &e, None).await?,
-        _ => model::manifest_contact(best.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page)),
+        _ => model::manifest_contact(best.manifest.as_ref())
+            .or_else(|| url.as_deref().map(model::repo_page)),
     };
-    Ok(Json(Resolved { slug: format!("{}@{}", e.slug(), best.label()), kind: e.kind.clone(), url, contact, version: version_info(best) }))
+    Ok(Json(Resolved {
+        slug: format!("{}@{}", e.slug(), best.label()),
+        kind: e.kind.clone(),
+        url,
+        contact,
+        version: version_info(best),
+    }))
 }
 
-pub async fn stack_releases(State(state): State<AppState>, Path((owner, name)): Path<(String, String)>) -> ApiResult<Json<StackReleases>> {
+pub async fn stack_releases(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+) -> ApiResult<Json<StackReleases>> {
     let e = public_entry(&state, &owner, &name, Some("stack")).await?;
     let versions = model::versions(&state, e.id).await?;
     Ok(Json(StackReleases { slug: e.slug(), releases: versions.iter().map(version_info).collect() }))
@@ -196,10 +229,13 @@ pub async fn stack_release(
     };
     let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
     let contact = model::entry_contact(&state, &e, repo.as_deref()).await?.unwrap_or_default();
-    let contact = header::HeaderValue::from_str(&contact).unwrap_or(header::HeaderValue::from_static(""));
+    let contact =
+        header::HeaderValue::from_str(&contact).unwrap_or(header::HeaderValue::from_static(""));
     let contact_header = (header::HeaderName::from_static(CONTACT_HEADER), contact);
     let Some(tip) = tip else {
-        let v = model::version_by_label(&state, e.id, &version).await?.ok_or(AppError::NotFound)?;
+        let v = model::version_by_label(&state, e.id, &version)
+            .await?
+            .ok_or(AppError::NotFound)?;
         return Ok(([contact_header], Json(stacks::frozen_of(&state, &v).await?)).into_response());
     };
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
@@ -216,7 +252,8 @@ pub async fn stack_release(
         repos: r.pins,
         recipe: Some(definition),
     };
-    let unpinned = (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true"));
+    let unpinned =
+        (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true"));
     Ok(([unpinned, contact_header], Json(frozen)).into_response())
 }
 
@@ -258,16 +295,28 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
     }
 }
 
-pub async fn sim_download(State(state): State<AppState>, Path((owner, name, version)): Path<(String, String, String)>) -> ApiResult<Response> {
+pub async fn sim_download(
+    State(state): State<AppState>,
+    Path((owner, name, version)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
     let e = public_entry(&state, &owner, &name, Some("sim")).await?;
-    let v = model::version_by_label(&state, e.id, &version).await?.ok_or(AppError::NotFound)?;
+    let v = model::version_by_label(&state, e.id, &version)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let (content, _) = sim_file(&state, v.id).await?;
     let sha: String = sqlx::query_scalar("SELECT sha256 FROM sim_files WHERE version_id = $1")
         .bind(v.id)
         .fetch_one(&state.db)
         .await
         .map_err(AppError::from)?;
-    Ok(([(header::CONTENT_TYPE, "application/toml".to_owned()), (header::HeaderName::from_static(SHA256_HEADER), sha)], content).into_response())
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/toml".to_owned()),
+            (header::HeaderName::from_static(SHA256_HEADER), sha),
+        ],
+        content,
+    )
+        .into_response())
 }
 
 /// Publishes a `.sim` (the request body) as the next version of the token owner's sim.
@@ -279,12 +328,9 @@ pub async fn sim_publish(
     body: Bytes,
 ) -> ApiResult<Json<Published>> {
     state.limiter.check("upload", ip.0, 20)?;
-    if owner != user.username {
-        return Err(AppError::Forbidden.into());
-    }
     let checked = sims::check(&body)?;
     let warnings = checked.index.warnings.clone();
-    let (entry, n) = sims::publish(&state, &user, Some(&name), checked).await?;
+    let (entry, n) = sims::publish(&state, &user, Some(&owner), Some(&name), checked).await?;
     Ok(Json(Published {
         slug: format!("{}@{n}", entry.slug()),
         url: state.cfg.url(&format!("{}/{n}", entry.url())),
@@ -301,14 +347,19 @@ pub async fn stack_publish(
     Json(b): Json<ReleaseRequest>,
 ) -> ApiResult<Json<Published>> {
     state.limiter.check("release", ip.0, 10)?;
-    if owner != user.username {
-        return Err(AppError::Forbidden.into());
-    }
     let m = Manifest::from_toml(&b.definition).map_err(AppError::bad)?;
     if m.stack.as_ref().map(|s| s.name.as_str()) != Some(name.as_str()) {
         return Err(AppError::bad(format!("the definition's [stack] name is not '{name}'")).into());
     }
-    let e = crate::web::account::cut_release(&state, &user, &b.definition, b.thornlist.as_deref(), &b.version).await?;
+    let e = crate::web::account::cut_release(
+        &state,
+        &user,
+        Some(&owner),
+        &b.definition,
+        b.thornlist.as_deref(),
+        &b.version,
+    )
+    .await?;
     Ok(Json(Published {
         slug: format!("{}@{}", e.slug(), b.version.trim()),
         url: state.cfg.url(&format!("{}/{}", e.url(), b.version.trim())),

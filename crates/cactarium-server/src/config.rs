@@ -83,7 +83,10 @@ impl Config {
             dev_login: flag("CACTARIUM_DEV_LOGIN"),
             allow_local_repos: flag("CACTARIUM_ALLOW_LOCAL_REPOS"),
             trust_proxy: flag("CACTARIUM_TRUST_PROXY"),
-            poll_interval: var("CACTARIUM_POLL_SECONDS").map(|s| s.parse()).transpose()?.unwrap_or(4 * 3600),
+            poll_interval: var("CACTARIUM_POLL_SECONDS")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(4 * 3600),
             static_dir: var("CACTARIUM_STATIC_DIR").unwrap_or_else(|| "static".into()),
             base_url,
         };

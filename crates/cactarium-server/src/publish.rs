@@ -23,6 +23,37 @@ pub struct NewEntry<'a> {
     pub curated: bool,
 }
 
+/// Who may publish under `owner`: the user of that name, members of the organization of that
+/// name, and admins under a namespace that is no user's (such as an org they don't belong to).
+pub async fn check_namespace(state: &AppState, user: &User, owner: &str) -> AppResult<()> {
+    if owner == user.username || user.orgs.iter().any(|o| o == owner) {
+        return Ok(());
+    }
+    if user.is_admin() {
+        let is_user: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1)")
+                .bind(owner)
+                .fetch_one(&state.db)
+                .await?;
+        if !is_user {
+            return Ok(());
+        }
+        return Err(AppError::Denied(format!(
+            "'{owner}' is a user's name; only they can publish under it"
+        )));
+    }
+    Err(AppError::Denied(format!(
+        "you can publish only under your own name or an organization you belong to, not '{owner}'"
+    )))
+}
+
+/// The namespaces `user` may publish under without being an admin: their name and their orgs.
+pub fn namespaces(user: &User) -> Vec<String> {
+    std::iter::once(user.username.clone())
+        .chain(user.orgs.iter().cloned())
+        .collect()
+}
+
 fn skips_review(user: &User) -> bool {
     user.trusted || user.is_admin()
 }
@@ -33,10 +64,8 @@ pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> App
     if n.curated && !user.is_admin() {
         return Err(AppError::Forbidden);
     }
-    // Admins may publish under a namespace that is not a user's (e.g. `et`); everyone else only
-    // under their own name.
-    if !n.curated && n.owner != user.username && !user.is_admin() {
-        return Err(AppError::Forbidden);
+    if !n.curated {
+        check_namespace(state, user, n.owner).await?;
     }
     if find_conflict(state, n.owner, n.name).await? {
         return Err(AppError::Conflict(format!("{}/{} already exists", n.owner, n.name)));
@@ -63,7 +92,15 @@ pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> App
         .bind(status)
         .execute(&state.db)
         .await?;
-    audit(state, Some(user.id), "entry.create", Some(&entry.slug()), json!({ "kind": n.kind, "visibility": visibility }), None).await?;
+    audit(
+        state,
+        Some(user.id),
+        "entry.create",
+        Some(&entry.slug()),
+        json!({ "kind": n.kind, "visibility": visibility }),
+        None,
+    )
+    .await?;
     Ok(entry)
 }
 
@@ -90,6 +127,9 @@ pub async fn resubmit(state: &AppState, entry: &Entry, user: &User) -> AppResult
 }
 
 pub async fn touch(state: &AppState, entry_id: i64) -> AppResult<()> {
-    sqlx::query("UPDATE entries SET updated_at = now() WHERE id = $1").bind(entry_id).execute(&state.db).await?;
+    sqlx::query("UPDATE entries SET updated_at = now() WHERE id = $1")
+        .bind(entry_id)
+        .execute(&state.db)
+        .await?;
     Ok(())
 }

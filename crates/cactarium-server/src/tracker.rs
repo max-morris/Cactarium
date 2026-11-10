@@ -33,7 +33,10 @@ fn policy(state: &AppState) -> GitPolicy {
 }
 
 fn version_tags(refs: Vec<RemoteRef>) -> Vec<(RemoteRef, TrackedVersion)> {
-    let mut v: Vec<_> = refs.into_iter().filter_map(|r| TrackedVersion::from_tag(&r.name).map(|t| (r, t))).collect();
+    let mut v: Vec<_> = refs
+        .into_iter()
+        .filter_map(|r| TrackedVersion::from_tag(&r.name).map(|t| (r, t)))
+        .collect();
     v.sort_by(|a, b| (&a.1.track, &a.1.version).cmp(&(&b.1.track, &b.1.version)));
     v
 }
@@ -57,11 +60,14 @@ pub async fn inspect(state: &AppState, url: &str) -> AppResult<Found> {
         .max_by(|a, b| a.1.version.cmp(&b.1.version))
         .or_else(|| tags.iter().max_by(|a, b| a.1.version.cmp(&b.1.version)))
         .ok_or_else(|| AppError::bad("the repo has no version tags (vX.Y.Z or track/vX.Y.Z)"))?;
-    let co = git::checkout(policy(state), &url, &newest.0.commit, Some(&newest.0.name)).await.map_err(AppError::bad)?;
+    let co = git::checkout(policy(state), &url, &newest.0.commit, Some(&newest.0.name))
+        .await
+        .map_err(AppError::bad)?;
     let mut manifests = Vec::new();
     for file in [PACKAGE_FILE, STACK_FILE] {
         if let Some(text) = git::read_in(&co, file).map_err(AppError::bad)? {
-            let m = Manifest::from_repo_file(file, &text).map_err(|e| AppError::bad(format!("{file} at {}: {e}", newest.0.name)))?;
+            let m = Manifest::from_repo_file(file, &text)
+                .map_err(|e| AppError::bad(format!("{file} at {}: {e}", newest.0.name)))?;
             manifests.push((file, m));
         }
     }
@@ -83,11 +89,19 @@ fn owners_of(m: &Manifest) -> Vec<String> {
 }
 
 fn name_of(m: &Manifest) -> String {
-    m.package.as_ref().map(|p| p.name.to_string()).or_else(|| m.stack.as_ref().map(|s| s.name.to_string())).unwrap_or_default()
+    m.package
+        .as_ref()
+        .map(|p| p.name.to_string())
+        .or_else(|| m.stack.as_ref().map(|s| s.name.to_string()))
+        .unwrap_or_default()
 }
 
 fn summary_of(m: &Manifest) -> Option<String> {
-    let d = m.package.as_ref().and_then(|p| p.description.clone()).or_else(|| m.stack.as_ref().and_then(|s| s.description.clone()))?;
+    let d = m
+        .package
+        .as_ref()
+        .and_then(|p| p.description.clone())
+        .or_else(|| m.stack.as_ref().and_then(|s| s.description.clone()))?;
     Some(d.lines().next().unwrap_or("").chars().take(200).collect())
 }
 
@@ -95,19 +109,17 @@ fn summary_of(m: &Manifest) -> Option<String> {
 /// the user's own name, or (admins only) under `namespace`, a name that is no user's, such as
 /// `et`. That name must be in each manifest's `owners`: only someone who can push to the repo can
 /// put it there.
-pub async fn register(state: &AppState, user: &User, url: &str, namespace: Option<&str>) -> AppResult<Vec<Entry>> {
-    let owner = match namespace.map(str::trim).filter(|n| !n.is_empty() && *n != user.username) {
+pub async fn register(
+    state: &AppState,
+    user: &User,
+    url: &str,
+    namespace: Option<&str>,
+) -> AppResult<Vec<Entry>> {
+    let owner = match namespace.map(str::trim).filter(|n| !n.is_empty()) {
         None => user.username.clone(),
-        Some(_) if !user.is_admin() => return Err(AppError::Forbidden),
         Some(ns) => {
             ns.parse::<cactup_ecosystem_common::name::Owner>().map_err(AppError::bad)?;
-            let is_user: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1)")
-                .bind(ns)
-                .fetch_one(&state.db)
-                .await?;
-            if is_user {
-                return Err(AppError::bad(format!("'{ns}' is a user's name; only they can publish under it")));
-            }
+            publish::check_namespace(state, user, ns).await?;
             ns.to_owned()
         }
     };
@@ -126,7 +138,14 @@ pub async fn register(state: &AppState, user: &User, url: &str, namespace: Optio
         let entry = publish::create_entry(
             state,
             user,
-            NewEntry { kind, owner: &owner, name: &name_of(&m), summary: summary_of(&m), description: None, curated: false },
+            NewEntry {
+                kind,
+                owner: &owner,
+                name: &name_of(&m),
+                summary: summary_of(&m),
+                description: None,
+                curated: false,
+            },
         )
         .await?;
         attach_repo(state, &entry, &found.url, file, None).await?;
@@ -140,20 +159,39 @@ pub async fn register(state: &AppState, user: &User, url: &str, namespace: Optio
 
 /// Admin-only: a package for a repo nobody on the Cactarium controls, with an overlay manifest
 /// kept here instead of in the repo.
-pub async fn register_curated(state: &AppState, admin: &User, owner: &str, url: &str, overlay: &str) -> AppResult<Entry> {
+pub async fn register_curated(
+    state: &AppState,
+    admin: &User,
+    owner: &str,
+    url: &str,
+    overlay: &str,
+) -> AppResult<Entry> {
     let m = Manifest::from_repo_file(PACKAGE_FILE, overlay).map_err(AppError::bad)?;
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
     let entry = publish::create_entry(
         state,
         admin,
-        NewEntry { kind: "package", owner, name: &name_of(&m), summary: summary_of(&m), description: None, curated: true },
+        NewEntry {
+            kind: "package",
+            owner,
+            name: &name_of(&m),
+            summary: summary_of(&m),
+            description: None,
+            curated: true,
+        },
     )
     .await?;
     attach_repo(state, &entry, &url, PACKAGE_FILE, Some(overlay)).await?;
     Ok(entry)
 }
 
-async fn attach_repo(state: &AppState, entry: &Entry, url: &str, file: &str, overlay: Option<&str>) -> AppResult<()> {
+async fn attach_repo(
+    state: &AppState,
+    entry: &Entry,
+    url: &str,
+    file: &str,
+    overlay: Option<&str>,
+) -> AppResult<()> {
     sqlx::query("INSERT INTO entry_repos (entry_id, url, manifest_file, webhook_secret, overlay_manifest) VALUES ($1, $2, $3, $4, $5)")
         .bind(entry.id)
         .bind(url)
@@ -193,10 +231,11 @@ struct Known {
 /// Brings an entry up to date with its repo's tags. Returns how many versions were added.
 pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
-    let banned: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND banned)")
-        .bind(&entry.owner)
-        .fetch_one(&state.db)
-        .await?;
+    let banned: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND banned)")
+            .bind(&entry.owner)
+            .fetch_one(&state.db)
+            .await?;
     if banned || entry.visibility == "hidden" {
         return Ok(0);
     }
@@ -212,12 +251,16 @@ pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
 
 async fn sync_inner(state: &AppState, entry: &Entry, repo: &RepoRow) -> AppResult<usize> {
     let refs = git::ls_tags(policy(state), &repo.url).await.map_err(AppError::bad)?;
-    let remote: BTreeMap<String, String> = refs.iter().map(|r| (r.name.clone(), r.commit.clone())).collect();
-    let known: Vec<Known> = sqlx::query_as("SELECT id, tag, commit, state FROM versions WHERE entry_id = $1 AND NOT is_virtual")
-        .bind(entry.id)
-        .fetch_all(&state.db)
-        .await?;
-    let by_tag: BTreeMap<&str, &Known> = known.iter().filter_map(|k| k.tag.as_deref().map(|t| (t, k))).collect();
+    let remote: BTreeMap<String, String> =
+        refs.iter().map(|r| (r.name.clone(), r.commit.clone())).collect();
+    let known: Vec<Known> = sqlx::query_as(
+        "SELECT id, tag, commit, state FROM versions WHERE entry_id = $1 AND NOT is_virtual",
+    )
+    .bind(entry.id)
+    .fetch_all(&state.db)
+    .await?;
+    let by_tag: BTreeMap<&str, &Known> =
+        known.iter().filter_map(|k| k.tag.as_deref().map(|t| (t, k))).collect();
 
     for k in &known {
         let (Some(tag), Some(frozen)) = (&k.tag, &k.commit) else { continue };
@@ -229,7 +272,10 @@ async fn sync_inner(state: &AppState, entry: &Entry, repo: &RepoRow) -> AppResul
                 mark(state, entry, k.id, "upstream-missing", tag, frozen, None).await?;
             }
             Some(now) if now == frozen && k.state == "upstream-missing" => {
-                sqlx::query("UPDATE versions SET state = 'ok' WHERE id = $1").bind(k.id).execute(&state.db).await?;
+                sqlx::query("UPDATE versions SET state = 'ok' WHERE id = $1")
+                    .bind(k.id)
+                    .execute(&state.db)
+                    .await?;
             }
             _ => {}
         }
@@ -253,8 +299,20 @@ async fn sync_inner(state: &AppState, entry: &Entry, repo: &RepoRow) -> AppResul
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn mark(state: &AppState, entry: &Entry, version_id: i64, new_state: &str, tag: &str, frozen: &str, now: Option<&String>) -> AppResult<()> {
-    sqlx::query("UPDATE versions SET state = $2 WHERE id = $1").bind(version_id).bind(new_state).execute(&state.db).await?;
+async fn mark(
+    state: &AppState,
+    entry: &Entry,
+    version_id: i64,
+    new_state: &str,
+    tag: &str,
+    frozen: &str,
+    now: Option<&String>,
+) -> AppResult<()> {
+    sqlx::query("UPDATE versions SET state = $2 WHERE id = $1")
+        .bind(version_id)
+        .bind(new_state)
+        .execute(&state.db)
+        .await?;
     sqlx::query("INSERT INTO tag_events (entry_id, version_id, tag, frozen_commit, new_commit) VALUES ($1, $2, $3, $4, $5)")
         .bind(entry.id)
         .bind(version_id)
@@ -263,13 +321,27 @@ async fn mark(state: &AppState, entry: &Entry, version_id: i64, new_state: &str,
         .bind(now)
         .execute(&state.db)
         .await?;
-    audit(state, None, &format!("tag.{new_state}"), Some(&entry.slug()), json!({ "tag": tag, "frozen": frozen, "now": now }), None).await?;
+    audit(
+        state,
+        None,
+        &format!("tag.{new_state}"),
+        Some(&entry.slug()),
+        json!({ "tag": tag, "frozen": frozen, "now": now }),
+        None,
+    )
+    .await?;
     Ok(())
 }
 
 /// Freezes one tag as a version. A tag whose manifest is missing or wrong still becomes a version,
 /// marked invalid with the reason, so it is not fetched again on every poll.
-async fn ingest(state: &AppState, entry: &Entry, repo: &RepoRow, r: &RemoteRef, tv: &TrackedVersion) -> AppResult<()> {
+async fn ingest(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    r: &RemoteRef,
+    tv: &TrackedVersion,
+) -> AppResult<()> {
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let base = |reason: Option<String>, tree: Option<String>| (reason, tree);
     let co = git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await;
@@ -305,7 +377,15 @@ async fn ingest(state: &AppState, entry: &Entry, repo: &RepoRow, r: &RemoteRef, 
     if let Some(p) = prepared {
         store_prepared(state, entry, vid, &track, p).await?;
     }
-    audit(state, None, "version.ingest", Some(&entry.slug()), json!({ "tag": r.name, "commit": r.commit, "invalid": invalid }), None).await?;
+    audit(
+        state,
+        None,
+        "version.ingest",
+        Some(&entry.slug()),
+        json!({ "tag": r.name, "commit": r.commit, "invalid": invalid }),
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -318,7 +398,14 @@ struct Prepared {
     frozen: Option<(FrozenStack, String, Option<String>)>,
 }
 
-async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Checkout, r: &RemoteRef, tv: &TrackedVersion) -> AppResult<Prepared> {
+async fn prepare(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    co: &git::Checkout,
+    r: &RemoteRef,
+    tv: &TrackedVersion,
+) -> AppResult<Prepared> {
     let text = match &repo.overlay_manifest {
         Some(o) => o.clone(),
         None => git::read_in(co, &repo.manifest_file)
@@ -327,7 +414,11 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
     };
     let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(AppError::bad)?;
     if name_of(&m) != entry.name {
-        return Err(AppError::bad(format!("the manifest names '{}', not '{}'", name_of(&m), entry.name)));
+        return Err(AppError::bad(format!(
+            "the manifest names '{}', not '{}'",
+            name_of(&m),
+            entry.name
+        )));
     }
     if !entry.curated && !owners_of(&m).contains(&entry.owner) {
         return Err(AppError::bad(format!("the manifest's owners no longer include '{}'", entry.owner)));
@@ -336,23 +427,43 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
     for c in &m.fork_of {
         claims.push(("fork-of", c.target.clone(), None, c.note.clone()));
     }
-    for (kind, list) in [("depends-on", &m.depends_on), ("works-with", &m.works_with), ("incompatible-with", &m.incompatible_with)] {
+    for (kind, list) in [
+        ("depends-on", &m.depends_on),
+        ("works-with", &m.works_with),
+        ("incompatible-with", &m.incompatible_with),
+    ] {
         for c in list {
-            claims.push((kind, c.target.clone(), c.range.as_ref().map(|r| r.to_string()), c.note.clone()));
+            claims.push((
+                kind,
+                c.target.clone(),
+                c.range.as_ref().map(|r| r.to_string()),
+                c.note.clone(),
+            ));
         }
     }
     let manifest_json = serde_json::to_value(&m).map_err(anyhow::Error::from)?;
-    let mut p = Prepared { manifest_json, readme_html: None, summary: summary_of(&m), thorns: vec![], claims, frozen: None };
+    let mut p = Prepared {
+        manifest_json,
+        readme_html: None,
+        summary: summary_of(&m),
+        thorns: vec![],
+        claims,
+        frozen: None,
+    };
 
     if let Some(pkg) = &m.package {
         let readme_path = pkg.readme.clone().unwrap_or_else(|| "README.md".into());
         p.readme_html = git::read_in(co, &readme_path).ok().flatten().map(|t| markdown::render(&t));
         let allow = pkg.thorns.as_ref();
         let root = co.path.clone();
-        let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?;
+        let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root))
+            .await
+            .map_err(anyhow::Error::from)?;
         for t in scanned {
             let Some(name) = t.name.clone() else {
-                return Err(AppError::bad("the repo root is itself a thorn; publish it from an arrangement-level repo"));
+                return Err(AppError::bad(
+                    "the repo root is itself a thorn; publish it from an arrangement-level repo",
+                ));
             };
             if allow.is_some_and(|a| !a.contains(&name)) {
                 continue;
@@ -361,10 +472,13 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
                 (Some(a), _) => a.clone(),
                 (None, Some(a)) => a.clone(),
                 (None, None) => {
-                    return Err(AppError::bad("thorns sit at the repo root; set [package] arrangement in cactarium.toml"));
+                    return Err(AppError::bad(
+                        "thorns sit at the repo root; set [package] arrangement in cactarium.toml",
+                    ));
                 }
             };
-            p.thorns.push((arrangement, name, t.dir.to_string_lossy().into_owned(), t.facts));
+            p.thorns
+                .push((arrangement, name, t.dir.to_string_lossy().into_owned(), t.facts));
         }
         if p.thorns.is_empty() {
             return Err(AppError::bad("no thorns found (directories with an interface.ccl)"));
@@ -372,12 +486,21 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
     }
     if let Some(stack) = &m.stack {
         let own = match &stack.thornlist {
-            Some(path) => Some(git::read_in(co, path).map_err(AppError::bad)?.ok_or_else(|| AppError::bad(format!("'{path}' does not exist at this tag")))?),
+            Some(path) => Some(
+                git::read_in(co, path)
+                    .map_err(AppError::bad)?
+                    .ok_or_else(|| AppError::bad(format!("'{path}' does not exist at this tag")))?,
+            ),
             None => None,
         };
         let resolution = stacks::resolve(state, &entry.owner, stack, own.as_deref(), None).await?;
         let slug: Slug = format!("{}@{}", entry.slug(), tv).parse().map_err(AppError::bad)?;
-        let filename = stack.thornlist.as_deref().and_then(|p| p.rsplit('/').next()).map(str::to_owned).unwrap_or_else(|| format!("{}.th", entry.name));
+        let filename = stack
+            .thornlist
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}.th", entry.name));
         let frozen = stacks::freeze(slug, &filename, resolution, Some(text.clone()))?;
         let toml = toml::to_string(&frozen).map_err(anyhow::Error::from)?;
         p.frozen = Some((frozen, toml, own));
@@ -386,7 +509,13 @@ async fn prepare(state: &AppState, entry: &Entry, repo: &RepoRow, co: &git::Chec
     Ok(p)
 }
 
-async fn store_prepared(state: &AppState, entry: &Entry, vid: i64, track: &str, p: Prepared) -> AppResult<()> {
+async fn store_prepared(
+    state: &AppState,
+    entry: &Entry,
+    vid: i64,
+    track: &str,
+    p: Prepared,
+) -> AppResult<()> {
     for (arr, name, dir, facts) in &p.thorns {
         sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(vid)
@@ -410,10 +539,15 @@ async fn store_prepared(state: &AppState, entry: &Entry, vid: i64, track: &str, 
             .await?;
     }
     if let Some((frozen, toml, own)) = &p.frozen {
-        store_release(state, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone()).await?;
+        store_release(state, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone())
+            .await?;
     }
     if p.summary.is_some() {
-        sqlx::query("UPDATE entries SET summary = $2 WHERE id = $1").bind(entry.id).bind(&p.summary).execute(&state.db).await?;
+        sqlx::query("UPDATE entries SET summary = $2 WHERE id = $1")
+            .bind(entry.id)
+            .bind(&p.summary)
+            .execute(&state.db)
+            .await?;
     }
     Ok(())
 }
@@ -460,11 +594,13 @@ pub async fn store_release(
 pub async fn store_built_thorns(state: &AppState, vid: i64, thornlist: &str) -> AppResult<()> {
     let Ok(list) = cactup_ecosystem_common::crl::parse(thornlist) else { return Ok(()) };
     for c in list.components().iter().filter(|c| c.checkout.contains('/') && !c.fetch_only) {
-        sqlx::query("INSERT INTO release_thorns (version_id, checkout) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(vid)
-            .bind(&c.checkout)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "INSERT INTO release_thorns (version_id, checkout) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(vid)
+        .bind(&c.checkout)
+        .execute(&state.db)
+        .await?;
     }
     Ok(())
 }
@@ -494,7 +630,11 @@ pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
-pub async fn store_pins(state: &AppState, vid: i64, pins: &[cactup_ecosystem_common::sim::RepoPin]) -> AppResult<()> {
+pub async fn store_pins(
+    state: &AppState,
+    vid: i64,
+    pins: &[cactup_ecosystem_common::sim::RepoPin],
+) -> AppResult<()> {
     for p in pins {
         sqlx::query("INSERT INTO source_pins (version_id, repo, url, url_norm, git_ref, commit) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING")
             .bind(vid)
@@ -510,7 +650,13 @@ pub async fn store_pins(state: &AppState, vid: i64, pins: &[cactup_ecosystem_com
 }
 
 /// Admin-only: a curated version (a commit that exists upstream, named by the admin).
-pub async fn add_virtual_version(state: &AppState, admin: &User, entry: &Entry, label: &str, commit: &str) -> AppResult<()> {
+pub async fn add_virtual_version(
+    state: &AppState,
+    admin: &User,
+    entry: &Entry,
+    label: &str,
+    commit: &str,
+) -> AppResult<()> {
     let tv: TrackedVersion = label.parse().map_err(AppError::bad)?;
     let commit = commit.trim().to_ascii_lowercase();
     if !(commit.len() == 40 || commit.len() == 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -518,7 +664,9 @@ pub async fn add_virtual_version(state: &AppState, admin: &User, entry: &Entry, 
     }
     let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
     // The commit must exist upstream: fetching it proves that.
-    let co = git::checkout(policy(state), &repo.url, &commit, None).await.map_err(|e| AppError::bad(format!("that commit cannot be fetched: {e:#}")))?;
+    let co = git::checkout(policy(state), &repo.url, &commit, None)
+        .await
+        .map_err(|e| AppError::bad(format!("that commit cannot be fetched: {e:#}")))?;
     let r = RemoteRef { name: tv.conventional_tag(), commit: commit.clone() };
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let prepared = prepare(state, entry, &repo, &co, &r, &tv).await?;
@@ -542,7 +690,15 @@ pub async fn add_virtual_version(state: &AppState, admin: &User, entry: &Entry, 
         _ => e.into(),
     })?;
     store_prepared(state, entry, vid, &track, prepared).await?;
-    audit(state, Some(admin.id), "version.virtual", Some(&entry.slug()), json!({ "version": label, "commit": commit }), None).await?;
+    audit(
+        state,
+        Some(admin.id),
+        "version.virtual",
+        Some(&entry.slug()),
+        json!({ "version": label, "commit": commit }),
+        None,
+    )
+    .await?;
     Ok(())
 }
 

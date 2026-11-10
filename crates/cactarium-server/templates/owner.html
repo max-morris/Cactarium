@@ -2,11 +2,24 @@
 {% block title %}{{ owner }} · Cactarium{% endblock %}
 {% block content %}
 <section class="stack-lg">
-  <div class="stack-sm">
-    <span class="eyebrow">Owner</span>
-    <h1 class="mono">{{ owner }}</h1>
-    {% if display != owner %}<p class="lead">{{ display }}</p>{% endif %}
+  <div class="row-wrap between">
+    <div class="stack-sm">
+      <span class="eyebrow">{% if is_org %}Organization{% else %}User{% endif %}</span>
+      <h1 class="mono">{{ owner }}</h1>
+      {% if display != owner %}<p class="lead">{{ display }}</p>{% endif %}
+    </div>
+    {% if can_manage_org %}<a class="button ghost" href="/orgs/{{ owner }}">Manage</a>{% endif %}
   </div>
+  {% if is_org && !members.is_empty() %}
+  <p class="small"><span class="muted">Members:</span>
+    {% for m in members %}<a class="mono" href="/{{ m.0 }}">{{ m.0 }}</a>{% if m.1 == "owner" %} <span class="muted">(owner)</span>{% endif %}{% if !loop.last %}, {% endif %}{% endfor %}
+  </p>
+  {% endif %}
+  {% if !orgs.is_empty() %}
+  <p class="small"><span class="muted">Organizations:</span>
+    {% for o in orgs %}<a class="mono" href="/{{ o }}">{{ o }}</a>{% if !loop.last %}, {% endif %}{% endfor %}
+  </p>
+  {% endif %}
   {% let rows = entries %}
   {% include "_entry_table.html" %}
 </section>

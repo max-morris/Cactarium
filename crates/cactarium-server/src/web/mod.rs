@@ -2,6 +2,7 @@ pub mod account;
 pub mod admin;
 pub mod api;
 pub mod hooks;
+pub mod orgs;
 pub mod public;
 
 use axum::Router;
@@ -71,6 +72,11 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/users", get(admin::users))
         .route("/admin/users/{id}", post(admin::user_action))
         .route("/admin/audit", get(admin::audit_log))
+        .route("/admin/site", get(admin::site_page).post(admin::site_save))
+        .route("/orgs/new", get(orgs::new_page).post(orgs::create_form))
+        .route("/orgs/{name}", get(orgs::manage_page))
+        .route("/orgs/{name}/members", post(orgs::add_member))
+        .route("/orgs/{name}/members/{uid}", post(orgs::member_action))
         .route("/hooks/{provider}/{entry_id}", post(hooks::receive))
         .nest("/api/v1", api)
         .nest_service("/static", ServeDir::new(&state.cfg.static_dir))

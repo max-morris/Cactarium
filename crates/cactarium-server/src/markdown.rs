@@ -20,7 +20,9 @@ pub fn render(src: &str) -> String {
 mod tests {
     #[test]
     fn scripts_are_removed() {
-        let h = super::render("# Hi\n<script>alert(1)</script>\n[x](javascript:alert(1)) <img src=x onerror=alert(1)>");
+        let h = super::render(
+            "# Hi\n<script>alert(1)</script>\n[x](javascript:alert(1)) <img src=x onerror=alert(1)>",
+        );
         assert!(h.contains("<h1>Hi</h1>"));
         assert!(!h.contains("<script"));
         assert!(!h.contains("javascript:"));

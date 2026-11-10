@@ -15,6 +15,7 @@
         <textarea id="th" name="thornlist" class="mono" rows="14" spellcheck="false">{{ thornlist }}</textarea>
       </div>
       <div class="split-side stack-sm">
+        {% include "_publish_under.html" %}
         <label for="ver">Release version</label>
         <input id="ver" name="version" class="mono" value="{{ version }}" placeholder="1.0.0 or mixed-precision:1.0.0" required>
         <button class="button" type="submit">Resolve and release</button>
@@ -22,7 +23,7 @@
 
 [stack]
 name = "carpetx-mp"
-extends = ["einsteintoolkit/et@2026.5.0"]
+extends = ["et/carpetx@1.0.0"]
 enable = ["CarpetX/TestReal4"]
 
 [[stack.override]]

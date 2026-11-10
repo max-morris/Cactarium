@@ -24,8 +24,7 @@ pub struct Entry {
     pub updated_at: OffsetDateTime,
 }
 
-pub const ENTRY_COLS: &str =
-    "id, kind, owner, name, summary, description, visibility, verified, curated, created_by, created_at, updated_at";
+pub const ENTRY_COLS: &str = "id, kind, owner, name, summary, description, visibility, verified, curated, created_by, created_at, updated_at";
 
 impl Entry {
     pub fn slug(&self) -> String {
@@ -36,9 +35,10 @@ impl Entry {
         format!("/{}/{}", self.owner, self.name)
     }
 
-    /// Whether `user` manages this entry: its owner namespace is theirs, or they are an admin.
+    /// Whether `user` manages this entry: its owner namespace is theirs or an organization they
+    /// belong to, or they are an admin.
     pub fn manageable_by(&self, user: Option<&User>) -> bool {
-        user.is_some_and(|u| u.is_admin() || u.username == self.owner)
+        user.is_some_and(|u| u.is_admin() || u.username == self.owner || u.orgs.contains(&self.owner))
     }
 
     pub fn visible_to(&self, user: Option<&User>) -> bool {
@@ -73,7 +73,11 @@ pub const VERSION_COLS: &str = "id, entry_id, track, version, sort_key, tag, com
 impl Version {
     /// `1.2.3`, `mixed-precision:1.2.3`, or a sim's `3`.
     pub fn label(&self) -> String {
-        if self.track.is_empty() { self.version.clone() } else { format!("{}:{}", self.track, self.version) }
+        if self.track.is_empty() {
+            self.version.clone()
+        } else {
+            format!("{}:{}", self.track, self.version)
+        }
     }
 
     pub fn short_commit(&self) -> String {
@@ -100,16 +104,23 @@ pub fn tracked(v: &Version) -> Option<TrackedVersion> {
 }
 
 pub async fn find_entry(state: &AppState, owner: &str, name: &str) -> AppResult<Option<Entry>> {
-    Ok(sqlx::query_as::<_, Entry>(&format!("SELECT {ENTRY_COLS} FROM entries WHERE owner = $1 AND name = $2"))
-        .bind(owner)
-        .bind(name)
-        .fetch_optional(&state.db)
-        .await?)
+    Ok(sqlx::query_as::<_, Entry>(&format!(
+        "SELECT {ENTRY_COLS} FROM entries WHERE owner = $1 AND name = $2"
+    ))
+    .bind(owner)
+    .bind(name)
+    .fetch_optional(&state.db)
+    .await?)
 }
 
 /// The entry, if `user` may see it; NotFound otherwise (hidden entries are indistinguishable from
 /// missing ones).
-pub async fn visible_entry(state: &AppState, owner: &str, name: &str, user: Option<&User>) -> AppResult<Entry> {
+pub async fn visible_entry(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+    user: Option<&User>,
+) -> AppResult<Entry> {
     match find_entry(state, owner, name).await? {
         Some(e) if e.visible_to(user) => Ok(e),
         _ => Err(AppError::NotFound),
@@ -134,7 +145,11 @@ pub async fn versions(state: &AppState, entry_id: i64) -> AppResult<Vec<Version>
     .await?)
 }
 
-pub async fn version_by_label(state: &AppState, entry_id: i64, label: &str) -> AppResult<Option<Version>> {
+pub async fn version_by_label(
+    state: &AppState,
+    entry_id: i64,
+    label: &str,
+) -> AppResult<Option<Version>> {
     let (track, version) = match label.split_once(':') {
         Some((t, v)) => (t, v),
         None => ("", label),
@@ -182,12 +197,18 @@ pub fn repo_page(url: &str) -> String {
 /// The contact a manifest declares (`[package] contact` or `[stack] contact`).
 pub fn manifest_contact(manifest: Option<&serde_json::Value>) -> Option<String> {
     let m = manifest?;
-    ["package", "stack"].iter().find_map(|k| m[k]["contact"].as_str().map(str::to_owned))
+    ["package", "stack"]
+        .iter()
+        .find_map(|k| m[k]["contact"].as_str().map(str::to_owned))
 }
 
 /// Where to go for help with an entry: the newest usable version's declared contact (for a sim,
 /// the one in its file), else its repo.
-pub async fn entry_contact(state: &AppState, e: &Entry, repo_url: Option<&str>) -> AppResult<Option<String>> {
+pub async fn entry_contact(
+    state: &AppState,
+    e: &Entry,
+    repo_url: Option<&str>,
+) -> AppResult<Option<String>> {
     let declared = if e.kind == "sim" {
         let content: Option<String> = sqlx::query_scalar(
             "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 ORDER BY v.sort_key DESC LIMIT 1",
@@ -195,7 +216,9 @@ pub async fn entry_contact(state: &AppState, e: &Entry, repo_url: Option<&str>) 
         .bind(e.id)
         .fetch_optional(&state.db)
         .await?;
-        content.and_then(|c| cactup_ecosystem_common::sim::SimFile::from_toml(&c).ok()).and_then(|s| s.sim.contact)
+        content
+            .and_then(|c| cactup_ecosystem_common::sim::SimFile::from_toml(&c).ok())
+            .and_then(|s| s.sim.contact)
     } else {
         let m: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND NOT yanked AND state <> 'invalid' ORDER BY created_at DESC LIMIT 1",
@@ -210,15 +233,20 @@ pub async fn entry_contact(state: &AppState, e: &Entry, repo_url: Option<&str>) 
 }
 
 pub async fn heart_count(state: &AppState, entry_id: i64) -> AppResult<i64> {
-    Ok(sqlx::query_scalar("SELECT count(*) FROM hearts WHERE entry_id = $1").bind(entry_id).fetch_one(&state.db).await?)
+    Ok(sqlx::query_scalar("SELECT count(*) FROM hearts WHERE entry_id = $1")
+        .bind(entry_id)
+        .fetch_one(&state.db)
+        .await?)
 }
 
 pub fn fmt_date(t: OffsetDateTime) -> String {
-    t.format(time::macros::format_description!("[year]-[month]-[day]")).unwrap_or_default()
+    t.format(time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap_or_default()
 }
 
 pub fn fmt_time(t: OffsetDateTime) -> String {
-    t.format(time::macros::format_description!("[year]-[month]-[day] [hour]:[minute] UTC")).unwrap_or_default()
+    t.format(time::macros::format_description!("[year]-[month]-[day] [hour]:[minute] UTC"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

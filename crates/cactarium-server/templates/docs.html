@@ -77,8 +77,8 @@ commit = "…40 hex digits…"</pre>
 <h2 id="finding">Finding things</h2>
 <p>Search matches names, summaries, thorns and implementations. A stack or a sim is found by the thorns it builds too: searching <code>CarpetX</code> among stacks lists the stacks whose newest release builds a CarpetX thorn, and each thorn's page lists the packages that provide it and the stacks and sims that build it. A package that declares <code>[[fork-of]]</code> appears on its upstream's page, with a side-by-side comparison of the two. Signed in, <em>Save</em> keeps an entry on your dashboard; the count of saves is public.</p>
 
-<h2 id="namespaces">Namespaces</h2>
-<p>Everything you publish lives under your Cactarium name. Admins can also publish under a namespace that is no user's, such as <code>et</code> for Einstein Toolkit work: the repo's manifest then lists that namespace in <code>owners</code>.</p>
+<h2 id="namespaces">Namespaces and organizations</h2>
+<p>Everything you publish lives under your Cactarium name or under an <em>organization</em> you belong to, such as <code>et</code> for the Einstein Toolkit. Anyone can <a href="/orgs/new">create an organization</a> and becomes its owner. Every member publishes under it and manages its entries; owners also add and remove members. A repo published under an organization lists the organization's name in its manifest's <code>owners</code>. From cactup, a member's API token publishes under the organization too.</p>
 
 <h2 id="sim">The .sim format</h2>
 <p>A <code>.sim</code> is TOML holding the thornlist and the parfile verbatim, a pin for every repo, declared inputs and run hints. Only fully specified sims (every repo pinned, nothing dirty) can be published. Make one with <code>cactup sim export</code>, or <code>cactup sim pack foo.th foo.par</code>; read one with <code>cactup import</code> or <code>cactup sim unpack</code>.</p>

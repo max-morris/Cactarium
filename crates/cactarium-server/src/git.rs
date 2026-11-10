@@ -35,7 +35,7 @@ fn private(ip: IpAddr) -> bool {
                 || o[0] == 100 && (o[1] & 0xc0) == 64          // 100.64/10, shared address space
                 || o[0] == 192 && o[1] == 0 && o[2] == 0       // 192.0.0/24, protocol assignments
                 || o[0] == 198 && (o[1] & 0xfe) == 18          // 198.18/15, benchmarking
-                || o[0] >= 240                                 // 240/4, reserved
+                || o[0] >= 240 // 240/4, reserved
         }
         IpAddr::V6(v) => {
             let s = v.segments();
@@ -117,7 +117,14 @@ fn git(policy: GitPolicy, home: &Path) -> Command {
         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
         .env("GIT_HTTP_LOW_SPEED_TIME", "30")
         .args(["-c", "protocol.allow=never", "-c", "protocol.https.allow=always"])
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "submodule.recurse=false", "-c", "credential.helper="])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "credential.helper=",
+        ])
         // A redirect could point anywhere, including inside our own network.
         .args(["-c", "http.followRedirects=false"])
         .stdin(Stdio::null())
@@ -196,14 +203,21 @@ pub async fn resolve_ref(policy: GitPolicy, url: &str, git_ref: Option<&str>) ->
     let out = run(c, "listing refs").await?;
     let want: Vec<String> = match git_ref {
         None => vec!["HEAD".into()],
-        Some(r) => vec![format!("refs/heads/{r}"), format!("refs/tags/{r}^{{}}"), format!("refs/tags/{r}")],
+        Some(r) => {
+            vec![format!("refs/heads/{r}"), format!("refs/tags/{r}^{{}}"), format!("refs/tags/{r}")]
+        }
     };
     for w in &want {
         if let Some(line) = out.lines().find(|l| l.split_once('\t').is_some_and(|(_, n)| n == w)) {
             return Ok(line.split('\t').next().unwrap_or_default().to_owned());
         }
     }
-    bail!("{url} has no {}", git_ref.map(|r| format!("branch or tag '{r}'")).unwrap_or_else(|| "default branch".into()))
+    bail!(
+        "{url} has no {}",
+        git_ref
+            .map(|r| format!("branch or tag '{r}'"))
+            .unwrap_or_else(|| "default branch".into())
+    )
 }
 
 /// A commit checked out into a temporary directory, removed when dropped.
@@ -226,7 +240,12 @@ fn dir_size(p: &Path) -> u64 {
 
 /// Fetches exactly `commit` (depth 1) and checks it out. Falls back to fetching `via` (a branch or
 /// tag) when the server refuses to serve an unadvertised commit.
-pub async fn checkout(policy: GitPolicy, url: &str, commit: &str, via: Option<&str>) -> anyhow::Result<Checkout> {
+pub async fn checkout(
+    policy: GitPolicy,
+    url: &str,
+    commit: &str,
+    via: Option<&str>,
+) -> anyhow::Result<Checkout> {
     let t = check(policy, url).await?;
     let url = t.url.clone();
     let dir = tempfile::tempdir()?;
@@ -240,20 +259,30 @@ pub async fn checkout(policy: GitPolicy, url: &str, commit: &str, via: Option<&s
         c
     };
     run(g(&["init", "-q"]), "git init").await?;
-    let direct = run(g(&["fetch", "-q", "--depth", "1", "--no-tags", "--", &url, commit]), "fetching the commit").await;
+    let direct =
+        run(g(&["fetch", "-q", "--depth", "1", "--no-tags", "--", &url, commit]), "fetching the commit")
+            .await;
     if let Err(e) = direct {
         let Some(via) = via else { return Err(e) };
-        run(g(&["fetch", "-q", "--depth", "1", "--no-tags", "--", &url, via]), "fetching the commit").await?;
+        run(g(&["fetch", "-q", "--depth", "1", "--no-tags", "--", &url, via]), "fetching the commit")
+            .await?;
     }
     // Refuse before writing the tree out: a small, highly compressed download can expand to
     // gigabytes on disk.
     let listing = run(g(&["ls-tree", "-r", "-l", "--", commit]), "listing the tree").await?;
-    let total: u64 = listing.lines().filter_map(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok()).sum();
+    let total: u64 = listing
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok())
+        .sum();
     if total > MAX_TREE_BYTES {
         bail!("the repo is too large to index ({} MB at this commit)", total / (1024 * 1024));
     }
-    run(g(&["-c", "advice.detachedHead=false", "checkout", "-q", commit]), "checking out the commit").await?;
-    let tree = run(g(&["rev-parse", &format!("{commit}^{{tree}}")]), "reading the tree").await?.trim().to_owned();
+    run(g(&["-c", "advice.detachedHead=false", "checkout", "-q", commit]), "checking out the commit")
+        .await?;
+    let tree = run(g(&["rev-parse", &format!("{commit}^{{tree}}")]), "reading the tree")
+        .await?
+        .trim()
+        .to_owned();
     let size = dir_size(&path);
     if size > MAX_TREE_BYTES {
         bail!("the repo is too large to index ({} MB)", size / (1024 * 1024));
@@ -264,7 +293,9 @@ pub async fn checkout(policy: GitPolicy, url: &str, commit: &str, via: Option<&s
 /// Reads a file inside a checkout, refusing paths that escape it (`..`, absolute, symlinks out).
 pub fn read_in(co: &Checkout, rel: &str) -> anyhow::Result<Option<String>> {
     let rel_path = Path::new(rel);
-    if rel_path.is_absolute() || rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if rel_path.is_absolute()
+        || rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         bail!("'{rel}' must be a path inside the repo");
     }
     let p = co.path.join(rel_path);
@@ -309,8 +340,23 @@ mod tests {
 
     #[test]
     fn private_addresses() {
-        for a in ["10.0.0.1", "127.0.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "0.1.2.3", "198.18.0.1", "240.0.0.1",
-                  "224.0.0.1", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1", "64:ff9b::a00:1", "ff02::1"] {
+        for a in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.1.2.3",
+            "198.18.0.1",
+            "240.0.0.1",
+            "224.0.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+            "ff02::1",
+        ] {
             assert!(private(a.parse().unwrap()), "{a}");
         }
         for a in ["140.82.112.3", "2606:50c0:8000::153"] {
@@ -320,8 +366,14 @@ mod tests {
 
     #[test]
     fn url_normalization() {
-        assert_eq!(normalize_url("https://GitHub.com/max-morris/CarpetX.git/"), "github.com/max-morris/CarpetX");
-        assert_eq!(normalize_url("https://github.com/max-morris/CarpetX"), "github.com/max-morris/CarpetX");
+        assert_eq!(
+            normalize_url("https://GitHub.com/max-morris/CarpetX.git/"),
+            "github.com/max-morris/CarpetX"
+        );
+        assert_eq!(
+            normalize_url("https://github.com/max-morris/CarpetX"),
+            "github.com/max-morris/CarpetX"
+        );
     }
 
     #[tokio::test]

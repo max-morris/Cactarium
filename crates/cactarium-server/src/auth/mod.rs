@@ -30,6 +30,8 @@ pub struct User {
     pub role: String,
     pub trusted: bool,
     pub banned: bool,
+    /// The organizations the user belongs to (any role).
+    pub orgs: Vec<String>,
 }
 
 impl User {
@@ -40,7 +42,6 @@ impl User {
     pub fn is_superadmin(&self) -> bool {
         self.role == "superadmin"
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -67,10 +68,15 @@ pub fn cookie_name(state: &AppState) -> &'static str {
 }
 
 fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get_all(COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|kv| {
-        let (k, v) = kv.trim().split_once('=')?;
-        (k == name).then(|| v.to_owned())
-    })
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|kv| {
+            let (k, v) = kv.trim().split_once('=')?;
+            (k == name).then(|| v.to_owned())
+        })
 }
 
 pub fn set_cookie_header(state: &AppState, token: &str) -> HeaderValue {
@@ -99,7 +105,9 @@ struct SessionRow {
 
 pub async fn load_user(state: &AppState, id: i64) -> AppResult<Option<User>> {
     Ok(sqlx::query_as::<_, User>(
-        "SELECT id, username, role, trusted, banned FROM users WHERE id = $1",
+        "SELECT id, username, role, trusted, banned,
+                ARRAY(SELECT o.name FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.user_id = users.id ORDER BY o.name) AS orgs
+         FROM users WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -118,11 +126,13 @@ pub async fn current_session(state: &AppState, headers: &HeaderMap) -> AppResult
     .await?;
     let Some(row) = row else { return Ok(None) };
     if OffsetDateTime::now_utc() - row.last_seen > TOUCH_EVERY {
-        sqlx::query("UPDATE sessions SET last_seen = now(), expires_at = now() + $2 WHERE token_hash = $1")
-            .bind(&hash)
-            .bind(IDLE)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "UPDATE sessions SET last_seen = now(), expires_at = now() + $2 WHERE token_hash = $1",
+        )
+        .bind(&hash)
+        .bind(IDLE)
+        .execute(&state.db)
+        .await?;
     }
     let user = match row.user_id {
         Some(id) => load_user(state, id).await?.filter(|u| !u.banned),
@@ -158,7 +168,10 @@ pub async fn create_session(
 }
 
 pub async fn destroy_session(state: &AppState, s: &Session) -> AppResult<()> {
-    sqlx::query("DELETE FROM sessions WHERE token_hash = $1").bind(&s.token_hash).execute(&state.db).await?;
+    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(&s.token_hash)
+        .execute(&state.db)
+        .await?;
     Ok(())
 }
 

@@ -53,7 +53,7 @@
         <button class="button" name="decision" value="approve" type="submit">Approve and publish</button>
         <button class="button ghost" name="decision" value="changes" type="submit">Request changes</button>
         <button class="button danger" name="decision" value="reject" type="submit">Reject</button>
-        {% if !r.submitter_trusted %}
+        {% if !r.submitter_trusted && can_trust %}
         <label class="check small"><input type="checkbox" name="trust_submitter"> <span>Also mark <strong>{{ r.submitter }}</strong> as trusted (future submissions publish without review)</span></label>
         {% endif %}
       </form>

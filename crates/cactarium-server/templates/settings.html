@@ -12,6 +12,13 @@
     </div>
   </section>
   <section class="card stack-sm">
+    <h2 class="h-small">Organizations</h2>
+    {% if let Some(u) = ctx.user %}
+    {% for o in u.orgs %}<p><a class="mono" href="/orgs/{{ o }}">{{ o }}</a></p>{% else %}<p class="muted small">None yet.</p>{% endfor %}
+    {% endif %}
+    <div><a class="button small ghost" href="/orgs/new">New organization</a></div>
+  </section>
+  <section class="card stack-sm">
     <h2 class="h-small">API tokens</h2>
     <p class="muted small">For <span class="mono">cactup login</span>, so cactup can publish sims and stack releases for you. A token is shown once.</p>
     {% if let Some(t) = new_token %}

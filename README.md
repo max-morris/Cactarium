@@ -21,8 +21,8 @@ just logs       # follow the server's log
 just dev-reset  # stop and delete the local database and demo repos
 ```
 
-After seeding, sign in at http://localhost:8000/auth/login as `max` (superadmin), `et` (trusted) or
-`alice`. The development sign-in and `file://` repos are refused unless the site is served from
+After seeding, sign in at http://localhost:8000/auth/login as `max` (superadmin, owner of the `et`
+organization), `alice` or `bob`. The development sign-in and `file://` repos are refused unless the site is served from
 localhost.
 
 ## Layout
@@ -42,3 +42,8 @@ The production setup mirrors the CactUp tutorial server: the host's Apache termi
 proxies to the app, which Docker Compose publishes on loopback only. Copy `deploy/.env.example` to
 `deploy/.env`, fill it in, then `just up`. `just update` snapshots the database, pulls, rebuilds,
 migrates and restarts.
+
+Server-side commands run in the app container with `just cli ...`:
+`admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
+[--owner]`, `org list`, `register`, `publish-sim`, `sync`, `token`. Create the `et` organization
+with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.

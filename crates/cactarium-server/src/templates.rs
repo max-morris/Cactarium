@@ -13,6 +13,8 @@ pub struct UserView {
     pub username: String,
     pub is_admin: bool,
     pub is_superadmin: bool,
+    /// Organizations the user belongs to, which they can publish under.
+    pub orgs: Vec<String>,
 }
 
 /// What every page's layout needs.
@@ -35,6 +37,7 @@ impl PageCtx {
                 username: u.username.clone(),
                 is_admin: u.is_admin(),
                 is_superadmin: u.is_superadmin(),
+                orgs: u.orgs.clone(),
             }),
             csrf: s.map(|s| s.csrf.clone()).unwrap_or_default(),
             dev_banner: state.cfg.dev_login,
@@ -42,12 +45,13 @@ impl PageCtx {
         }
     }
 
-    pub fn is_admin(&self) -> bool {
-        self.user.as_ref().is_some_and(|u| u.is_admin)
-    }
-
     pub fn is_superadmin(&self) -> bool {
         self.user.as_ref().is_some_and(|u| u.is_superadmin)
+    }
+
+    /// Whether the user can publish under a namespace other than their own name.
+    pub fn has_namespaces(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.is_admin || !u.orgs.is_empty())
     }
 }
 
@@ -295,6 +299,12 @@ pub struct OwnerPage {
     pub owner: String,
     pub display: String,
     pub entries: Vec<EntryRow>,
+    pub is_org: bool,
+    /// For an organization: (username, role).
+    pub members: Vec<(String, String)>,
+    /// For a user: the organizations they belong to.
+    pub orgs: Vec<String>,
+    pub can_manage_org: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +323,8 @@ pub struct AlertRow {
 pub struct DashboardPage {
     pub ctx: PageCtx,
     pub entries: Vec<EntryRow>,
+    /// (name, display name, my role)
+    pub orgs: Vec<(String, String, String)>,
     pub saved: Vec<EntryRow>,
     pub reviews: Vec<(String, String, String, String)>,
     pub alerts: Vec<AlertRow>,
@@ -436,6 +448,7 @@ pub struct AdminQueuePage {
     pub nav: String,
     pub open: Vec<SubRow>,
     pub review: Option<ReviewView>,
+    pub can_trust: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +491,7 @@ pub struct AdminUsersPage {
     pub nav: String,
     pub q: String,
     pub users: Vec<AdminUserRow>,
+    pub can_trust: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -512,4 +526,35 @@ pub struct AdminCuratedPage {
     pub nav: String,
     pub curated: Vec<AdminEntryRow>,
     pub error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "new_org.html")]
+pub struct NewOrgPage {
+    pub ctx: PageCtx,
+    pub name: String,
+    pub display: String,
+    pub error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "org.html")]
+pub struct OrgPage {
+    pub ctx: PageCtx,
+    pub name: String,
+    pub display: String,
+    pub my_role: String,
+    pub can_manage: bool,
+    /// (user id, username, role, added)
+    pub members: Vec<(i64, String, String, String)>,
+    pub entries: Vec<EntryRow>,
+}
+
+#[derive(Template)]
+#[template(path = "admin_site.html")]
+pub struct AdminSitePage {
+    pub ctx: PageCtx,
+    pub nav: String,
+    pub trust_granted_by: String,
+    pub orgs: Vec<(String, String, i64)>,
 }

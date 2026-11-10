@@ -216,7 +216,9 @@ commit "$R" "SpacetimeX"; g "$R" tag v0.1.0; publish spacetimex
 
 echo "Registering on the local site"
 cli migrate >/dev/null
-for u in max alice; do cli dev-user "$u"; done
+for u in max alice bob; do cli dev-user "$u"; done
+# The Einstein Toolkit's organization; its members publish under et/ and manage its entries.
+cli org create et max --display-name "Einstein Toolkit" 2>/dev/null || echo "Organization et exists"
 cli register max $U/carpetx-et.git --owner et
 cli register max $U/et-stack.git --owner et
 cli register max $U/carpetx.git
@@ -299,4 +301,4 @@ git -C "$R" push -q --force "$REPOS/carpetx.git" refs/tags/v1.0.0
 cli sync max/carpetx
 
 echo
-echo "Done. Sign in at http://localhost:8000/auth/login as max (superadmin) or alice."
+echo "Done. Sign in at http://localhost:8000/auth/login as max (superadmin, owner of et), alice or bob."

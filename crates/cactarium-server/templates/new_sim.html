@@ -9,8 +9,9 @@
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <label for="simfile">The .sim file (up to 1 MB)</label>
     <input id="simfile" name="file" type="file" accept=".sim,.toml" required>
+    {% include "_publish_under.html" %}
     <label for="simname">Publish as <span class="muted">(defaults to the name inside the file)</span></label>
-    <div class="row"><span class="mono muted">{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}/</span><input id="simname" name="name" class="mono" placeholder="bhns-gw230529-dense"></div>
+    <div class="row">{% if !ctx.has_namespaces() %}<span class="mono muted">{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}/</span>{% endif %}<input id="simname" name="name" class="mono" placeholder="bhns-gw230529-dense"></div>
     <button class="button" type="submit">Publish</button>
   </form>
   <p class="muted small">Only fully specified sims can be published: every repo pinned to a commit, nothing dirty. A new sim is reviewed once; later versions publish right away.</p>
