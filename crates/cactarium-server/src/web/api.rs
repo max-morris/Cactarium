@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
     API_GENERATION, ClaimInfo, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed,
     ReleaseRequest, Resolved, CONTACT_HEADER, SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER,
-    VersionInfo,
+    UNTRUSTED_HEADER, VersionInfo,
 };
 use cactup_ecosystem_common::ccl::ThornFacts;
 use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
@@ -266,7 +266,7 @@ pub async fn stack_release(
     let unpinned =
         (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true"));
     let untrusted = (
-        header::HeaderName::from_static(crate::site::UNTRUSTED_HEADER),
+        header::HeaderName::from_static(UNTRUSTED_HEADER),
         header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
     );
     Ok(([unpinned, contact_header, untrusted], Json(frozen)).into_response())
@@ -400,7 +400,16 @@ pub async fn package_refresh(
         return Err(AppError::Forbidden.into());
     }
     let new_versions = tracker::sync(&state, &e).await?;
-    Ok(Json(Refreshed { slug: e.slug(), new_versions }))
+    let awaiting: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM versions WHERE entry_id = $1 AND review = 'pending'")
+            .bind(e.id)
+            .fetch_one(&state.db)
+            .await?;
+    Ok(Json(Refreshed {
+        slug: e.slug(),
+        new_versions,
+        awaiting_review: usize::try_from(awaiting).unwrap_or(0),
+    }))
 }
 
 pub async fn not_found() -> ApiError {

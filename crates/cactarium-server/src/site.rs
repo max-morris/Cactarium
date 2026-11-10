@@ -8,9 +8,6 @@ use crate::state::AppState;
 pub const TRUST_GRANTED_BY: &str = "trust-granted-by";
 /// Whether `@head`/`@master` of an untrusted stack are served: `refuse` or `allow`.
 pub const UNTRUSTED_TIPS: &str = "untrusted-tips";
-/// The response header that marks a stack's unpinned form as coming from an untrusted stack;
-/// cactup warns loudly and asks before installing it.
-pub const UNTRUSTED_HEADER: &str = "x-cactarium-untrusted";
 
 /// Whether untrusted stacks' branch tips are served (`allow`); anything else means refuse.
 pub async fn untrusted_tips_allowed(state: &AppState) -> AppResult<bool> {

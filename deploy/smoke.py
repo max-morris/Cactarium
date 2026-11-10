@@ -371,9 +371,10 @@ page(alice, "/dashboard", contains="Pin CarpetX.")
 
 # A pushed tag is reviewed too.
 subprocess.run(["git", "-C", ENV["DEMO_REPOS"] + "/spacetimex.git", "tag", "v0.2.0", "HEAD"], check=True)
-alice.get("/alice/spacetimex")
-s, _, _ = alice.post("/alice/spacetimex/refresh", {})
-check("alice checks for new tags", s == 303, s)
+s, body, _ = anon.req("POST", "/api/v1/packages/alice/spacetimex/refresh", headers={"Authorization": f"Bearer {tok.group(1)}"})
+r = json.loads(body) if s == 200 else {}
+check("an API refresh counts the tag as new and awaiting review",
+      r.get("new-versions") == 1 and r.get("awaiting-review") == 1, f"{s} {body[:200]}")
 page(anon, "/alice/spacetimex/0.2.0", expect=404)
 page(maxv, "/admin", contains="alice (pushed a tag)")
 check("approve the pushed tag", decide("alice/spacetimex@0.2.0", "approve") == 303)
