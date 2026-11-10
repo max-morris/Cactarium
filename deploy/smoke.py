@@ -223,7 +223,9 @@ check("thorn-name collisions are refused", s == 200 and "collide" in text, text[
 page(anon, "/max/clash", expect=404)  # a failed release leaves no entry behind
 maxv.get("/new/stack")
 s, text, _ = maxv.post("/new/stack", {"definition": definition.replace("smoke-stack", "squeezed"), "thornlist": clash.replace("!CHECKOUT =\nOther/Boundary", "!CHECKOUT = Other/Boundary"), "version": "0.1.0"})
-check("a thorn on the !CHECKOUT line is refused", s == 200 and "its own line" in text, s)
+check("a checkout-only thorn (on the !CHECKOUT line) is accepted, not treated as a collision", s == 303, f"{s} {text[text.find('alert'):][:200]}")
+s, body, _ = anon.get("/api/v1/stacks/max/squeezed/releases/0.1.0")
+check("the release keeps it checkout-only", s == 200 and "= Other/Boundary" in json.loads(body)["thornlist"]["text"], body[:300])
 text = page(anon, "/max/carpetx")
 check("the newest manifest's default track is shown first", 'pill mono selected" href="/max/carpetx?track=mixed-precision"' in text)
 

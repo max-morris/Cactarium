@@ -75,18 +75,6 @@ fn enable_lines(text: &str, enable: &[String]) -> String {
         + if text.ends_with('\n') { "\n" } else { "" }
 }
 
-/// Thorns written on a `!CHECKOUT` line itself. Cactus reads a CRL list as its ThornList too and
-/// skips every line starting with `!`, so such a thorn would be fetched but never built.
-pub fn thorns_on_checkout_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|l| {
-            let (k, v) = l.trim_start().split_once('=')?;
-            (k.trim() == "!CHECKOUT").then_some(v)
-        })
-        .flat_map(|v| v.split_whitespace().filter(|t| t.contains('/')).map(str::to_owned).collect::<Vec<_>>())
-        .collect()
-}
-
 fn checkout_key(c: &Component, root: &str) -> String {
     let joined = crl::lexical_canonicalize(&format!("{}/{}", c.target, c.checkout));
     joined.strip_prefix(&format!("{root}/")).unwrap_or(&joined).to_owned()
@@ -113,13 +101,6 @@ pub async fn resolve(
     // Sources in priority order: (label, text, base pins).
     let mut sources: Vec<(String, String, BTreeMap<String, RepoPin>)> = Vec::new();
     if let Some(t) = own_text {
-        let stuck = thorns_on_checkout_lines(t);
-        if !stuck.is_empty() {
-            return Err(AppError::bad(format!(
-                "put each thorn on its own line after !CHECKOUT = (Cactus skips lines starting with !, so these would never be built): {}",
-                stuck.join(", ")
-            )));
-        }
         sources.push(("the stack's thornlist".into(), t.to_owned(), BTreeMap::new()));
     }
     for base in &section.extends {
@@ -134,8 +115,16 @@ pub async fn resolve(
     let mut disabled: BTreeSet<String> = BTreeSet::new();
     let mut base_pins: BTreeMap<String, RepoPin> = BTreeMap::new();
     for (label, text, pins) in &sources {
-        let list = crl::parse(&enable_lines(text, &section.enable))
-            .map_err(|e| AppError::bad(format!("{label}: {e:#}")))?;
+        let parse = |t: &str| crl::parse(t).map_err(|e| AppError::bad(format!("{label}: {e:#}")));
+        // Enabling a checkout-only thorn (on the !CHECKOUT line) builds it; enabling one that is
+        // only a #DISABLED line adds its checkout. Uncommenting the #DISABLED line of a
+        // checkout-only thorn would check it out twice.
+        let mut list = parse(text)?;
+        let missing: Vec<String> =
+            section.enable.iter().filter(|t| !list.components().iter().any(|c| &c.checkout == *t)).cloned().collect();
+        if !missing.is_empty() {
+            list = parse(&enable_lines(text, &missing))?;
+        }
         match &root {
             None => root = Some(list.root().to_owned()),
             Some(r) if r != list.root() && list.root() != "." => {
@@ -146,7 +135,11 @@ pub async fn resolve(
         let r = root.clone().unwrap_or_else(|| ".".into());
         for c in list.components() {
             if seen.insert(checkout_key(c, &r)) {
-                merged.push(c.clone());
+                let mut c = c.clone();
+                if section.enable.contains(&c.checkout) {
+                    c.fetch_only = false;
+                }
+                merged.push(c);
             }
         }
         disabled.extend(list.disabled_thorns().iter().cloned());
@@ -301,10 +294,10 @@ fn describe(c: &Component) -> String {
 }
 
 /// Cactus thorn names are global: two different checkouts with the same thorn name cannot both be
-/// built.
+/// built. Checkout-only thorns (on a !CHECKOUT line) are not built, so they never collide.
 fn check_collisions(components: &[Component]) -> AppResult<()> {
     let mut by_name: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-    for c in components.iter().filter(|c| c.ty != ComponentType::Ignore && c.checkout.contains('/')) {
+    for c in components.iter().filter(|c| c.ty != ComponentType::Ignore && !c.fetch_only && c.checkout.contains('/')) {
         let thorn = c.checkout.rsplit('/').next().unwrap_or_default();
         by_name.entry(thorn.to_ascii_lowercase()).or_default().insert(&c.checkout);
     }
@@ -395,18 +388,18 @@ mod tests {
     }
 
     #[test]
-    fn thorns_on_the_checkout_line_are_found() {
-        let t = "!CHECKOUT = Makefile lib\n!CHECKOUT = A/B C/D\n!CHECKOUT =\nE/F\n";
-        assert_eq!(thorns_on_checkout_lines(t), ["A/B", "C/D"]);
-    }
-
-    #[test]
     fn collisions_are_found() {
         let list = crl::parse(
-            "!CRL_VERSION = 1.0\n!TARGET = a\n!TYPE = git\n!URL = https://x/r.git\n!CHECKOUT = Carpet/Multipole SpacetimeX/multipole\n",
+            "!CRL_VERSION = 1.0\n!TARGET = a\n!TYPE = git\n!URL = https://x/r.git\n!CHECKOUT =\nCarpet/Multipole\nSpacetimeX/multipole\n",
         )
         .unwrap();
         let e = check_collisions(list.components()).unwrap_err().to_string();
         assert!(e.contains("Carpet/Multipole vs SpacetimeX/multipole"), "{e}");
+        // Checkout-only thorns are not built, so they cannot collide.
+        let only = crl::parse(
+            "!CRL_VERSION = 1.0\n!TARGET = a\n!TYPE = git\n!URL = https://x/r.git\n!CHECKOUT = Carpet/Multipole\nSpacetimeX/multipole\n",
+        )
+        .unwrap();
+        check_collisions(only.components()).unwrap();
     }
 }

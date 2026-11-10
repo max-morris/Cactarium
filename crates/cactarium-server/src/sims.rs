@@ -97,13 +97,6 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
             found.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
-    let stuck = crate::stacks::thorns_on_checkout_lines(&sim.thornlist.text);
-    if !stuck.is_empty() {
-        warnings.push(format!(
-            "these thorns sit on a !CHECKOUT line, where Cactus never builds them: {}",
-            stuck.join(", ")
-        ));
-    }
     if sim.sim.license.is_none() {
         warnings.push("no license: others can view it but may not know whether they can reuse it".into());
     }
@@ -127,7 +120,8 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
         Err(_) => {}
     }
     let index = SimIndex {
-        thorns: list.components().iter().filter(|c| c.checkout.contains('/')).map(|c| c.checkout.clone()).collect(),
+        // The thorns the build compiles: checkout-only ones (on a !CHECKOUT line) are fetched, not built.
+        thorns: list.components().iter().filter(|c| c.checkout.contains('/') && !c.fetch_only).map(|c| c.checkout.clone()).collect(),
         repos: crl_repos.into_iter().collect(),
         inputs: sim.inputs.iter().map(|i| i.knob.clone()).collect(),
         vars: sim.parfile.vars.clone(),
@@ -218,7 +212,9 @@ text = '''
 !TYPE = git
 !URL = https://github.com/x/CarpetX.git
 !REPO_PATH = $2
-!CHECKOUT = CarpetX/CarpetX CarpetX/Loop
+!CHECKOUT =
+CarpetX/CarpetX
+CarpetX/Loop
 '''
 [parfile]
 filename = "qc0.par"
