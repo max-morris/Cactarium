@@ -109,6 +109,8 @@ apache_settings() {
 # included by the virtual host that serves https://$domain/. To undo: remove that Include line.
 ProxyPreserveHost On
 RequestHeader set X-Forwarded-Proto https
+# Cutting a stack release looks up every repo it names (seconds; minutes for a slow forge).
+ProxyTimeout 300
 # Uploads (.sim files) are at most 1 MB; the app refuses anything over 2 MB anyway.
 LimitRequestBody 4194304
 # The certificate's renewal (certbot's webroot) keeps working over HTTPS.

@@ -28,6 +28,9 @@ use crate::git::{self, GitPolicy};
 use crate::model::{self, Version};
 use crate::state::AppState;
 
+/// Remote lookups run at once while resolving one stack.
+const LOOKUPS_AT_ONCE: usize = 8;
+
 /// A repo whose pin changed between two releases.
 #[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq)]
 pub struct RepoMove {
@@ -219,8 +222,10 @@ pub async fn resolve(
             }
         }
     }
+    // Pins that need a lookup are resolved concurrently, a few at a time: a full ET-sized list
+    // names about 80 repos, and one at a time that took over half a minute.
     let mut pins = Vec::new();
-    let mut resolved_commits: BTreeMap<String, String> = BTreeMap::new();
+    let mut lookups: Vec<(usize, String, Option<String>)> = Vec::new();
     for (repo, c) in &by_repo {
         let url = c.url.clone().unwrap_or_default();
         let mut pin = RepoPin { name: repo.clone(), url: url.clone(), git_ref: c.branch.clone(), commit: None, sha256: None, cactarium: None, dirty: false };
@@ -241,13 +246,7 @@ pub async fn resolve(
         } else {
             match c.ty {
                 ComponentType::Git if tip.is_some() => {}
-                ComponentType::Git => {
-                    pin.commit = Some(
-                        git::resolve_ref(policy, &url, c.branch.as_deref())
-                            .await
-                            .map_err(|e| AppError::bad(format!("repo '{repo}': {e:#}")))?,
-                    );
-                }
+                ComponentType::Git => lookups.push((pins.len(), url.clone(), c.branch.clone())),
                 ComponentType::Http | ComponentType::Https | ComponentType::Ftp => {
                     return Err(AppError::bad(format!(
                         "repo '{repo}' is a download; pin it with a sha256 in [[stack.pin]]"
@@ -258,11 +257,24 @@ pub async fn resolve(
                 }
             }
         }
-        if let Some(cm) = &pin.commit {
-            resolved_commits.insert(repo.clone(), cm.clone());
-        }
         pins.push(pin);
     }
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(LOOKUPS_AT_ONCE));
+    let mut set = tokio::task::JoinSet::new();
+    for (i, url, branch) in lookups {
+        let gate = gate.clone();
+        set.spawn(async move {
+            let _permit = gate.acquire_owned().await;
+            (i, git::resolve_ref(policy, &url, branch.as_deref()).await)
+        });
+    }
+    while let Some(done) = set.join_next().await {
+        let (i, result) = done.map_err(anyhow::Error::from)?;
+        let commit = result.map_err(|e| AppError::bad(format!("repo '{}': {e:#}", pins[i].name)))?;
+        pins[i].commit = Some(commit);
+    }
+    let resolved_commits: BTreeMap<String, String> =
+        pins.iter().filter_map(|p| p.commit.clone().map(|c| (p.name.clone(), c))).collect();
 
     let untouched = tip.is_none() && section.extends.is_empty() && section.enable.is_empty() && section.disable.is_empty();
     let text = match own_text {
