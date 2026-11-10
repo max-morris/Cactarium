@@ -322,6 +322,7 @@ async fn admin_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<Admi
             verified: e.verified,
             trusted: e.trusted,
             curated: e.curated,
+            repo_url: tracker::repo_of(state, e.id).await?.map(|r| r.url).unwrap_or_default(),
             tag_rule: match tracker::repo_of(state, e.id).await? {
                 Some(r) if e.curated => {
                     let mut parts = vec![match &r.tag_pattern {
@@ -346,19 +347,29 @@ pub async fn entries(
     Admin(a): Admin,
     Query(q): Query<FilterQ>,
 ) -> AppResult<Response> {
+    entries_page(&state, &a, q.q, None).await
+}
+
+async fn entries_page(
+    state: &AppState,
+    a: &crate::auth::SignedIn,
+    q: String,
+    error: Option<String>,
+) -> AppResult<Response> {
     let list = sqlx::query_as::<_, Entry>(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE $1 = '' OR owner || '/' || name ILIKE '%' || $1 || '%' ORDER BY updated_at DESC LIMIT 200"
     ))
-    .bind(q.q.trim())
+    .bind(q.trim())
     .fetch_all(&state.db)
     .await?;
-    let entries = admin_rows(&state, list).await?;
+    let entries = admin_rows(state, list).await?;
     Ok(page(&AdminEntriesPage {
-        ctx: PageCtx::new(&state, Some(&a.session)),
+        ctx: PageCtx::new(state, Some(&a.session)),
         nav: "entries".into(),
-        q: q.q,
+        q,
         entries,
-        can_trust: site::may_grant_trust(&state, &a.user).await?,
+        can_trust: site::may_grant_trust(state, &a.user).await?,
+        error,
     })?
     .into_response())
 }
@@ -367,6 +378,7 @@ pub async fn entries(
 pub struct EntryAction {
     action: String,
     new_owner: Option<String>,
+    new_url: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -405,6 +417,14 @@ pub async fn entry_action(
             audit(&state, Some(a.user.id), "entry.transfer", Some(&e.slug()), json!({ "to": to }), None)
                 .await?;
             return Ok(Redirect::to("/admin/entries").into_response());
+        }
+        "move-repo" => {
+            let to = f.new_url.as_deref().unwrap_or("");
+            return match tracker::move_repo(&state, &a.user, &e, to).await {
+                Ok(()) => Ok(Redirect::to(&format!("/admin/entries?q={}", e.name)).into_response()),
+                Err(AppError::BadRequest(m)) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
+                Err(err) => Err(err),
+            };
         }
         _ => return Err(AppError::bad("unknown action")),
     };

@@ -487,6 +487,8 @@ pub struct AdminEntryRow {
     pub curated: bool,
     /// How a curated package's upstream tags become versions; empty otherwise.
     pub tag_rule: String,
+    /// The repo it is read from; empty for entries without one (sims, uploaded stacks).
+    pub repo_url: String,
     pub versions: Vec<VersionRow>,
 }
 
@@ -498,6 +500,7 @@ pub struct AdminEntriesPage {
     pub q: String,
     pub entries: Vec<AdminEntryRow>,
     pub can_trust: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]

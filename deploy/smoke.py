@@ -574,6 +574,20 @@ check("a repo with only pattern tags registers", s == 303, f"{s} {text[text.find
 s, body, _ = anon.get("/api/v1/packages/et/patlib/versions")
 check("its pattern tag is its version", s == 200 and '"version":"2026.5.1"' in body and '"tag":"XT_2026_05_v1"' in body, body[:300])
 
+# Moving a registered repo to a new URL: only one that holds the same tags at the same commits.
+moved = ENV["DEMO_REPOS"] + "/fakelib-moved.git"
+subprocess.run(["rm", "-rf", moved], check=True)
+sh("git", "clone", "-q", "--bare", bare, moved, cwd=work)
+text = page(maxv, "/admin/entries?q=fakelib")
+feid = re.search(r'action="/admin/entries/(\d+)"', text).group(1)
+s, text, _ = maxv.post(f"/admin/entries/{feid}", {"action": "move-repo", "new_url": REPOS + "/patlib.git"})
+check("a repo with other history is refused", s == 200 and "doesn&#39;t hold" in text, text[text.find("alert"):][:300])
+maxv.get("/admin/entries?q=fakelib")
+s, _, _ = maxv.post(f"/admin/entries/{feid}", {"action": "move-repo", "new_url": REPOS + "/fakelib-moved.git"})
+check("the same repo at a new URL is accepted", s == 303, s)
+s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions")
+check("versions now name the new URL", s == 200 and "fakelib-moved.git" in body, body[:300])
+
 print()
 if FAILED:
     print(f"{len(FAILED)} failed")

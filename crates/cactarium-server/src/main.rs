@@ -75,6 +75,9 @@ enum Command {
     },
     /// Check an entry's repo for new and moved tags now.
     Sync { slug: String },
+    /// Point an entry at its repo's new URL (after a move such as a GitHub transfer), as the given
+    /// admin; refused unless the new URL holds the same tags at the same commits.
+    MoveRepo { username: String, slug: String, url: String },
     /// Local development only: create a user who can use the development sign-in.
     DevUser { username: String },
     /// Create an API token for a user (scope "publish") and print it. It is shown only once.
@@ -233,6 +236,23 @@ async fn main() -> anyhow::Result<()> {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
             curate::run(&state, &user, &file).await
+        }
+        Command::MoveRepo { username, slug, url } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            if !user.is_admin() {
+                anyhow::bail!("{username} is not an admin");
+            }
+            let (owner, name) = slug.split_once('/').context("give owner/name")?;
+            let e = model::find_entry(&state, owner, name)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .context("no such entry")?;
+            tracker::move_repo(&state, &user, &e, &url)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{} now reads {url}", e.slug());
+            Ok(())
         }
         Command::Sync { slug } => {
             let state = make_state(cfg, db)?;

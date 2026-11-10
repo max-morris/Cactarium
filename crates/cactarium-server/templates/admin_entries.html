@@ -5,6 +5,7 @@
 {% include "_admin_nav.html" %}
 <section class="stack">
   <p class="small muted">Verified is a public badge. A trusted entry's new releases publish without review, as do those of a trusted owner (user or organization).</p>
+  {% if let Some(m) = error %}<div class="alert">{{ m }}</div>{% endif %}
   <form class="row-wrap" method="get" action="/admin/entries"><label class="sr-only" for="eq">Filter</label><input id="eq" name="q" value="{{ q }}" placeholder="owner or name"><button class="button small" type="submit">Filter</button></form>
   {% for e in entries %}
   <div class="card stack-sm">
@@ -21,6 +22,14 @@
         <button class="button small ghost" name="action" value="transfer">Transfer</button>
       </form>
     </div>
+    {% if !e.repo_url.is_empty() %}
+    <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap small">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <span class="muted">Repo <span class="mono">{{ e.repo_url }}</span></span>
+      <label class="sr-only" for="nu{{ e.id }}">New repo URL</label><input id="nu{{ e.id }}" name="new_url" class="mono" placeholder="new URL, e.g. after a GitHub transfer">
+      <button class="button small ghost" name="action" value="move-repo" title="Only if the new URL holds the same tags at the same commits">Move repo</button>
+    </form>
+    {% endif %}
     {% if !e.versions.is_empty() %}<p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span>{% if v.yanked %} (yanked){% endif %}{% if v.pending %} (awaiting review){% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
   </div>
   {% else %}<p class="muted">No entries.</p>{% endfor %}

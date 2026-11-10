@@ -298,6 +298,9 @@ pub async fn update_curated(
     }
     let (pattern, since) = TagRule::of_manifest(&m).stored();
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
+    if repo_of(state, entry.id).await?.is_some_and(|r| r.url != url) {
+        same_history(state, entry, &url).await?;
+    }
     sqlx::query("UPDATE entry_repos SET url = $2, overlay_manifest = $3, tag_pattern = $4, min_version = $5 WHERE entry_id = $1")
         .bind(entry.id)
         .bind(&url)
@@ -364,6 +367,82 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
         .await?;
     audit(state, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
         .await
+}
+
+/// Checks that `url` holds the history the entry's published versions froze: every tagged version
+/// whose tag is still where it was frozen has that tag at the same commit there, and every version
+/// named by commit can be fetched from it. A moved repo (say, transferred to an organization) passes;
+/// a different repo doesn't.
+async fn same_history(state: &AppState, entry: &Entry, url: &str) -> AppResult<()> {
+    let known: Vec<(String, String, Option<String>, Option<String>, bool, String)> = sqlx::query_as(
+        "SELECT track, version, tag, commit, is_virtual, state FROM versions WHERE entry_id = $1 AND state <> 'invalid'",
+    )
+    .bind(entry.id)
+    .fetch_all(&state.db)
+    .await?;
+    let remote: BTreeMap<String, String> = git::ls_tags(policy(state), url)
+        .await
+        .map_err(AppError::bad)?
+        .into_iter()
+        .map(|r| (r.name, r.commit))
+        .collect();
+    let mut problems = Vec::new();
+    for (track, version, tag, commit, is_virtual, st) in &known {
+        let label = if track.is_empty() { version.clone() } else { format!("{track}:{version}") };
+        let Some(commit) = commit else { continue };
+        if *is_virtual {
+            if git::checkout(policy(state), url, commit, None).await.is_err() {
+                problems
+                    .push(format!("{label}: commit {} isn't there", &commit[..12.min(commit.len())]));
+            }
+        } else if let Some(tag) = tag
+            && st == "ok"
+        {
+            match remote.get(tag) {
+                Some(c) if c == commit => {}
+                Some(_) => problems.push(format!("{label}: tag {tag} names another commit there")),
+                None => problems.push(format!("{label}: there is no tag {tag} there")),
+            }
+        }
+    }
+    if !problems.is_empty() {
+        problems.truncate(8);
+        return Err(AppError::bad(format!(
+            "{url} doesn't hold {}'s history: {}",
+            entry.slug(),
+            problems.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+/// Admin-only: points a registered entry at its repo's new URL (e.g. after the repo moved to another
+/// GitHub owner), once [`same_history`] confirms it is the same repo. Versions keep their frozen
+/// commits; stack releases that pinned the old URL keep it (GitHub redirects a moved repo's URL).
+pub async fn move_repo(state: &AppState, admin: &User, entry: &Entry, new_url: &str) -> AppResult<()> {
+    let repo = repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
+    let url = git::check_url(policy(state), new_url.trim()).await.map_err(AppError::bad)?;
+    if url == repo.url {
+        return Err(AppError::bad(format!("{} already uses {url}", entry.slug())));
+    }
+    same_history(state, entry, &url).await?;
+    sqlx::query("UPDATE entry_repos SET url = $2, poll_error = NULL WHERE entry_id = $1")
+        .bind(entry.id)
+        .bind(&url)
+        .execute(&state.db)
+        .await?;
+    audit(
+        state,
+        Some(admin.id),
+        "repo.move",
+        Some(&entry.slug()),
+        json!({ "from": repo.url, "to": url }),
+        None,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn attach_repo(
