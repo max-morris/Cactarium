@@ -27,13 +27,16 @@ license = "LGPL-2.1-or-later"
 # contact = "https://github.com/you/CarpetX/issues"   # where to get help; default: the repo
 # arrangement = "CarpetX"          # only if the thorns sit at the repo root
 # thorns = ["CarpetX", "Loop"]     # default: every directory with an interface.ccl
+                                   # (a repo that is one thorn: its arrangement, and thorns = ["Name"])
+# tag-pattern = "ET_{major}_{minor}_v{patch}"   # release tags that aren't vX.Y.Z (ET_2026_05_v0 is 2026.5.0)
+# since = "2026.5.0"               # tags below this version aren't versions
 default-track = "mixed-precision"
 
 [tracks.mixed-precision]
 description = "CCTK_REAL4/REAL2 storage"
 
 [[fork-of]]
-target = "einsteintoolkit/carpetx"
+target = "et/carpetx"
 
 [[depends-on]]
 target = "max-morris/cactus"
