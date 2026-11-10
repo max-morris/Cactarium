@@ -76,6 +76,15 @@ pub async fn owner_trusted(state: &AppState, owner: &str) -> AppResult<bool> {
     .await?)
 }
 
+/// Whether `entry` itself or its owner is trusted (who publishes a given release aside).
+pub async fn entry_trusted(state: &AppState, entry: &Entry) -> AppResult<bool> {
+    let trusted: bool = sqlx::query_scalar("SELECT trusted FROM entries WHERE id = $1")
+        .bind(entry.id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(trusted || owner_trusted(state, &entry.owner).await?)
+}
+
 /// The review state a new release of `entry` starts in: `approved` or `pending`. `actor` is the
 /// user publishing it, if any (a tag found by polling or a webhook has none: the owner pushed it).
 pub async fn release_review(

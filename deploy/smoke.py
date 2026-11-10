@@ -182,8 +182,24 @@ v = Visitor()
 v.get("/auth/login")
 s, _, hdrs = v.post("/auth/dev", {"username": "orgx", "next": "/dashboard"})
 check("signing in as that owner must choose another name", hdrs.get("location") == "/auth/choose-name", hdrs.get("location"))
+# Untrusted stacks' branch tips: refused by default, served marked untrusted when the site allows.
+s, body, _ = anon.get("/api/v1/stacks/et/et-stack/releases/head")
+check("an untrusted stack's @head is refused by default", s == 403 and "isn't trusted" in body, f"{s} {body[:200]}")
+s, _, _ = anon.get("/api/v1/stacks/et/et-stack/releases/master")
+check("and so is its @master", s == 403, s)
+page(anon, "/et/et-stack", contains="doesn't serve its")
+maxv.get("/admin/site")
+s, _, _ = maxv.post("/admin/site", {"untrusted_tips": "allow"})
+check("the superadmin allows untrusted tips", s == 303, s)
+s, _, hdrs = anon.get("/api/v1/stacks/et/et-stack/releases/head")
+check("then it is served, marked untrusted", s == 200 and hdrs.get("x-cactarium-untrusted") == "true", f"{s} {hdrs}")
+page(anon, "/et/et-stack", contains="cactup warns and asks")
+maxv.get("/admin/site")
+maxv.post("/admin/site", {"untrusted_tips": "refuse"})
+s, _, hdrs = anon.get("/api/v1/stacks/max/carpetx-mp/releases/head")
+check("a trusted owner's @head is served, not marked", s == 200 and hdrs.get("x-cactarium-untrusted") == "false", f"{s} {hdrs}")
 # The unpinned forms are rate-limited.
-codes = [anon.get("/api/v1/stacks/et/et-stack/releases/head")[0] for _ in range(14)]
+codes = [anon.get("/api/v1/stacks/max/carpetx-mp/releases/head")[0] for _ in range(14)]
 check("@head requests are rate-limited", codes[0] == 200 and codes[-1] == 429, codes)
 
 # Hearts: save, count, un-save.

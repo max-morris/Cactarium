@@ -238,6 +238,17 @@ pub async fn stack_release(
             .ok_or(AppError::NotFound)?;
         return Ok(([contact_header], Json(stacks::frozen_of(&state, &v).await?)).into_response());
     };
+    // A tip is whatever the branches hold now and never passes review: only a trusted stack's is
+    // served freely. Otherwise the site setting refuses it, or serves it marked untrusted.
+    let trusted = crate::publish::entry_trusted(&state, &e).await?;
+    if !trusted && !crate::site::untrusted_tips_allowed(&state).await? {
+        return Err(AppError::Denied(format!(
+            "{}@{version} is not served: the stack isn't trusted, and its branch tips are never reviewed. \
+             Install a release instead (owner/stack@X.Y.Z or a range).",
+            e.slug()
+        ))
+        .into());
+    }
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
     let (definition, own) = current_definition(&state, &e).await?;
@@ -254,7 +265,11 @@ pub async fn stack_release(
     };
     let unpinned =
         (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true"));
-    Ok(([unpinned, contact_header], Json(frozen)).into_response())
+    let untrusted = (
+        header::HeaderName::from_static(crate::site::UNTRUSTED_HEADER),
+        header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
+    );
+    Ok(([unpinned, contact_header, untrusted], Json(frozen)).into_response())
 }
 
 /// The stack's definition as it stands now: its repo's default branch for a manifest repo, else

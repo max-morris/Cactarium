@@ -818,6 +818,13 @@ async fn stack_page(
             .unwrap_or_default(),
         tip_cmd: format!("cactup install {}@head", entry.slug()),
         master_cmd: format!("cactup install {}@master", entry.slug()),
+        tip_policy: if crate::publish::entry_trusted(state, entry).await? {
+            "trusted".into()
+        } else if crate::site::untrusted_tips_allowed(state).await? {
+            "allow".into()
+        } else {
+            "refuse".into()
+        },
         frozen_text: frozen.as_ref().map(|f| f.thornlist.text.clone()).unwrap_or_default(),
         pins,
         diff: serde_json::from_value(diff).unwrap_or_default(),

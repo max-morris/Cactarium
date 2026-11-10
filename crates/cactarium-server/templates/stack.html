@@ -12,11 +12,16 @@
         <details class="small">
           <summary>Advanced: unpinned branch tips (not reproducible)</summary>
           <div class="alert warn stack-sm">
+          {% if tip_policy == "refuse" %}
+            <span>Not available: this stack isn't trusted, and branch tips are never reviewed, so the Cactarium doesn't serve its <strong>@head</strong> or <strong>@master</strong>. Install a release.</span>
+          {% else %}
+            {% if tip_policy == "allow" %}<span><strong>This stack isn't trusted.</strong> Its branch tips are never reviewed; cactup warns and asks before installing them.</span>{% endif %}
             <span><strong>@head</strong>: each repo at the tip of the branch this stack names.</span>
             {% call m::copy(tip_cmd) %}{% endcall %}
             <span><strong>@master</strong>: every repo at the tip of its default branch, like <span class="mono">cactup install master</span>.</span>
             {% call m::copy(master_cmd) %}{% endcall %}
             <span class="small">Two installs a day apart can differ.</span>
+          {% endif %}
           </div>
         </details>
       {% else %}

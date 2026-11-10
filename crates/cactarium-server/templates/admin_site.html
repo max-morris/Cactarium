@@ -14,6 +14,16 @@
       <div><button class="button small" type="submit">Save</button></div>
     </form>
   </section>
+  <section class="card stack-sm">
+    <h2 class="h-small">Branch tips of untrusted stacks</h2>
+    <p class="muted small"><span class="mono">@head</span> and <span class="mono">@master</span> install whatever a stack's branches hold now, which is never reviewed. A trusted stack (the entry or its owner) always serves them. For the rest:</p>
+    <form method="post" action="/admin/site" class="stack-sm">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label class="row-wrap"><input type="radio" name="untrusted_tips" value="refuse" {% if untrusted_tips != "allow" %}checked{% endif %}> Refuse: don't serve them at all</label>
+      <label class="row-wrap"><input type="radio" name="untrusted_tips" value="allow" {% if untrusted_tips == "allow" %}checked{% endif %}> Allow: serve them marked untrusted; cactup warns loudly and asks first (or <span class="mono">--risky-allow-untrusted-artifacts</span>)</label>
+      <div><button class="button small" type="submit">Save</button></div>
+    </form>
+  </section>
   <section class="stack-sm">
     <h2 class="h-small">Organizations</h2>
     <div class="table-box"><table>

@@ -658,6 +658,9 @@ pub async fn site_page(State(state): State<AppState>, Admin(a): Admin) -> AppRes
         trust_granted_by: site::get(&state, site::TRUST_GRANTED_BY)
             .await?
             .unwrap_or_else(|| "superadmin".into()),
+        untrusted_tips: site::get(&state, site::UNTRUSTED_TIPS)
+            .await?
+            .unwrap_or_else(|| "refuse".into()),
         orgs: orgs.into_iter().map(|(n, d, c, t)| (n, d.unwrap_or_default(), c, t)).collect(),
     })?
     .into_response())
@@ -665,7 +668,9 @@ pub async fn site_page(State(state): State<AppState>, Admin(a): Admin) -> AppRes
 
 #[derive(Deserialize)]
 pub struct SiteForm {
-    trust_granted_by: String,
+    /// Each panel posts one of these.
+    trust_granted_by: Option<String>,
+    untrusted_tips: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -679,19 +684,16 @@ pub async fn site_save(
     if !a.user.is_superadmin() {
         return Err(AppError::Forbidden);
     }
-    let value = match f.trust_granted_by.as_str() {
-        v @ ("superadmin" | "admins") => v,
-        _ => return Err(AppError::bad("trust_granted_by is superadmin or admins")),
+    let (key, value) = match (f.trust_granted_by.as_deref(), f.untrusted_tips.as_deref()) {
+        (Some(v @ ("superadmin" | "admins")), None) => (site::TRUST_GRANTED_BY, v),
+        (None, Some(v @ ("refuse" | "allow"))) => (site::UNTRUSTED_TIPS, v),
+        _ => {
+            return Err(AppError::bad(
+                "give trust_granted_by (superadmin or admins) or untrusted_tips (refuse or allow)",
+            ));
+        }
     };
-    site::set(&state, site::TRUST_GRANTED_BY, value).await?;
-    audit(
-        &state,
-        Some(a.user.id),
-        "site.set",
-        Some(site::TRUST_GRANTED_BY),
-        json!({ "value": value }),
-        None,
-    )
-    .await?;
+    site::set(&state, key, value).await?;
+    audit(&state, Some(a.user.id), "site.set", Some(key), json!({ "value": value }), None).await?;
     Ok(Redirect::to("/admin/site").into_response())
 }

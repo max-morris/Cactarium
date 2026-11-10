@@ -260,6 +260,8 @@ pub struct StackPage {
     pub install_cmd: String,
     pub tip_cmd: String,
     pub master_cmd: String,
+    /// How `@head`/`@master` are served: `trusted`, `allow` (untrusted, with a warning) or `refuse`.
+    pub tip_policy: String,
     pub frozen_text: String,
     pub pins: Vec<PinRow>,
     pub diff: Vec<MoveRow>,
@@ -568,6 +570,7 @@ pub struct AdminSitePage {
     pub ctx: PageCtx,
     pub nav: String,
     pub trust_granted_by: String,
+    pub untrusted_tips: String,
     /// (name, display name, members, trusted)
     pub orgs: Vec<(String, String, i64, bool)>,
 }
