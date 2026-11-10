@@ -36,7 +36,7 @@ status:
 down:
     {{compose}} down
 
-# Production, once per VM: deploy/.env, docker group, Apache proxy, nightly backups
+# Production, once per VM: deploy/.env, docker group, Apache proxy
 setup:
     sh deploy/setup.sh
 
@@ -53,9 +53,9 @@ up:
 firewall:
     sh deploy/setup.sh firewall
 
-# Production: back up, pull, rebuild, migrate, restart (data kept; seconds of downtime)
+# Production: snapshot the database, pull, rebuild, migrate, restart (data kept; seconds of downtime)
 update:
-    just backup
+    just snapshot
     git pull --ff-only
     {{compose}} build app
     {{compose}} run --rm app migrate
@@ -70,11 +70,14 @@ cli *args:
 admin-grant user:
     {{compose}} exec app cactarium admin grant {{user}}
 
-# Dump the database to deploy/backups/
-backup:
+# Dump the database to deploy/backups/before-update.dump, replacing the last one. Not a backup
+# (ITS backs the VM up): a quick way back if an update's migration goes wrong, with
+# `pg_restore --clean`.
+snapshot:
     mkdir -p deploy/backups
-    {{compose}} exec -T db pg_dump -U cactarium -d cactarium --format=custom > deploy/backups/cactarium-$(date +%Y%m%d-%H%M%S).dump
-    @ls -lh deploy/backups | tail -1
+    {{compose}} exec -T db pg_dump -U cactarium -d cactarium --format=custom > deploy/backups/before-update.dump.tmp
+    mv deploy/backups/before-update.dump.tmp deploy/backups/before-update.dump
+    @ls -lh deploy/backups/before-update.dump
 
 # Unit tests
 test:

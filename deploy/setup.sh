@@ -9,8 +9,6 @@
 #   host that serves https://DOMAIN/ at the app on 127.0.0.1:PORT. It writes the proxy settings to
 #   a file of their own, adds one Include line to that virtual host, keeps a copy of the file it
 #   edits, and puts back what it changed if Apache rejects the result.
-# - `sh setup.sh backups`: a systemd timer that dumps the database nightly to deploy/backups,
-#   keeping the last 30 dumps.
 # - `sh setup.sh firewall` (`just firewall`, never run by `just setup`): ufw denying everything
 #   inbound but HTTP and HTTPS from anywhere and SSH from the bastion (SSH_FROM in deploy/.env).
 #   It refuses to run unless your own SSH session comes from that bastion, so it can't lock you
@@ -125,39 +123,6 @@ ProxyPassReverse / http://127.0.0.1:$port/
 EOF
 }
 
-backups() {
-    unit=/etc/systemd/system/cactarium-backup
-    tmp=$(mktemp)
-    cat > "$tmp" <<EOF
-[Unit]
-Description=Dump the Cactarium database to $deploy/backups
-After=docker.service
-
-[Service]
-Type=oneshot
-User=$user
-WorkingDirectory=$deploy/..
-ExecStart=/bin/sh -c 'mkdir -p deploy/backups && docker compose --project-directory deploy -f deploy/compose.yaml exec -T db pg_dump -U cactarium -d cactarium --format=custom > deploy/backups/cactarium-\$\$(date +%%Y%%m%%d-%%H%%M%%S).dump && ls -1t deploy/backups/*.dump | tail -n +31 | xargs -r rm --'
-EOF
-    $sudo install -m 0644 "$tmp" "$unit.service"
-    cat > "$tmp" <<EOF
-[Unit]
-Description=Nightly Cactarium database dump
-
-[Timer]
-OnCalendar=*-*-* 03:30:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-    $sudo install -m 0644 "$tmp" "$unit.timer"
-    rm -f "$tmp"
-    $sudo systemctl daemon-reload
-    $sudo systemctl enable --now cactarium-backup.timer
-    echo "backups: nightly at 03:30 to $deploy/backups (copy them off the VM too)"
-}
-
 firewall() {
     from=$(get SSH_FROM)
     if [ -z "$from" ]; then
@@ -197,7 +162,6 @@ firewall() {
 
 case "${1:-}" in
     apache) apache; exit ;;
-    backups) backups; exit ;;
     firewall) firewall; exit ;;
 esac
 
@@ -223,7 +187,6 @@ front=ok
 if systemctl is-active -q apache2 2>/dev/null; then
     sh "$deploy/setup.sh" apache || front=failed
 fi
-sh "$deploy/setup.sh" backups
 
 if [ "$front" = failed ]; then
     echo "setup: all done but Apache's part, which failed (above): fix that, then 'sh deploy/setup.sh apache'" >&2
