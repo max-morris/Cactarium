@@ -49,6 +49,10 @@ up:
     {{compose}} up -d
     {{compose}} ps
 
+# Production, once per VM, over SSH through the bastion: ufw allowing only 80, 443 and SSH from it
+firewall:
+    sh deploy/setup.sh firewall
+
 # Production: back up, pull, rebuild, migrate, restart (data kept; seconds of downtime)
 update:
     just backup

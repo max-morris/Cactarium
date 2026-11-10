@@ -11,6 +11,11 @@
 #   edits, and puts back what it changed if Apache rejects the result.
 # - `sh setup.sh backups`: a systemd timer that dumps the database nightly to deploy/backups,
 #   keeping the last 30 dumps.
+# - `sh setup.sh firewall` (`just firewall`, never run by `just setup`): ufw denying everything
+#   inbound but HTTP and HTTPS from anywhere and SSH from the bastion (SSH_FROM in deploy/.env).
+#   It refuses to run unless your own SSH session comes from that bastion, so it can't lock you
+#   out. Docker's published ports bypass ufw, which is why compose.yaml publishes the app on
+#   loopback only.
 #
 # Adapted from the CactUp tutorial server's deploy/setup.sh (Cactup, feature/notebook-tutorial).
 set -eu
@@ -153,9 +158,47 @@ EOF
     echo "backups: nightly at 03:30 to $deploy/backups (copy them off the VM too)"
 }
 
+firewall() {
+    from=$(get SSH_FROM)
+    if [ -z "$from" ]; then
+        echo "firewall: set SSH_FROM in deploy/.env to the host you SSH in through (the bastion)" >&2
+        return 1
+    fi
+    # The bastion's address(es), and the port sshd listens on.
+    addrs=$(getent ahostsv4 "$from" | awk '{print $1}' | sort -u)
+    if [ -z "$addrs" ]; then
+        echo "firewall: cannot resolve SSH_FROM=$from" >&2
+        return 1
+    fi
+    # Never lock yourself out: this session must come from the bastion. (Checked before
+    # anything needs root.)
+    me=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+    if [ -z "$me" ] || ! echo "$addrs" | grep -qx "$me"; then
+        echo "firewall: this session comes from '${me:-not SSH}', not from $from ($(echo $addrs)); refusing," >&2
+        echo "since SSH would then only be allowed from $from. Run it over SSH through $from." >&2
+        return 1
+    fi
+    port=$($sudo sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
+    port=${port:-22}
+    command -v ufw > /dev/null || $sudo apt-get install -y ufw
+    $sudo ufw default deny incoming
+    $sudo ufw default allow outgoing
+    $sudo ufw default deny routed
+    for a in $addrs; do
+        $sudo ufw allow from "$a" to any port "$port" proto tcp comment "ssh from $from"
+    done
+    $sudo ufw allow 80/tcp comment "http (redirects to https)"
+    $sudo ufw allow 443/tcp comment https
+    $sudo ufw --force enable
+    $sudo systemctl enable -q ufw
+    $sudo ufw status verbose
+    echo "firewall: on, and on again after a reboot (ENABLED=yes in /etc/ufw/ufw.conf)"
+}
+
 case "${1:-}" in
     apache) apache; exit ;;
     backups) backups; exit ;;
+    firewall) firewall; exit ;;
 esac
 
 # deploy/.env
@@ -186,4 +229,4 @@ if [ "$front" = failed ]; then
     echo "setup: all done but Apache's part, which failed (above): fix that, then 'sh deploy/setup.sh apache'" >&2
     exit 1
 fi
-echo "setup: done. Next: fill in deploy/.env, then 'just up'."
+echo "setup: done. Next: fill in deploy/.env (SSH_FROM too), 'just firewall', then 'just up'."
