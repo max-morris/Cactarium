@@ -55,9 +55,17 @@ pub async fn dashboard(State(state): State<AppState>, s: SignedIn) -> AppResult<
     .bind(&s.user.username)
     .fetch_all(&state.db)
     .await?;
+    let saved = sqlx::query_as::<_, Entry>(&format!(
+        "SELECT {ENTRY_COLS} FROM entries e WHERE visibility = 'public' AND id IN (SELECT entry_id FROM hearts WHERE user_id = $1)
+         ORDER BY (SELECT created_at FROM hearts h WHERE h.user_id = $1 AND h.entry_id = e.id) DESC"
+    ))
+    .bind(s.user.id)
+    .fetch_all(&state.db)
+    .await?;
     let p = DashboardPage {
         ctx: PageCtx::new(&state, Some(&s.session)),
         entries: entry_rows(&state, entries).await?,
+        saved: entry_rows(&state, saved).await?,
         reviews: reviews.into_iter().map(|(o, n, st, note, at)| (format!("{o}/{n}"), st, note.unwrap_or_default(), fmt_date(at))).collect(),
         alerts: tag_alerts(&state, Some(&s.user.username)).await?,
     };
@@ -73,6 +81,9 @@ pub async fn new_repo_page(State(state): State<AppState>, s: SignedIn) -> AppRes
 #[derive(Deserialize)]
 pub struct RepoForm {
     url: String,
+    /// Admins only: the namespace to publish under, if not their own.
+    #[serde(default)]
+    owner: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -85,7 +96,7 @@ pub async fn new_repo(
 ) -> AppResult<Response> {
     s.session.check_csrf(&f.csrf)?;
     state.limiter.check("register", ip.0, 10)?;
-    match tracker::register(&state, &s.user, &f.url).await {
+    match tracker::register(&state, &s.user, &f.url, f.owner.as_deref()).await {
         Ok(entries) => Ok(Redirect::to(&entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into())).into_response()),
         Err(AppError::BadRequest(m) | AppError::Conflict(m)) => {
             Ok(page(&NewRepoPage { ctx: PageCtx::new(&state, Some(&s.session)), url: f.url, error: Some(m) })?.into_response())
@@ -326,6 +337,26 @@ pub async fn yank(State(state): State<AppState>, s: SignedIn, Path((owner, name)
     }
     audit(&state, Some(s.user.id), if yank { "version.yank" } else { "version.unyank" }, Some(&e.slug()), json!({ "version_id": f.version_id, "reason": reason }), None).await?;
     Ok(Redirect::to(&format!("{}?tab=versions", e.url())).into_response())
+}
+
+/// Saves an entry for later, or un-saves it. The count of saves is public.
+pub async fn heart(State(state): State<AppState>, s: SignedIn, Path((owner, name)): Path<(String, String)>, Form(f): Form<CsrfForm>) -> AppResult<Response> {
+    s.session.check_csrf(&f.csrf)?;
+    let e = model::visible_entry(&state, &owner, &name, Some(&s.user)).await?;
+    let removed = sqlx::query("DELETE FROM hearts WHERE user_id = $1 AND entry_id = $2")
+        .bind(s.user.id)
+        .bind(e.id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    if removed == 0 {
+        sqlx::query("INSERT INTO hearts (user_id, entry_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(s.user.id)
+            .bind(e.id)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(Redirect::to(&e.url()).into_response())
 }
 
 pub async fn resubmit(State(state): State<AppState>, s: SignedIn, Path((owner, name)): Path<(String, String)>, Form(f): Form<CsrfForm>) -> AppResult<Response> {

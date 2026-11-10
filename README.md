@@ -40,4 +40,5 @@ localhost.
 
 The production setup mirrors the CactUp tutorial server: the host's Apache terminates TLS and
 proxies to the app, which Docker Compose publishes on loopback only. Copy `deploy/.env.example` to
-`deploy/.env`, fill it in, then `just up`. `just backup` dumps the database.
+`deploy/.env`, fill it in, then `just up`. `just update` backs up, pulls, rebuilds and restarts;
+`just backup` dumps the database.

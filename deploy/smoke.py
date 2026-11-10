@@ -97,6 +97,16 @@ for p in ["/", "/search", "/search?kind=package", "/search?kind=stack", "/search
           "/max/carpetx-mp/1.0.0/download.th", "/max/qc0-demo/1/download.sim", "/auth/login"]:
     page(anon, p)
 page(anon, "/max/carpetx", contains="mixed-precision")
+# Forks and the compare page.
+page(anon, "/et/carpetx", contains="max/carpetx")
+page(anon, "/compare?a=et/carpetx&b=max/carpetx", contains="CarpetX/TestReal4")
+# Stacks found by the thorn they build.
+page(anon, "/search?q=TestReal4&kind=stack", contains="max/carpetx-mp")
+page(anon, "/thorns/CarpetX/TestReal4", contains="max/carpetx-mp")
+# Contacts: declared, or the repo.
+page(anon, "/et/et", contains="bitbucket.org/einsteintoolkit/tickets/issues")
+s, body, _ = anon.get("/api/v1/entries/max/carpetx")
+check("the API gives a contact (the repo, when none is declared)", s == 200 and json.loads(body)["contact"].endswith("/carpetx"), body[:200])
 page(anon, "/max/carpetx/1.0.0", contains="tag moved upstream")
 page(anon, "/alice/spacetimex", expect=404)
 page(anon, "/nobody", expect=404)
@@ -116,6 +126,11 @@ s, t, _ = alice.post("/max/carpetx/refresh", {})
 check("alice cannot manage max's package", s == 403, s)
 s, t, _ = alice.post("/new/repo", {"_csrf": "wrong", "url": "file:///repos/x.git"})
 check("a wrong CSRF token is refused", s == 400, s)
+
+# Only admins publish under a namespace that is not theirs.
+alice.get("/new/repo")
+s, _, _ = alice.post("/new/repo", {"url": REPOS + "/spacetimex.git", "owner": "et"})
+check("a non-admin cannot publish under et", s == 403, s)
 
 maxv = Visitor("max")
 for p in ["/dashboard", "/settings", "/new/repo", "/new/sim", "/new/stack", "/new/stack?name=max/carpetx-mp",
@@ -168,6 +183,21 @@ check("signing in as that owner must choose another name", hdrs.get("location") 
 # The unpinned forms are rate-limited.
 codes = [anon.get("/api/v1/stacks/et/et/releases/head")[0] for _ in range(14)]
 check("@head requests are rate-limited", codes[0] == 200 and codes[-1] == 429, codes)
+
+# Hearts: save, count, un-save.
+maxv.get("/max/qc0-demo")
+s, _, _ = maxv.post("/max/qc0-demo/heart", {})
+check("save an entry", s == 303, s)
+page(maxv, "/max/qc0-demo", contains="Saved")
+page(maxv, "/dashboard", contains="max/qc0-demo")
+s, body, _ = anon.get("/api/v1/entries/max/qc0-demo")
+check("the public count goes up", json.loads(body)["hearts"] == 1, body[:200])
+maxv.get("/max/qc0-demo")
+maxv.post("/max/qc0-demo/heart", {})
+s, body, _ = anon.get("/api/v1/entries/max/qc0-demo")
+check("saving again un-saves", json.loads(body)["hearts"] == 0, body[:200])
+s, _, _ = anon.req("POST", "/max/qc0-demo/heart", data={"_csrf": "x"})
+check("saving needs an account", s == 401, s)
 
 # Users: trust alice.
 text = page(maxv, "/admin/users")

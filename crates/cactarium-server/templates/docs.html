@@ -24,6 +24,7 @@ name = "carpetx"
 owners = ["your-cactarium-name"]   # proof you control the repo
 description = "CarpetX with mixed-precision grid functions"
 license = "LGPL-2.1-or-later"
+# contact = "https://github.com/you/CarpetX/issues"   # where to get help; default: the repo
 # arrangement = "CarpetX"          # only if the thorns sit at the repo root
 # thorns = ["CarpetX", "Loop"]     # default: every directory with an interface.ccl
 default-track = "mixed-precision"
@@ -49,6 +50,7 @@ note = "needs the mixed-precision flesh"
 [[caveat]]
 thorn = "TestReal2"
 note = "needs _Float16 (GCC 12 or newer)"</pre>
+<p><code>contact</code> says where to go for help or to report a problem: an <code>https://</code> URL (an issue tracker, a forum) or a <code>mailto:</code> address. Without one, the repo is the contact. Stacks take it in <code>[stack]</code>, sims in <code>[sim]</code>.</p>
 <p>Thorns and their dependencies (<code>IMPLEMENTS</code>, <code>INHERITS</code>, <code>REQUIRES</code>, …) are read from each thorn's <code>interface.ccl</code> and <code>configuration.ccl</code>. Claims are shown and checked; nothing resolves them into a build.</p>
 <p>A stack lives in <code>cactarium-stack.toml</code>, in its own small repo (a <em>manifest repo</em>) or alongside a package. It can be a plain thornlist, a recipe built on other stacks, or both:</p>
 <pre class="code">format = 1
@@ -71,6 +73,12 @@ url = "https://github.com/jaykalinani/AsterX.git"
 ref = "main"
 commit = "…40 hex digits…"</pre>
 <p>Each tag cuts a release: the Cactarium merges the sources, applies the overrides, resolves every branch to its current commit and freezes the result. It refuses thorn-name collisions (Cactus thorn names are global) and repos checked out from conflicting sources. Two unpinned forms exist for development: <code>owner/stack@head</code> puts each repo at the tip of the branch the stack names, and <code>owner/stack@master</code> puts every repo at the tip of its default branch, like <code>cactup install master</code>.</p>
+
+<h2 id="finding">Finding things</h2>
+<p>Search matches names, summaries, thorns and implementations. A stack or a sim is found by the thorns it builds too: searching <code>CarpetX</code> among stacks lists the stacks whose newest release builds a CarpetX thorn, and each thorn's page lists the packages that provide it and the stacks and sims that build it. A package that declares <code>[[fork-of]]</code> appears on its upstream's page, with a side-by-side comparison of the two. Signed in, <em>Save</em> keeps an entry on your dashboard; the count of saves is public.</p>
+
+<h2 id="namespaces">Namespaces</h2>
+<p>Everything you publish lives under your Cactarium name. Admins can also publish under a namespace that is no user's, such as <code>et</code> for Einstein Toolkit work: the repo's manifest then lists that namespace in <code>owners</code>.</p>
 
 <h2 id="sim">The .sim format</h2>
 <p>A <code>.sim</code> is TOML holding the thornlist and the parfile verbatim, a pin for every repo, declared inputs and run hints. Only fully specified sims (every repo pinned, nothing dirty) can be published. Make one with <code>cactup sim export</code>, or <code>cactup sim pack foo.th foo.par</code>; read one with <code>cactup import</code> or <code>cactup sim unpack</code>.</p>

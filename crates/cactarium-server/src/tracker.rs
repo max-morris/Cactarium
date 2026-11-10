@@ -91,17 +91,33 @@ fn summary_of(m: &Manifest) -> Option<String> {
     Some(d.lines().next().unwrap_or("").chars().take(200).collect())
 }
 
-/// Registers every manifest a repo carries as an entry under the user's name, then syncs its tags.
-/// The user's name must be in each manifest's `owners`: only someone who can push to the repo can
+/// Registers every manifest a repo carries as an entry, then syncs its tags. The entries go under
+/// the user's own name, or (admins only) under `namespace`, a name that is no user's, such as
+/// `et`. That name must be in each manifest's `owners`: only someone who can push to the repo can
 /// put it there.
-pub async fn register(state: &AppState, user: &User, url: &str) -> AppResult<Vec<Entry>> {
+pub async fn register(state: &AppState, user: &User, url: &str, namespace: Option<&str>) -> AppResult<Vec<Entry>> {
+    let owner = match namespace.map(str::trim).filter(|n| !n.is_empty() && *n != user.username) {
+        None => user.username.clone(),
+        Some(_) if !user.is_admin() => return Err(AppError::Forbidden),
+        Some(ns) => {
+            ns.parse::<cactup_ecosystem_common::name::Owner>().map_err(AppError::bad)?;
+            let is_user: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1)")
+                .bind(ns)
+                .fetch_one(&state.db)
+                .await?;
+            if is_user {
+                return Err(AppError::bad(format!("'{ns}' is a user's name; only they can publish under it")));
+            }
+            ns.to_owned()
+        }
+    };
     let found = inspect(state, url).await?;
     let mut entries = Vec::new();
     for (file, m) in &found.manifests {
-        if !owners_of(m).contains(&user.username) {
+        if !owners_of(m).contains(&owner) {
             return Err(AppError::bad(format!(
-                "{file} at {} does not list '{}' in owners; add your Cactarium name there to prove you control the repo",
-                found.tag, user.username
+                "{file} at {} does not list '{owner}' in owners; add it there to prove you control the repo",
+                found.tag
             )));
         }
     }
@@ -110,7 +126,7 @@ pub async fn register(state: &AppState, user: &User, url: &str) -> AppResult<Vec
         let entry = publish::create_entry(
             state,
             user,
-            NewEntry { kind, owner: &user.username, name: &name_of(&m), summary: summary_of(&m), description: None, curated: false },
+            NewEntry { kind, owner: &owner, name: &name_of(&m), summary: summary_of(&m), description: None, curated: false },
         )
         .await?;
         attach_repo(state, &entry, &found.url, file, None).await?;
@@ -436,7 +452,46 @@ pub async fn store_release(
         .bind(serde_json::to_value(&diff).map_err(anyhow::Error::from)?)
         .execute(&state.db)
         .await?;
+    store_built_thorns(state, vid, &frozen.thornlist.text).await?;
     store_pins(state, vid, &frozen.repos).await
+}
+
+/// Records the thorns a stack release or a sim builds, so they can be found by thorn.
+pub async fn store_built_thorns(state: &AppState, vid: i64, thornlist: &str) -> AppResult<()> {
+    let Ok(list) = cactup_ecosystem_common::crl::parse(thornlist) else { return Ok(()) };
+    for c in list.components().iter().filter(|c| c.checkout.contains('/') && !c.fetch_only) {
+        sqlx::query("INSERT INTO release_thorns (version_id, checkout) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(vid)
+            .bind(&c.checkout)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Fills in the thorn index for releases and sims published before it existed.
+pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
+    let stacks: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version_id, frozen FROM stack_releases s WHERE NOT EXISTS (SELECT 1 FROM release_thorns r WHERE r.version_id = s.version_id)",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (vid, frozen) in stacks {
+        if let Ok(f) = toml::from_str::<cactup_ecosystem_common::stack::FrozenStack>(&frozen) {
+            store_built_thorns(state, vid, &f.thornlist.text).await?;
+        }
+    }
+    let sims: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version_id, content FROM sim_files s WHERE NOT EXISTS (SELECT 1 FROM release_thorns r WHERE r.version_id = s.version_id)",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (vid, content) in sims {
+        if let Ok(sim) = cactup_ecosystem_common::sim::SimFile::from_toml(&content) {
+            store_built_thorns(state, vid, &sim.thornlist.text).await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn store_pins(state: &AppState, vid: i64, pins: &[cactup_ecosystem_common::sim::RepoPin]) -> AppResult<()> {

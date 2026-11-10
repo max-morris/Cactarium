@@ -33,7 +33,9 @@ pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> App
     if n.curated && !user.is_admin() {
         return Err(AppError::Forbidden);
     }
-    if !n.curated && n.owner != user.username {
+    // Admins may publish under a namespace that is not a user's (e.g. `et`); everyone else only
+    // under their own name.
+    if !n.curated && n.owner != user.username && !user.is_admin() {
         return Err(AppError::Forbidden);
     }
     if find_conflict(state, n.owner, n.name).await? {

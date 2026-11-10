@@ -62,6 +62,13 @@ async fn latest_labels(state: &AppState, ids: &[i64]) -> AppResult<BTreeMap<i64,
 pub async fn entry_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<EntryRow>> {
     let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
     let latest = latest_labels(state, &ids).await?;
+    let hearts: BTreeMap<i64, i64> =
+        sqlx::query_as::<_, (i64, i64)>("SELECT entry_id, count(*) FROM hearts WHERE entry_id = ANY($1) GROUP BY entry_id")
+            .bind(&ids)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect();
     Ok(entries
         .into_iter()
         .map(|e| EntryRow {
@@ -73,6 +80,7 @@ pub async fn entry_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<
             visibility: e.visibility.clone(),
             verified: e.verified,
             curated: e.curated,
+            hearts: hearts.get(&e.id).copied().unwrap_or(0),
         })
         .collect())
 }
@@ -140,7 +148,8 @@ pub async fn search(State(state): State<AppState>, v: Visitor, Query(q): Query<S
             "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public'
              AND ($1 = '' OR kind = $1)
              AND ($2 = '%%' OR owner || '/' || name ILIKE $2 OR summary ILIKE $2
-                  OR id IN (SELECT v.entry_id FROM thorns t JOIN versions v ON v.id = t.version_id WHERE t.name ILIKE $2 OR t.implements ILIKE $2))
+                  OR id IN (SELECT v.entry_id FROM thorns t JOIN versions v ON v.id = t.version_id WHERE t.name ILIKE $2 OR t.implements ILIKE $2)
+                  OR id IN (SELECT v.entry_id FROM release_thorns r JOIN versions v ON v.id = r.version_id WHERE r.checkout ILIKE $2))
              ORDER BY (name ILIKE $3) DESC, updated_at DESC LIMIT 100"
         ))
         .bind(&kind)
@@ -167,22 +176,40 @@ pub async fn search(State(state): State<AppState>, v: Visitor, Query(q): Query<S
     Ok(page(&SearchPage { ctx: PageCtx::new(&state, v.0.as_ref()), q: term, kind, results, thorns, title })?.into_response())
 }
 
+/// Public stacks and sims whose newest version builds a thorn (`Arrangement/Thorn`, or just the
+/// thorn's name when `by_name`).
+async fn building(state: &AppState, thorn: &str, by_name: bool) -> AppResult<Vec<EntryRow>> {
+    let cond = if by_name { "lower(split_part(r.checkout, '/', 2)) = lower($1)" } else { "lower(r.checkout) = lower($1)" };
+    let entries = sqlx::query_as::<_, Entry>(&format!(
+        "SELECT {ENTRY_COLS} FROM entries e WHERE visibility = 'public' AND kind IN ('stack', 'sim') AND id IN
+         (SELECT v.entry_id FROM release_thorns r JOIN versions v ON v.id = r.version_id WHERE {cond}
+            AND v.id = (SELECT id FROM versions w WHERE w.entry_id = v.entry_id AND NOT w.yanked ORDER BY (w.track = '') DESC, w.sort_key DESC LIMIT 1))
+         ORDER BY (SELECT count(*) FROM hearts h WHERE h.entry_id = e.id) DESC, updated_at DESC LIMIT 100"
+    ))
+    .bind(thorn)
+    .fetch_all(&state.db)
+    .await?;
+    entry_rows(state, entries).await
+}
+
 pub async fn thorn(State(state): State<AppState>, v: Visitor, Path((arr, name)): Path<(String, String)>) -> AppResult<Response> {
-    let thorns = thorn_hits(&state, "lower(t.arrangement || '/' || t.name) = lower($1)", &format!("{arr}/{name}")).await?;
+    let full = format!("{arr}/{name}");
+    let thorns = thorn_hits(&state, "lower(t.arrangement || '/' || t.name) = lower($1)", &full).await?;
     Ok(page(&SearchPage {
         ctx: PageCtx::new(&state, v.0.as_ref()),
-        q: format!("{arr}/{name}"),
+        results: building(&state, &full, false).await?,
+        q: full.clone(),
         kind: "thorn".into(),
-        results: vec![],
         thorns,
-        title: format!("Thorn {arr}/{name}"),
+        title: format!("Thorn {full}: packages that provide it, stacks and sims that build it"),
     })?
     .into_response())
 }
 
 pub async fn thorn_by_name(State(state): State<AppState>, v: Visitor, Path(name): Path<String>) -> AppResult<Response> {
     let thorns = thorn_hits(&state, "lower(t.name) = lower($1)", &name).await?;
-    Ok(page(&SearchPage { ctx: PageCtx::new(&state, v.0.as_ref()), q: name.clone(), kind: "thorn".into(), results: vec![], thorns, title: format!("Thorn {name}") })?.into_response())
+    let results = building(&state, &name, true).await?;
+    Ok(page(&SearchPage { ctx: PageCtx::new(&state, v.0.as_ref()), q: name.clone(), kind: "thorn".into(), results, thorns, title: format!("Thorn {name}: packages that provide it, stacks and sims that build it") })?.into_response())
 }
 
 pub async fn implementation(State(state): State<AppState>, v: Visitor, Path(name): Path<String>) -> AppResult<Response> {
@@ -262,7 +289,21 @@ async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<
     } else {
         Default::default()
     };
+    let repo_url = repo.as_ref().map(|r| r.url.clone());
+    let contact = model::entry_contact(state, e, repo_url.as_deref()).await?.unwrap_or_default();
+    let hearted = match user {
+        Some(u) => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM hearts WHERE user_id = $1 AND entry_id = $2)")
+            .bind(u.id)
+            .bind(e.id)
+            .fetch_one(&state.db)
+            .await?,
+        None => false,
+    };
     Ok(EntryHead {
+        contact,
+        hearts: model::heart_count(state, e.id).await?,
+        hearted,
+        signed_in: user.is_some(),
         slug: e.slug(),
         url: e.url(),
         kind: e.kind.clone(),
@@ -461,6 +502,21 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
         Some(v) if v.yanked => "This version is yanked: still downloadable by exact version, never chosen by a range.".into(),
         _ => String::new(),
     };
+    // Packages that call themselves forks of this one, and the ones this one forks.
+    let forks = sqlx::query_as::<_, Entry>(&format!(
+        "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND kind = 'package' AND id IN
+         (SELECT v.entry_id FROM claims c JOIN versions v ON v.id = c.version_id
+          WHERE c.kind = 'fork-of' AND c.target_owner = $1 AND c.target_name = $2) ORDER BY owner, name"
+    ))
+    .bind(&entry.owner)
+    .bind(&entry.name)
+    .fetch_all(&state.db)
+    .await?;
+    let upstreams: Vec<(String, String)> = claims
+        .iter()
+        .filter(|c| c.kind == "fork of")
+        .map(|c| (c.target.clone(), format!("/compare?a={}&b={}", c.target, entry.slug())))
+        .collect();
     let add_cmd = match current {
         Some(v) if v.track.is_empty() => format!("cactup add {}@^{}", entry.slug(), v.version),
         Some(v) => format!("cactup add {}@{}:^{}", entry.slug(), v.track, v.version),
@@ -482,6 +538,8 @@ async fn package_page(state: &AppState, ctx: PageCtx, e: EntryHead, entry: &Entr
         poll_error,
         webhook_url: state.cfg.url(&format!("/hooks/github/{}", entry.id)),
         webhook_secret: if e.can_manage { repo.map(|r| r.webhook_secret).unwrap_or_default() } else { String::new() },
+        forks: entry_rows(state, forks).await?,
+        upstreams,
         ctx,
         e,
     };
@@ -672,4 +730,72 @@ pub async fn download(
         body,
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct CompareQ {
+    a: String,
+    b: String,
+}
+
+async fn compare_side(state: &AppState, user: Option<&crate::auth::User>, slug: &str) -> AppResult<(CompareSide, std::collections::BTreeSet<String>)> {
+    let (owner, name) = slug.split_once('/').ok_or(AppError::NotFound)?;
+    let e = model::visible_entry(state, owner, name, user).await?;
+    if e.kind != "package" {
+        return Err(AppError::bad(format!("{} is a {}; only packages can be compared", e.slug(), e.kind)));
+    }
+    let versions = model::versions(state, e.id).await?;
+    let newest_manifest: Option<Manifest> = versions
+        .iter()
+        .filter(|v| v.usable() && v.manifest.is_some())
+        .max_by_key(|v| v.created_at)
+        .and_then(|v| v.manifest.clone())
+        .and_then(|m| serde_json::from_value(m).ok());
+    let default_track = newest_manifest.as_ref().and_then(|m| m.package.as_ref()).and_then(|p| p.default_track.clone());
+    let current = pick(&versions, None, None, default_track.as_deref())?;
+    let thorns: std::collections::BTreeSet<String> = match current {
+        Some(v) => sqlx::query_scalar::<_, String>("SELECT arrangement || '/' || name FROM thorns WHERE version_id = $1")
+            .bind(v.id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect(),
+        None => Default::default(),
+    };
+    let repo = tracker::repo_of(state, e.id).await?.map(|r| r.url);
+    let side = CompareSide {
+        slug: e.slug(),
+        url: e.url(),
+        summary: e.summary.clone().unwrap_or_default(),
+        version: current.map(|v| v.label()).unwrap_or_default(),
+        tracks: model::tracks_of(&versions, default_track.as_deref())
+            .iter()
+            .map(|t| if t.is_empty() { "default".to_owned() } else { t.clone() })
+            .collect::<Vec<_>>()
+            .join(", "),
+        contact: model::entry_contact(state, &e, repo.as_deref()).await?.unwrap_or_default(),
+        repo: repo.unwrap_or_default(),
+        claims: match current {
+            Some(v) => claims_of(state, v.id).await?,
+            None => vec![],
+        },
+    };
+    Ok((side, thorns))
+}
+
+/// Two packages side by side, typically an upstream and its fork: their newest versions, tracks,
+/// claims and which thorns each has.
+pub async fn compare(State(state): State<AppState>, v: Visitor, Query(q): Query<CompareQ>) -> AppResult<Response> {
+    let (a, ta) = compare_side(&state, v.user(), q.a.trim()).await?;
+    let (b, tb) = compare_side(&state, v.user(), q.b.trim()).await?;
+    let p = ComparePage {
+        ctx: PageCtx::new(&state, v.0.as_ref()),
+        only_a: ta.difference(&tb).cloned().collect(),
+        only_b: tb.difference(&ta).cloned().collect(),
+        both: ta.intersection(&tb).cloned().collect(),
+        sides: vec![a.clone(), b.clone()],
+        a,
+        b,
+    };
+    Ok(page(&p)?.into_response())
 }

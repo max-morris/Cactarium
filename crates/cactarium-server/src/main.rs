@@ -48,8 +48,14 @@ enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
-    /// Register a repo (package and/or stack) on behalf of a user.
-    Register { username: String, url: String },
+    /// Register a repo (package and/or stack) on behalf of a user; with --owner (the user must be
+    /// an admin), under a namespace that is no user's, such as `et`.
+    Register {
+        username: String,
+        url: String,
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Publish a .sim file on behalf of a user.
     PublishSim {
         username: String,
@@ -114,10 +120,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Admin { action } => admin(&db, action).await,
-        Command::Register { username, url } => {
+        Command::Register { username, url, owner } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
-            for e in tracker::register(&state, &user, &url).await.map_err(|e| anyhow::anyhow!("{e}"))? {
+            for e in tracker::register(&state, &user, &url, owner.as_deref()).await.map_err(|e| anyhow::anyhow!("{e}"))? {
                 println!("Registered {} ({}, {})", e.slug(), e.kind, e.visibility);
             }
             Ok(())
@@ -229,6 +235,9 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
         tracing::warn!("development sign-in is enabled (CACTARIUM_DEV_LOGIN); never use this on a public server");
     }
     let state = make_state(cfg, db)?;
+    if let Err(e) = tracker::backfill_built_thorns(&state).await {
+        tracing::warn!("backfilling the thorn index failed: {e}");
+    }
     tokio::spawn(tracker::poll_forever(state.clone()));
     let sweeper = state.clone();
     tokio::spawn(async move {

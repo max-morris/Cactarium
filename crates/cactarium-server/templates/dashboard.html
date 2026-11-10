@@ -19,6 +19,9 @@
   {% endfor %}
   {% let rows = entries %}
   {% include "_entry_table.html" %}
+  <h2>Saved</h2>
+  {% let rows = saved %}
+  {% include "_entry_table.html" %}
   {% if !reviews.is_empty() %}
   <h2>Reviews</h2>
   <div class="table-box"><table><thead><tr><th scope="col">Entry</th><th scope="col">Status</th><th scope="col">Note</th><th scope="col">When</th></tr></thead><tbody>

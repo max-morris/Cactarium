@@ -19,6 +19,10 @@
   {% if kind != "thorn" %}
     {% let rows = results %}
     {% include "_entry_table.html" %}
+  {% else if !results.is_empty() %}
+    <h2>Stacks and sims that build it</h2>
+    {% let rows = results %}
+    {% include "_entry_table.html" %}
   {% endif %}
   {% if !thorns.is_empty() || kind == "thorn" %}
   <h2>Thorns</h2>

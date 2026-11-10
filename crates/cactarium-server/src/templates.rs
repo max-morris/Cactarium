@@ -42,6 +42,10 @@ impl PageCtx {
         }
     }
 
+    pub fn is_admin(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.is_admin)
+    }
+
     pub fn is_superadmin(&self) -> bool {
         self.user.as_ref().is_some_and(|u| u.is_superadmin)
     }
@@ -67,6 +71,7 @@ pub struct EntryRow {
     pub visibility: String,
     pub verified: bool,
     pub curated: bool,
+    pub hearts: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +126,12 @@ pub struct EntryHead {
     pub repo_url: String,
     pub review_note: String,
     pub review_status: String,
+    /// Where to go for help or to report problems.
+    pub contact: String,
+    pub hearts: i64,
+    /// The visitor saved it (always false when signed out).
+    pub hearted: bool,
+    pub signed_in: bool,
 }
 
 // ---------- pages ----------
@@ -219,6 +230,10 @@ pub struct PackagePage {
     pub poll_error: String,
     pub webhook_url: String,
     pub webhook_secret: String,
+    /// Packages that declare themselves forks of this one.
+    pub forks: Vec<EntryRow>,
+    /// (upstream slug, compare URL) for each package this one forks.
+    pub upstreams: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -298,6 +313,7 @@ pub struct AlertRow {
 pub struct DashboardPage {
     pub ctx: PageCtx,
     pub entries: Vec<EntryRow>,
+    pub saved: Vec<EntryRow>,
     pub reviews: Vec<(String, String, String, String)>,
     pub alerts: Vec<AlertRow>,
 }
@@ -347,6 +363,30 @@ pub struct SettingsPage {
     pub new_token: Option<String>,
     pub can_link_github: bool,
     pub can_link_orcid: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CompareSide {
+    pub slug: String,
+    pub url: String,
+    pub summary: String,
+    pub version: String,
+    pub tracks: String,
+    pub repo: String,
+    pub contact: String,
+    pub claims: Vec<ClaimRow>,
+}
+
+#[derive(Template)]
+#[template(path = "compare.html")]
+pub struct ComparePage {
+    pub ctx: PageCtx,
+    pub a: CompareSide,
+    pub b: CompareSide,
+    pub sides: Vec<CompareSide>,
+    pub only_a: Vec<String>,
+    pub only_b: Vec<String>,
+    pub both: Vec<String>,
 }
 
 #[derive(Template)]

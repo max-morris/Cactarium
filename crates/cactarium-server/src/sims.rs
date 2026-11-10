@@ -187,6 +187,7 @@ pub async fn publish(state: &AppState, user: &User, name: Option<&str>, checked:
         .await?;
     tx.commit().await?;
     tracker::store_pins(state, vid, &sim.repos).await?;
+    tracker::store_built_thorns(state, vid, &sim.thornlist.text).await?;
     audit(state, Some(user.id), "sim.publish", Some(&entry.slug()), json!({ "version": n, "sha256": sha }), None).await?;
     Ok((entry, n))
 }

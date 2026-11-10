@@ -49,6 +49,15 @@ up:
     {{compose}} up -d
     {{compose}} ps
 
+# Production: back up, pull, rebuild, migrate, restart (data kept; seconds of downtime)
+update:
+    just backup
+    git pull --ff-only
+    {{compose}} build app
+    {{compose}} run --rm app migrate
+    {{compose}} up -d
+    {{compose}} ps
+
 # Run the server's command line inside the app container, e.g. `just cli admin list`
 cli *args:
     {{compose}} exec app cactarium {{args}}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ a.slug }} and {{ b.slug }} · Cactarium{% endblock %}
+{% block content %}
+<section class="stack-lg">
+  <h1>Comparing <span class="mono">{{ a.slug }}</span> and <span class="mono">{{ b.slug }}</span></h1>
+  <div class="split">
+    {% for side in sides %}
+    <section class="split-side card stack-sm">
+      <h2 class="h-small"><a class="mono" href="{{ side.url }}">{{ side.slug }}</a></h2>
+      {% if !side.summary.is_empty() %}<p>{{ side.summary }}</p>{% endif %}
+      <p class="small"><span class="muted">Newest</span> <span class="mono">{{ side.version }}</span></p>
+      <p class="small"><span class="muted">Tracks</span> <span class="mono">{{ side.tracks }}</span></p>
+      {% if !side.repo.is_empty() %}<p class="small meta"><a href="{{ side.repo }}" rel="nofollow noopener">{{ side.repo }}</a></p>{% endif %}
+      {% if !side.contact.is_empty() %}<p class="small meta">Help: <a href="{{ side.contact }}" rel="nofollow noopener">{{ side.contact }}</a></p>{% endif %}
+      {% let claims = side.claims.clone() %}
+      {% include "_claims.html" %}
+    </section>
+    {% endfor %}
+  </div>
+  <div class="split">
+    <section class="split-side stack-sm"><h2 class="h-small">Only in {{ a.slug }}</h2>{% for t in only_a %}<a class="mono small" href="/thorns/{{ t }}">{{ t }}</a>{% else %}<p class="muted small">Nothing.</p>{% endfor %}</section>
+    <section class="split-side stack-sm"><h2 class="h-small">Only in {{ b.slug }}</h2>{% for t in only_b %}<a class="mono small" href="/thorns/{{ t }}">{{ t }}</a>{% else %}<p class="muted small">Nothing.</p>{% endfor %}</section>
+    <section class="split-side stack-sm"><h2 class="h-small">In both</h2>{% for t in both %}<a class="mono small" href="/thorns/{{ t }}">{{ t }}</a>{% else %}<p class="muted small">Nothing.</p>{% endfor %}</section>
+  </div>
+  <p class="small muted">Thorns of each package's newest version on its default track. Tracks and claims are as their authors declare them.</p>
+</section>
+{% endblock %}

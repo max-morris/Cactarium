@@ -85,14 +85,16 @@ fn version_info(v: &Version) -> VersionInfo {
 pub async fn entry(State(state): State<AppState>, Path((owner, name)): Path<(String, String)>) -> ApiResult<Json<EntryInfo>> {
     let e = public_entry(&state, &owner, &name, None).await?;
     let versions = model::versions(&state, e.id).await?;
-    let repo = tracker::repo_of(&state, e.id).await?;
+    let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
     Ok(Json(EntryInfo {
         slug: e.slug(),
         kind: e.kind.clone(),
         summary: e.summary.clone(),
         verified: e.verified,
         curated: e.curated,
-        repo: repo.map(|r| r.url),
+        contact: model::entry_contact(&state, &e, repo.as_deref()).await?,
+        hearts: model::heart_count(&state, e.id).await?,
+        repo,
         tracks: model::tracks_of(&versions, None),
         versions: versions.iter().map(|v| v.label()).collect(),
     }))
@@ -166,12 +168,12 @@ pub async fn resolve(State(state): State<AppState>, Query(q): Query<ResolveQ>) -
             .map(|(_, v)| v)
             .ok_or_else(|| AppError::bad(format!("no version of {} matches {req}", e.slug())))?
     };
-    Ok(Json(Resolved {
-        slug: format!("{}@{}", e.slug(), best.label()),
-        kind: e.kind.clone(),
-        url: tracker::repo_of(&state, e.id).await?.map(|r| r.url),
-        version: version_info(best),
-    }))
+    let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
+    let contact = match e.kind.as_str() {
+        "sim" => model::entry_contact(&state, &e, None).await?,
+        _ => model::manifest_contact(best.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page)),
+    };
+    Ok(Json(Resolved { slug: format!("{}@{}", e.slug(), best.label()), kind: e.kind.clone(), url, contact, version: version_info(best) }))
 }
 
 pub async fn stack_releases(State(state): State<AppState>, Path((owner, name)): Path<(String, String)>) -> ApiResult<Json<StackReleases>> {

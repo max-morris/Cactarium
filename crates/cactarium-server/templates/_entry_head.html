@@ -8,7 +8,20 @@
   </div>
   <h1 class="mono">{{ e.slug }}</h1>
   {% if !e.summary.is_empty() %}<p class="lead">{{ e.summary }}</p>{% endif %}
-  {% if !e.repo_url.is_empty() %}<p class="meta"><a href="{{ e.repo_url }}" rel="nofollow noopener">{{ e.repo_url }}</a></p>{% endif %}
+  <div class="row-wrap meta">
+    {% if !e.repo_url.is_empty() %}<a href="{{ e.repo_url }}" rel="nofollow noopener">{{ e.repo_url }}</a>{% endif %}
+    {% if !e.contact.is_empty() %}<span>Help and problems: <a href="{{ e.contact }}" rel="nofollow noopener">{{ e.contact }}</a></span>{% endif %}
+  </div>
+  <div class="row-wrap">
+    {% if e.signed_in %}
+    <form method="post" action="{{ e.url }}/heart" class="inline">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <button class="button small ghost heart{% if e.hearted %} hearted{% endif %}" type="submit" aria-pressed="{% if e.hearted %}true{% else %}false{% endif %}"><svg width="16" height="16" viewBox="0 0 24 24" fill="{% if e.hearted %}currentColor{% else %}none{% endif %}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 21s-7-4.5-9.5-9A5.5 5.5 0 0 1 12 6a5.5 5.5 0 0 1 9.5 6C19 16.5 12 21 12 21z"/></svg><span>{% if e.hearted %}Saved{% else %}Save{% endif %}</span><span class="muted">{{ e.hearts }}</span></button>
+    </form>
+    {% else %}
+    <span class="small muted heart-count" title="Sign in to save it"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 21s-7-4.5-9.5-9A5.5 5.5 0 0 1 12 6a5.5 5.5 0 0 1 9.5 6C19 16.5 12 21 12 21z"/></svg> {{ e.hearts }}</span>
+    {% endif %}
+  </div>
   {% if e.can_manage && !e.review_status.is_empty() %}
     <div class="alert {% if e.review_status == "changes-requested" %}warn{% endif %}">
       <strong>Review: {{ e.review_status }}.</strong>

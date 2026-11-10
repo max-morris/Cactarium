@@ -173,6 +173,46 @@ pub fn latest_on<'a>(versions: &'a [Version], track: &str) -> Option<&'a Version
     on.iter().find(|v| v.usable()).or(on.first()).copied()
 }
 
+/// A git URL as a page a person can open: `https://host/x/y.git` → `https://host/x/y`.
+pub fn repo_page(url: &str) -> String {
+    let u = url.trim_end_matches('/');
+    u.strip_suffix(".git").unwrap_or(u).to_owned()
+}
+
+/// The contact a manifest declares (`[package] contact` or `[stack] contact`).
+pub fn manifest_contact(manifest: Option<&serde_json::Value>) -> Option<String> {
+    let m = manifest?;
+    ["package", "stack"].iter().find_map(|k| m[k]["contact"].as_str().map(str::to_owned))
+}
+
+/// Where to go for help with an entry: the newest usable version's declared contact (for a sim,
+/// the one in its file), else its repo.
+pub async fn entry_contact(state: &AppState, e: &Entry, repo_url: Option<&str>) -> AppResult<Option<String>> {
+    let declared = if e.kind == "sim" {
+        let content: Option<String> = sqlx::query_scalar(
+            "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 ORDER BY v.sort_key DESC LIMIT 1",
+        )
+        .bind(e.id)
+        .fetch_optional(&state.db)
+        .await?;
+        content.and_then(|c| cactup_ecosystem_common::sim::SimFile::from_toml(&c).ok()).and_then(|s| s.sim.contact)
+    } else {
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND NOT yanked AND state <> 'invalid' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(e.id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+        manifest_contact(m.as_ref())
+    };
+    Ok(declared.or_else(|| repo_url.map(repo_page)))
+}
+
+pub async fn heart_count(state: &AppState, entry_id: i64) -> AppResult<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM hearts WHERE entry_id = $1").bind(entry_id).fetch_one(&state.db).await?)
+}
+
 pub fn fmt_date(t: OffsetDateTime) -> String {
     t.format(time::macros::format_description!("[year]-[month]-[day]")).unwrap_or_default()
 }

@@ -14,6 +14,10 @@
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <label for="url">Repo URL</label>
     <input id="url" name="url" class="mono" value="{{ url }}" placeholder="https://github.com/you/YourArrangement" required>
+    {% if ctx.is_admin() %}
+    <label for="owner">Publish under <span class="muted">(admins: a namespace that is no user's, such as et; empty for your own)</span></label>
+    <input id="owner" name="owner" class="mono" placeholder="et">
+    {% endif %}
     <button class="button" type="submit">Register</button>
   </form>
   <p class="muted small">See the <a href="/docs#manifests">manifest reference</a>. New entries are reviewed by an admin before they are public; later versions publish on their own.</p>

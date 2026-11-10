@@ -73,7 +73,7 @@ license = "LGPL-2.1-or-later"
 arrangement = "CarpetX"
 
 [[fork-of]]
-target = "einsteintoolkit/carpetx"
+target = "et/carpetx"
 EOF
 commit "$R" "CarpetX 1.0.0"; g "$R" tag v1.0.0
 echo "Faster regridding." >> "$R/README.md"; commit "$R" "CarpetX 1.1.0"; g "$R" tag v1.1.0
@@ -94,7 +94,7 @@ default-track = "mixed-precision"
 description = "CCTK_REAL4 and CCTK_REAL2 grid functions; needs a mixed-precision flesh"
 
 [[fork-of]]
-target = "einsteintoolkit/carpetx"
+target = "et/carpetx"
 
 [[depends-on]]
 target = "et/et"
@@ -113,7 +113,27 @@ commit "$R" "Mixed precision"; g "$R" tag mixed-precision/v1.0.0
 g "$R" checkout master
 publish carpetx
 
-# The ET stack: a flat stack in a manifest repo, by user "et".
+# Upstream CarpetX, published by an admin in the et namespace (its own authors haven't).
+new_repo carpetx-et
+R=$WORK/carpetx-et
+thorn "$R/CarpetX" driver $'REQUIRES AMReX MPI yaml_cpp zlib\nREQUIRES THORNS: Arith Loop'
+thorn "$R/Loop" Loop 'REQUIRES THORNS: Arith'
+thorn "$R/Arith" Arith ''
+printf '# CarpetX\n\nThe Einstein Toolkit AMReX-based driver (a demo stand-in).\n' > "$R/README.md"
+cat > "$R/cactarium.toml" <<'EOF'
+format = 1
+
+[package]
+name = "carpetx"
+owners = ["et"]
+description = "The Einstein Toolkit's AMReX-based driver"
+license = "LGPL-2.1-or-later"
+arrangement = "CarpetX"
+contact = "https://bitbucket.org/einsteintoolkit/tickets/issues"
+EOF
+commit "$R" "CarpetX 1.0.0"; g "$R" tag v1.0.0; publish carpetx-et
+
+# The ET stack: a flat stack in a manifest repo, published by an admin in the et namespace.
 new_repo et-stack
 R=$WORK/et-stack
 cat > "$R/et.th" <<EOF
@@ -157,6 +177,7 @@ format = 1
 name = "et"
 owners = ["et"]
 description = "The Einstein Toolkit's component list (a demo stand-in), one stack among many"
+contact = "https://bitbucket.org/einsteintoolkit/tickets/issues"
 thornlist = "et.th"
 EOF
 commit "$R" "ET 2026.5"; g "$R" tag v2026.5.0; publish et-stack
@@ -195,9 +216,9 @@ commit "$R" "SpacetimeX"; g "$R" tag v0.1.0; publish spacetimex
 
 echo "Registering on the local site"
 cli migrate >/dev/null
-for u in max et alice; do cli dev-user "$u"; done
-cli admin trust et
-cli register et $U/et-stack.git
+for u in max alice; do cli dev-user "$u"; done
+cli register max $U/carpetx-et.git --owner et
+cli register max $U/et-stack.git --owner et
 cli register max $U/carpetx.git
 cli register max $U/carpetx-mp.git
 cli register alice $U/spacetimex.git
@@ -278,4 +299,4 @@ git -C "$R" push -q --force "$REPOS/carpetx.git" refs/tags/v1.0.0
 cli sync max/carpetx
 
 echo
-echo "Done. Sign in at http://localhost:8000/auth/login as max (superadmin), et (trusted) or alice."
+echo "Done. Sign in at http://localhost:8000/auth/login as max (superadmin) or alice."

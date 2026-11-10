@@ -159,3 +159,8 @@ body.admin .header-user .link-button { color: var(--admin-ink); }
   h1 { font-size: 26px; }
   .header-user { margin-left: 0; }
 }
+
+/* hearts */
+.heart { gap: 6px; }
+.heart.hearted { color: var(--warn); border-color: var(--warn); }
+.heart-count { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }

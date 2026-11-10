@@ -43,8 +43,15 @@
     <section class="card stack-sm">
       <h2 class="h-small">Compatibility</h2>
       {% include "_claims.html" %}
+      {% for u in upstreams %}<a class="small" href="{{ u.1 }}">Compare with {{ u.0 }}</a>{% endfor %}
       {% for c in caveats %}<div class="alert warn small"><strong>{{ c.0 }}:</strong> {{ c.1 }}</div>{% endfor %}
     </section>
+    {% if !forks.is_empty() %}
+    <section class="card stack-sm">
+      <h2 class="h-small">Forks</h2>
+      {% for f in forks %}<span><a class="mono" href="{{ f.url }}">{{ f.slug }}</a> <a class="small" href="/compare?a={{ e.slug }}&amp;b={{ f.slug }}">compare</a></span>{% if !f.summary.is_empty() %}<span class="small muted">{{ f.summary }}</span>{% endif %}{% endfor %}
+    </section>
+    {% endif %}
     {% if e.can_manage %}
     <section class="card stack-sm">
       <h2 class="h-small">Manage</h2>
