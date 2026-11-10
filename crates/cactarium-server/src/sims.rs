@@ -244,7 +244,7 @@ commit = "{SHA}"
         assert!(w.contains("@KNOB(id)@"), "{w}");
     }
 
-    /// The pretty-bhns false positives: paths and knob syntax mentioned in comments are no use.
+    /// Paths and knob syntax mentioned in comments are no use.
     #[test]
     fn comments_are_not_uses() {
         let par = "# results go to /work/me; @KNOB(name)@ is the required form\ny = \"@KNOB-OPTIONAL(mail, none)@\"";
@@ -253,11 +253,11 @@ commit = "{SHA}"
         assert!(!w.contains("/work") && !w.contains("KNOB"), "{w}");
     }
 
-    /// Max's real BHNS parfile documents @KNOB(name)@ and /work in comments; neither is a use.
+    /// A real parfile that documents @KNOB(name)@ and /work in its comments (neither is a use) and
+    /// needs `kadath-initial-data`. Runs when CACTARIUM_TEST_PARFILE names one.
     #[test]
-    fn the_real_bhns_parfile_has_no_false_positives() {
-        let Some(home) = std::env::var_os("HOME") else { return };
-        let path = std::path::Path::new(&home).join("src/pretty-bhns/parfiles/bhns_gw230529_dense_output.par");
+    fn a_real_parfile_has_no_false_positives() {
+        let Some(path) = std::env::var_os("CACTARIUM_TEST_PARFILE") else { return };
         let Ok(par) = std::fs::read_to_string(path) else { return };
         let mut parsed = SimFile::from_toml(&sim(false, "x = 1")).unwrap();
         parsed.parfile.text = par;
