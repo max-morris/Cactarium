@@ -9,7 +9,7 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
     API_GENERATION, ClaimInfo, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed, ReleaseRequest, Resolved,
-    SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER, VersionInfo,
+    CONTACT_HEADER, SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER, VersionInfo,
 };
 use cactup_ecosystem_common::ccl::ThornFacts;
 use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
@@ -194,9 +194,13 @@ pub async fn stack_release(
         "master" => Some(Tip::Master),
         _ => None,
     };
+    let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
+    let contact = model::entry_contact(&state, &e, repo.as_deref()).await?.unwrap_or_default();
+    let contact = header::HeaderValue::from_str(&contact).unwrap_or(header::HeaderValue::from_static(""));
+    let contact_header = (header::HeaderName::from_static(CONTACT_HEADER), contact);
     let Some(tip) = tip else {
         let v = model::version_by_label(&state, e.id, &version).await?.ok_or(AppError::NotFound)?;
-        return Ok(Json(stacks::frozen_of(&state, &v).await?).into_response());
+        return Ok(([contact_header], Json(stacks::frozen_of(&state, &v).await?)).into_response());
     };
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
@@ -212,7 +216,8 @@ pub async fn stack_release(
         repos: r.pins,
         recipe: Some(definition),
     };
-    Ok(([(header::HeaderName::from_static(UNPINNED_HEADER), "true")], Json(frozen)).into_response())
+    let unpinned = (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true"));
+    Ok(([unpinned, contact_header], Json(frozen)).into_response())
 }
 
 /// The stack's definition as it stands now: its repo's default branch for a manifest repo, else
