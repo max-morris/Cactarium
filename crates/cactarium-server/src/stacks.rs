@@ -3,15 +3,16 @@
 //! Sources, highest priority first: the stack's own thornlist, then each `extends` base release in
 //! order. Components are merged by checkout location, first wins. Then `enable` (un-`#DISABLED`s a
 //! line in any source), `disable`, and repo overrides apply. Every repo is pinned from, in order:
-//! the definition's `[[stack.pin]]`, a `!REPO_COMMIT` in the text, the base release's pin (when the
-//! repo still points where the base had it), or the branch's current head.
+//! the definition's `[[stack.pin]]` for it (a commit, a sha256, or a tag, which must exist), a
+//! `!REPO_COMMIT` in the text, the definition's `pin-tag` (when the repo has that tag), the base
+//! release's pin (when the repo still points where the base had it), or the branch's current head.
 //!
 //! A flat stack with nothing to merge keeps its thornlist verbatim; anything else is emitted fresh
 //! with `!REPO_COMMIT` lines, so the downloaded `.th` is pinned on its own.
 //!
-//! The unpinned forms resolve without looking anything up: `@head` leaves every repo the definition
-//! does not pin on purpose at its branch tip; `@master` drops every branch and pin, so each repo
-//! follows its default branch.
+//! The unpinned forms: `@head` keeps the definition's deliberate pins (`[[stack.pin]]` and
+//! `pin-tag`, which are looked up) and leaves every other repo at its branch tip; `@master` drops
+//! every branch and pin, so each repo follows its default branch.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,7 +20,7 @@ use cactup_ecosystem_common::crl::{self, Component, ComponentType};
 use cactup_ecosystem_common::crl_emit;
 use cactup_ecosystem_common::sim::{RepoPin, ThornlistText};
 use cactup_ecosystem_common::slug::{Slug, Tip};
-use cactup_ecosystem_common::stack::{FrozenStack, StackSection};
+use cactup_ecosystem_common::stack::{FrozenStack, StackPin, StackSection};
 use cactup_ecosystem_common::version::TrackedReq;
 use serde::Serialize;
 
@@ -217,7 +218,14 @@ pub async fn resolve(
     check_collisions(&merged)?;
 
     // One pin per repo; every component of a repo must agree on where it comes from.
-    let def_pins: BTreeMap<&str, &RepoPin> = section.pins.iter().map(|p| (p.name.as_str(), p)).collect();
+    let def_pins: BTreeMap<&str, &StackPin> =
+        section.pins.iter().map(|p| (p.name.as_str(), p)).collect();
+    if let Some(p) = section.pins.iter().find(|p| !merged.iter().any(|c| c.repo == p.name)) {
+        return Err(AppError::bad(format!(
+            "[[stack.pin]] names repo '{}', which no source uses",
+            p.name
+        )));
+    }
     let mut by_repo: BTreeMap<String, &Component> = BTreeMap::new();
     for c in merged.iter().filter(|c| c.ty != ComponentType::Ignore) {
         match by_repo.get(&c.repo) {
@@ -241,7 +249,9 @@ pub async fn resolve(
     // Pins that need a lookup are resolved concurrently, a few at a time: a full ET-sized list
     // names about 80 repos, and one at a time that took over half a minute.
     let mut pins = Vec::new();
-    let mut lookups: Vec<(usize, String, Option<String>)> = Vec::new();
+    let mut lookups: Vec<(usize, String, Lookup)> = Vec::new();
+    let deliberate = tip != Some(Tip::Master);
+    let pin_tag = section.pin_tag.as_deref().filter(|_| deliberate);
     for (repo, c) in &by_repo {
         let url = c.url.clone().unwrap_or_default();
         let mut pin = RepoPin {
@@ -253,24 +263,41 @@ pub async fn resolve(
             cactarium: None,
             dirty: false,
         };
-        let deliberate = tip != Some(Tip::Master);
+        let base = base_pins.get(repo).filter(|b| b.url == url && b.git_ref == c.branch);
+        let git = c.ty == ComponentType::Git;
         if let Some(p) = def_pins.get(repo.as_str()).filter(|_| deliberate) {
-            pin.commit = p.commit.clone();
-            pin.sha256 = p.sha256.clone();
-            pin.cactarium = p.cactarium.clone();
+            match &p.tag {
+                Some(t) if git => lookups.push((pins.len(), url.clone(), Lookup::Tag(t.clone()))),
+                Some(_) => {
+                    return Err(AppError::bad(format!(
+                        "repo '{repo}' is not a git repo; it can't be pinned by tag"
+                    )));
+                }
+                None => {
+                    pin.commit = p.commit.clone();
+                    pin.sha256 = p.sha256.clone();
+                }
+            }
         } else if c.commit.is_some() {
             pin.commit = c.commit.clone();
-        } else if let Some(b) = base_pins.get(repo)
-            && b.url == url
-            && b.git_ref == c.branch
-        {
+        } else if let Some(t) = pin_tag.filter(|_| git) {
+            // Without the tag, the repo falls through to its base pin, else its branch.
+            let fallback = match base {
+                Some(b) => Fallback::Base(Box::new(b.clone())),
+                None if tip.is_some() => Fallback::Unpinned,
+                None => Fallback::Branch(c.branch.clone()),
+            };
+            lookups.push((pins.len(), url.clone(), Lookup::TagElse(t.to_owned(), fallback)));
+        } else if let Some(b) = base {
             pin.commit = b.commit.clone();
             pin.sha256 = b.sha256.clone();
             pin.cactarium = b.cactarium.clone();
         } else {
             match c.ty {
                 ComponentType::Git if tip.is_some() => {}
-                ComponentType::Git => lookups.push((pins.len(), url.clone(), c.branch.clone())),
+                ComponentType::Git => {
+                    lookups.push((pins.len(), url.clone(), Lookup::Branch(c.branch.clone())))
+                }
                 ComponentType::Http | ComponentType::Https | ComponentType::Ftp => {
                     return Err(AppError::bad(format!(
                         "repo '{repo}' is a download; pin it with a sha256 in [[stack.pin]]"
@@ -287,17 +314,24 @@ pub async fn resolve(
     }
     let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(LOOKUPS_AT_ONCE));
     let mut set = tokio::task::JoinSet::new();
-    for (i, url, branch) in lookups {
+    for (i, url, lookup) in lookups {
         let gate = gate.clone();
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
-            (i, git::resolve_ref(policy, &url, branch.as_deref()).await)
+            (i, lookup.run(policy, &url).await)
         });
     }
     while let Some(done) = set.join_next().await {
         let (i, result) = done.map_err(anyhow::Error::from)?;
-        let commit = result.map_err(|e| AppError::bad(format!("repo '{}': {e:#}", pins[i].name)))?;
-        pins[i].commit = Some(commit);
+        match result.map_err(|e| AppError::bad(format!("repo '{}': {e:#}", pins[i].name)))? {
+            Found::Commit(c) => pins[i].commit = Some(c),
+            Found::Base(b) => {
+                pins[i].commit = b.commit;
+                pins[i].sha256 = b.sha256;
+                pins[i].cactarium = b.cactarium;
+            }
+            Found::Unpinned => {}
+        }
     }
     let resolved_commits: BTreeMap<String, String> = pins
         .iter()
@@ -325,6 +359,52 @@ pub async fn resolve(
         }
     };
     Ok(Resolution { root, text, pins })
+}
+
+/// A pin that needs the remote repo.
+enum Lookup {
+    /// The branch's current head (None: the default branch).
+    Branch(Option<String>),
+    /// A tag a `[[stack.pin]]` names: it must exist.
+    Tag(String),
+    /// The definition's `pin-tag`, if the repo has it.
+    TagElse(String, Fallback),
+}
+
+/// What a repo without the `pin-tag` gets instead.
+enum Fallback {
+    Base(Box<RepoPin>),
+    Branch(Option<String>),
+    /// Under `@head`: the branch tip, left unpinned.
+    Unpinned,
+}
+
+enum Found {
+    Commit(String),
+    Base(Box<RepoPin>),
+    Unpinned,
+}
+
+impl Lookup {
+    async fn run(self, policy: GitPolicy, url: &str) -> anyhow::Result<Found> {
+        Ok(match self {
+            Lookup::Branch(b) => Found::Commit(git::resolve_ref(policy, url, b.as_deref()).await?),
+            Lookup::Tag(t) => match git::resolve_tag(policy, url, &t).await? {
+                Some(c) => Found::Commit(c),
+                None => anyhow::bail!("{url} has no tag '{t}' (named by its [[stack.pin]])"),
+            },
+            Lookup::TagElse(t, fallback) => match git::resolve_tag(policy, url, &t).await? {
+                Some(c) => Found::Commit(c),
+                None => match fallback {
+                    Fallback::Base(b) => Found::Base(b),
+                    Fallback::Branch(b) => {
+                        Found::Commit(git::resolve_ref(policy, url, b.as_deref()).await?)
+                    }
+                    Fallback::Unpinned => Found::Unpinned,
+                },
+            },
+        })
+    }
 }
 
 fn describe(c: &Component) -> String {

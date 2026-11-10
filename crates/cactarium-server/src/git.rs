@@ -220,6 +220,20 @@ pub async fn resolve_ref(policy: GitPolicy, url: &str, git_ref: Option<&str>) ->
     )
 }
 
+/// The commit a tag names (peeled, for an annotated tag), or None when the repo has no such tag.
+pub async fn resolve_tag(policy: GitPolicy, url: &str, tag: &str) -> anyhow::Result<Option<String>> {
+    let t = check(policy, url).await?;
+    let home = tempfile::tempdir()?;
+    let mut c = git_to(policy, home.path(), &t);
+    // The pattern also brings the peeled `^{}` line of an annotated tag, which parse_ls_remote prefers.
+    c.args(["ls-remote", "--tags", "--", &t.url, &format!("refs/tags/{tag}")]);
+    let out = run(c, "listing tags").await?;
+    Ok(parse_ls_remote(&out, "refs/tags/")
+        .into_iter()
+        .find(|r| r.name == tag)
+        .map(|r| r.commit))
+}
+
 /// A commit checked out into a temporary directory, removed when dropped.
 pub struct Checkout {
     _dir: tempfile::TempDir,

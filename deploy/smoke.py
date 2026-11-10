@@ -350,6 +350,36 @@ alice_id = re.search(r'href="/alice">alice</a>.*?action="/admin/users/(\d+)"', t
 s, _, _ = maxv.post(f"/admin/users/{alice_id}", {"action": "untrust"})
 check("untrust alice", s == 303, s)
 time.sleep(61)
+
+# Pins by tag: pin-tag pins every repo that has the tag, a repo's own [[stack.pin]] wins over it,
+# and a repo without the tag follows its branch.
+def git(repo, *args):
+    return subprocess.run(["git", "-C", ENV["DEMO_REPOS"] + f"/{repo}.git", *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+git("cactusbase", "tag", "v1.1.0", "master")
+moved = git("cactusbase", "commit-tree", "master^{tree}", "-p", "master", "-m", "After the tag")
+git("cactusbase", "update-ref", "refs/heads/master", moved)  # the branch head is no longer the tag
+want = {"carpetx": git("carpetx", "rev-parse", "v1.0.0^{commit}"),
+        "cactusbase": git("cactusbase", "rev-parse", "v1.1.0^{commit}"),
+        "spacetimex": git("spacetimex", "rev-parse", "master")}
+tagged_th = "!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n" + "".join(
+    f"\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {REPOS}/{r}.git\n!REPO_PATH = $2\n!CHECKOUT =\n{t}\n"
+    for r, t in [("carpetx", "CarpetX/Arith"), ("cactusbase", "CactusBase/IOUtil"), ("spacetimex", "SpacetimeX/NewRadX")])
+tagged = ('format = 1\n\n[stack]\nname = "tagged"\nthornlist = "tagged.th"\npin-tag = "v1.1.0"\n\n'
+          '[[stack.pin]]\nname = "carpetx"\ntag = "v1.0.0"\n')
+maxv.get("/new/stack")
+s, text, _ = maxv.post("/new/stack", {"definition": tagged, "thornlist": tagged_th, "version": "0.1.0"})
+check("cut a release pinned by tags", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+s, body, _ = anon.get("/api/v1/stacks/max/tagged/releases/0.1.0")
+got = {p["name"]: p.get("commit") for p in json.loads(body)["repo"]} if s == 200 else {}
+check("a repo's own tag pin wins over pin-tag", got.get("carpetx") == want["carpetx"], got)
+check("pin-tag pins a repo that has the tag", got.get("cactusbase") == want["cactusbase"], got)
+check("a repo without the tag follows its branch", got.get("spacetimex") == want["spacetimex"], got)
+maxv.get("/new/stack")
+s, text, _ = maxv.post("/new/stack", {"definition": tagged.replace('tag = "v1.0.0"', 'tag = "v9.9.9"').replace('"tagged"', '"tagged2"'), "thornlist": tagged_th, "version": "0.1.0"})
+check("a tag a [[stack.pin]] names must exist", s == 200 and "has no tag &#39;v9.9.9&#39;" in text, text[text.find("alert"):][:300])
 cut(alice, "alice-rel", "1.0.0")
 check("approve alice's new stack", decide("alice/alice-rel", "approve") == 303)
 page(anon, "/alice/alice-rel/1.0.0")

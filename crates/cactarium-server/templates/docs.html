@@ -58,21 +58,20 @@ note = "needs _Float16 (GCC 12 or newer)"</pre>
 [stack]
 name = "carpetx-mp-forks"
 owners = ["your-cactarium-name"]
-extends = ["einsteintoolkit/et@2026.5.0"]   # bases, highest priority first
+extends = ["et/et-stack@2026.5.0"]           # bases, highest priority first
 # thornlist = "extra.th"                     # a plain thornlist, or sections on top of the bases
 enable = ["CarpetX/TestReal4"]               # un-#DISABLE or keep a thorn
 disable = ["CarpetX/PDESolvers"]
+# pin-tag = "ET_2026_05_v0"                  # pin every repo that has this tag to it
 
 [[stack.override]]                           # redirect a repo of the bases
 repo = "CarpetX"
 package = "max-morris/carpetx@mixed-precision:^1"   # or url = "…" and ref = "branch"
 
-[[stack.pin]]                                # optional: fix a repo's commit in the definition
+[[stack.pin]]                                # optional: fix one repo in the definition
 name = "AsterX"
-url = "https://github.com/jaykalinani/AsterX.git"
-ref = "main"
-commit = "…40 hex digits…"</pre>
-<p>Each tag cuts a release: the Cactarium merges the sources, applies the overrides, resolves every branch to its current commit and freezes the result. It refuses thorn-name collisions (Cactus thorn names are global) and repos checked out from conflicting sources. Two unpinned forms exist for development: <code>owner/stack@head</code> puts each repo at the tip of the branch the stack names, and <code>owner/stack@master</code> puts every repo at the tip of its default branch, like <code>cactup install master</code>.</p>
+commit = "…40 hex digits…"                   # or tag = "v1.2", or sha256 = "…" for a download</pre>
+<p>Each tag cuts a release: the Cactarium merges the sources, applies the overrides, pins every repo and freezes the result. A repo is pinned by its own <code>[[stack.pin]]</code> if it has one (a tag named there must exist), else by a <code>!REPO_COMMIT</code> in the thornlist, else to the <code>pin-tag</code> if the repo has that tag, else to its base release's pin, else to the current head of the branch the thornlist names. Pinning by tag suits an Einstein Toolkit release, which tags each of its repos <code>ET_YYYY_MM_vN</code>; without pins, a release takes the branch heads at the moment the Cactarium reads its tag. It refuses thorn-name collisions (Cactus thorn names are global) and repos checked out from conflicting sources. Two unpinned forms exist for development: <code>owner/stack@head</code> puts each repo at the tip of the branch the stack names (repos the definition pins stay pinned), and <code>owner/stack@master</code> puts every repo at the tip of its default branch, like <code>cactup install master</code>.</p>
 
 <h2 id="finding">Finding things</h2>
 <p>Search matches names, summaries, thorns and implementations. A stack or a sim is found by the thorns it builds too: searching <code>CarpetX</code> among stacks lists the stacks whose newest release builds a CarpetX thorn, and each thorn's page lists the packages that provide it and the stacks and sims that build it. A package that declares <code>[[fork-of]]</code> appears on its upstream's page, with a side-by-side comparison of the two. Signed in, <em>Save</em> keeps an entry on your dashboard; the count of saves is public.</p>
