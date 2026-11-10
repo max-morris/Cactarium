@@ -238,6 +238,31 @@ if tok:
     bad = sim.replace('commit = "', 'commit = "zz', 1)
     s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=bad.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
     check("an invalid .sim is refused with a message", s == 400 and '"code":"bad-request"' in body, f"{s} {body[:200]}")
+    # An input that downloads an archive, unpacks it and fixes a path inside (sim format 2).
+    import hashlib, io, tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = b"eosfile = /path/to/gam2.polytrope\n"
+        info = tarfile.TarInfo("id/run.info")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    digest = hashlib.sha256(buf.getvalue()).hexdigest()
+    archive_input = ('\n[[input]]\nknob = "archive-data"\ndescription = "archive data"\n'
+                     'url = "https://example.org/id.tar.gz"\nsha256 = "' + digest + '"\nunpack = true\n'
+                     'path = "id/run.info"\n\n[[input.fixup]]\nfile = "id/run.info"\n'
+                     'replace = "/path/to/gam2.polytrope"\nwith = "{dir}/id/gam2.polytrope"\n')
+    v2 = sim.replace("format = 1", "format = 2", 1) + archive_input
+    auth = {"Authorization": f"Bearer {tok.group(1)}"}
+    s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=v2.encode(), headers=auth)
+    check("a sim with an unpacking input publishes", s == 200, f"{s} {body[:300]}")
+    n = json.loads(body)["slug"].rsplit("@", 1)[1] if s == 200 else "0"
+    text = page(anon, f"/max/qc0-demo/{n}?tab=inputs", contains="Downloads and unpacks")
+    check("the sim page shows what an import fetches and edits", "id/run.info" in text and digest in text and "/path/to/gam2.polytrope" in text)
+    for what, bad in [("unpack without a sha256", v2.replace('sha256 = "' + digest + '"\n', "")),
+                      ("a member path with ..", v2.replace('path = "id/run.info"', 'path = "../run.info"')),
+                      ("an unpacking input in a format-1 file", sim + archive_input)]:
+        s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=bad.encode(), headers=auth)
+        check(f"refused: {what}", s == 400, f"{s} {body[:200]}")
 
 # Yank and unyank.
 text = page(maxv, "/max/carpetx?tab=versions")

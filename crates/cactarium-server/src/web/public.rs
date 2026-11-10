@@ -901,20 +901,18 @@ async fn sim_page(
     let inputs = sim
         .inputs
         .iter()
-        .map(|i| {
-            (
-                i.knob.clone(),
-                i.description.clone().unwrap_or_default(),
-                i.url
-                    .as_deref()
-                    .map(|u| {
-                        format!(
-                            "{u}{}",
-                            i.sha256.as_deref().map(|s| format!(" · sha256 {s}")).unwrap_or_default()
-                        )
-                    })
-                    .unwrap_or_default(),
-            )
+        .map(|i| InputRow {
+            knob: i.knob.clone(),
+            description: i.description.clone().unwrap_or_default(),
+            url: i.url.clone().unwrap_or_default(),
+            sha256: i.sha256.clone().unwrap_or_default(),
+            unpack: i.unpack,
+            path: i.path.clone().unwrap_or_default(),
+            fixups: i
+                .fixups
+                .iter()
+                .map(|f| (f.file.clone(), f.replace.clone(), f.with.clone()))
+                .collect(),
         })
         .collect();
     let kind = match sim.parfile.kind {

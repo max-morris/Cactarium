@@ -93,6 +93,20 @@ pub struct VersionRow {
     pub pending: bool,
 }
 
+/// A sim input as its page shows it: what an import asks for or fetches.
+#[derive(Clone, Debug)]
+pub struct InputRow {
+    pub knob: String,
+    pub description: String,
+    pub url: String,
+    pub sha256: String,
+    pub unpack: bool,
+    /// The file in the unpacked archive the knob is set to (empty: the folder itself).
+    pub path: String,
+    /// (file, replace, with)
+    pub fixups: Vec<(String, String, String)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaimRow {
     pub kind: String,
@@ -286,7 +300,7 @@ pub struct SimPage {
     pub parfile_name: String,
     pub parfile: String,
     pub pins: Vec<PinRow>,
-    pub inputs: Vec<(String, String, String)>,
+    pub inputs: Vec<InputRow>,
     pub run: Vec<(String, String)>,
     pub provenance: Vec<(String, String)>,
     pub warnings: Vec<String>,

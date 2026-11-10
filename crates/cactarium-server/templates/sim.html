@@ -15,7 +15,17 @@
     {% else if tab == "pins" %}
       {% include "_pins.html" %}
     {% else if tab == "inputs" %}
-      {% for i in inputs %}<div class="card stack-sm"><span class="mono strong">{{ i.0 }}</span><span>{{ i.1 }}</span>{% if !i.2.is_empty() %}<span class="small muted mono">{{ i.2 }}</span>{% endif %}</div>{% else %}<p class="muted">This sim needs nothing from outside its sources.</p>{% endfor %}
+      {% for i in inputs %}<div class="card stack-sm">
+        <span class="mono strong">{{ i.knob }}</span>
+        {% if !i.description.is_empty() %}<span>{{ i.description }}</span>{% endif %}
+        {% if i.url.is_empty() %}<span class="small muted">cactup asks for a value on import (or <span class="mono">--input {{ i.knob }}=…</span>).</span>
+        {% else %}
+          <span class="small">{% if i.unpack %}Downloads and unpacks{% else %}Downloads{% endif %} <a class="mono" href="{{ i.url }}">{{ i.url }}</a></span>
+          {% if !i.sha256.is_empty() %}<span class="small muted mono">sha256 {{ i.sha256 }}</span>{% endif %}
+          {% if i.unpack %}<span class="small">The input is set to {% if i.path.is_empty() %}the unpacked folder{% else %}<span class="mono">{{ i.path }}</span> inside it{% endif %}.</span>{% endif %}
+          {% for f in i.fixups %}<span class="small">Then, in <span class="mono">{{ f.0 }}</span>, replaces <span class="mono">{{ f.1 }}</span> with <span class="mono">{{ f.2 }}</span> (<span class="mono">{dir}</span> is where it was unpacked).</span>{% endfor %}
+        {% endif %}
+      </div>{% else %}<p class="muted">This sim needs nothing from outside its sources.</p>{% endfor %}
     {% else if tab == "run" %}
       <div class="card stack-sm"><p class="muted small">Suggestions only: your flags and your machine decide.</p>
       {% for r in run %}<p><span class="muted">{{ r.0 }}</span> <span class="mono">{{ r.1 }}</span></p>{% else %}<p class="muted">No run hints.</p>{% endfor %}</div>

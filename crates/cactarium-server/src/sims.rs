@@ -107,6 +107,18 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
             found.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    // Not a problem, but what an import fetches and writes is worth a reviewer's look.
+    for i in sim.inputs.iter().filter(|i| i.unpack) {
+        warnings.push(format!(
+            "input {} downloads and unpacks {}{}",
+            i.knob,
+            i.url.as_deref().unwrap_or("?"),
+            match i.fixups.len() {
+                0 => String::new(),
+                n => format!(", then edits {n} line(s) in it"),
+            }
+        ));
+    }
     if sim.sim.license.is_none() {
         warnings
             .push("no license: others can view it but may not know whether they can reuse it".into());
@@ -325,6 +337,9 @@ commit = "{SHA}"
             description: None,
             url: None,
             sha256: None,
+            unpack: false,
+            path: None,
+            fixups: vec![],
         });
         let c = check(parsed.to_toml().unwrap().as_bytes()).unwrap();
         let w = c.index.warnings.join("\n");
