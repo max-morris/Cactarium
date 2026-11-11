@@ -1,7 +1,10 @@
 # The Cactarium. `just` lists the recipes.
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-compose := "docker compose --project-directory deploy -f deploy/compose.yaml"
+# Docker as you are allowed to run it: directly when you can reach the daemon (the docker group,
+# rootless Docker), else through sudo. Nothing here changes your groups.
+docker := if `docker info >/dev/null 2>&1 && echo direct || echo sudo` == "direct" { "docker" } else { "sudo docker" }
+compose := docker + " compose --project-directory deploy -f deploy/compose.yaml"
 devc := compose + " -f deploy/compose.dev.yaml"
 
 default:
@@ -36,7 +39,7 @@ status:
 down:
     {{compose}} down
 
-# Production, once per VM: deploy/.env, docker group, Apache proxy
+# Production, once per VM: deploy/.env and the Apache proxy
 setup:
     sh deploy/setup.sh
 

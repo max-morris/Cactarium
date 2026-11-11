@@ -53,7 +53,8 @@ with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 The whole sequence, rehearsed end to end against the real repos (curating takes about a minute):
 
 1. On the VM, clone this repo and run `just setup`: it writes `deploy/.env` (with a generated database
-   password), adds you to the docker group and points the Apache virtual host at the app. Then edit
+   password) and points the Apache virtual host at the app. The recipes run Docker through `sudo`
+   unless you can already reach the daemon; nothing changes your groups. Then edit
    `deploy/.env`: `CACTARIUM_BASE_URL`, `CACTARIUM_SUPERADMIN`, the GitHub OAuth app (callback
    `<base>/auth/github/callback`) and optionally ORCID's, and `SSH_FROM`. Never set
    `CACTARIUM_DEV_LOGIN` there.

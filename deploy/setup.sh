@@ -4,7 +4,6 @@
 #
 # - deploy/.env from .env.example, with a generated database password and CACTARIUM_BASE_URL
 #   from this machine's name (edit both, and fill in the OAuth apps, before `just up`).
-# - Docker access for you (the docker group).
 # - `sh setup.sh apache` (also run by `just setup` when apache2 is active): points the virtual
 #   host that serves https://DOMAIN/ at the app on 127.0.0.1:PORT. It writes the proxy settings to
 #   a file of their own, adds one Include line to that virtual host, keeps a copy of the file it
@@ -175,12 +174,6 @@ if [ ! -f .env ]; then
 fi
 if [ -z "$(get POSTGRES_PASSWORD)" ]; then
     put POSTGRES_PASSWORD "$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)"
-fi
-
-# Docker access.
-if ! id -nG "$user" | tr ' ' '\n' | grep -qx docker; then
-    $sudo usermod -aG docker "$user"
-    echo "setup: added $user to the docker group; log out and back in before 'just up'"
 fi
 
 front=ok
