@@ -713,8 +713,8 @@ pub async fn package_tip_commit(state: &AppState, entry: &Entry) -> AppResult<St
     git::resolve_ref(policy(state), &repo.url, None).await.map_err(AppError::bad)
 }
 
-/// Reads a package at `commit` (its default branch's tip) the way a release is read: the manifest
-/// (the curated one, for a curated package) and the thorns there.
+/// Reads a package at `commit` (its default branch's tip, or a commit someone named) the way a
+/// release is read: the manifest (the curated one, for a curated package) and the thorns there.
 pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppResult<PackageTip> {
     if entry.kind != "package" {
         return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
@@ -729,7 +729,7 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppRe
     let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
     let p = prepare(state, entry, &repo, &co, &r, &tv)
         .await
-        .map_err(|e| AppError::bad(format!("{}'s default branch: {e}", entry.slug())))?;
+        .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
     Ok(PackageTip {
         commit: commit.to_owned(),
         tree: co.tree.clone(),

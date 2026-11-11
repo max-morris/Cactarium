@@ -10,7 +10,7 @@
   <tbody>
     <tr><td><code>api-generation</code></td><td>On every response under <code>/api/v1</code>; currently <code>1</code>. A client that sees a generation it doesn't know should ask its user to upgrade rather than guess.</td></tr>
     <tr><td><code>x-cactarium-unpinned</code></td><td><code>true</code> on every <code>@head</code> or <code>@master</code> response: the body is not a release and its repos are not all pinned.</td></tr>
-    <tr><td><code>x-cactarium-untrusted</code></td><td>On every <code>@head</code> or <code>@master</code> response: <code>true</code> when the entry isn't trusted (neither it nor its owner), whose branch tips nobody reviewed, else <code>false</code>. Releases don't carry it.</td></tr>
+    <tr><td><code>x-cactarium-untrusted</code></td><td>On every <code>@head</code> or <code>@master</code> response, and on a package read at a commit no version froze: <code>true</code> when the entry isn't trusted (neither it nor its owner), whose branch tips nobody reviewed, else <code>false</code>. Releases don't carry it.</td></tr>
     <tr><td><code>x-cactarium-contact</code></td><td>On every stack release response, <code>@head</code> and <code>@master</code> included: where to go for help with the stack, its declared <code>contact</code>, else its repo. Empty when it has neither.</td></tr>
     <tr><td><code>x-sha256</code></td><td>On a sim download: the file's sha256, in hex.</td></tr>
   </tbody>
@@ -51,7 +51,8 @@
 <h3 id="package-versions"><code>GET /packages/{owner}/{name}/versions</code></h3>
 <p>Every published version of a package, newest first within each track, yanked and invalid ones included and marked. Response: <code>PackageVersions</code>, whose <code>versions</code> are <code>PackageVersion</code>s: the <code>VersionInfo</code> fields, the repo <code>url</code>, the <code>thorns</code> (<code>ThornInfo</code>: <code>arrangement</code>, <code>thorn</code>, the <a href="/docs/packages#repo-path"><code>repo-path</code></a> to write in a thornlist, and the CCL <code>facts</code>) and the <code>claims</code> (<code>ClaimInfo</code>: <code>kind</code>, <code>target</code>, <code>range</code>, <code>note</code>).</p>
 
-<h3 id="package-tip"><code>GET /packages/{owner}/{name}/versions/{head|master}</code></h3>
+<h3 id="package-tip"><code>GET /packages/{owner}/{name}/versions/{head|master|commit}</code></h3>
+<p>With a full commit id in place of <code>head</code>/<code>master</code>: the version frozen at that commit if there is one (a normal <code>PackageVersion</code>), else the package read at that commit, its <code>version</code> the commit id, with <code>x-cactarium-untrusted</code> and the same trust rule as tips (see <a href="/docs/versions#commits">commits</a>). <code>/resolve?req=owner/pkg@&lt;commit&gt;</code> answers the same way.</p>
 <p>The package at its default branch's tip, read now, in the shape of one <code>PackageVersion</code> whose <code>version</code> is <code>head</code> or <code>master</code> (the two mean the same for a package). Carries <code>x-cactarium-unpinned</code> and <code>x-cactarium-untrusted</code>. For an untrusted package it answers 403 unless the site allows untrusted branch tips. Limited to 12 requests a minute.</p>
 
 <h3 id="stack-releases"><code>GET /stacks/{owner}/{name}/releases</code></h3>

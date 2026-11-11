@@ -117,42 +117,52 @@ pub async fn package_versions(
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
     let mut versions = Vec::new();
     for v in model::versions(&state, e.id).await? {
-        let thorns: Vec<(String, String, String, serde_json::Value)> =
-            sqlx::query_as("SELECT arrangement, name, dir, facts FROM thorns WHERE version_id = $1 ORDER BY arrangement, name")
-                .bind(v.id)
-                .fetch_all(&state.db)
-                .await
-                .map_err(AppError::from)?;
-        let claims: Vec<(String, String, String, Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1 ORDER BY kind")
-                .bind(v.id)
-                .fetch_all(&state.db)
-                .await
-                .map_err(AppError::from)?;
-        versions.push(PackageVersion {
-            version: version_info(&v),
-            url: url.clone(),
-            thorns: thorns
-                .into_iter()
-                .map(|(arrangement, thorn, dir, facts)| ThornInfo {
-                    repo_path: crl_repo_path(&arrangement, &thorn, &dir),
-                    arrangement,
-                    thorn,
-                    facts: serde_json::from_value::<ThornFacts>(facts).unwrap_or_default(),
-                })
-                .collect(),
-            claims: claims
-                .into_iter()
-                .map(|(kind, o, n, range, note)| ClaimInfo {
-                    kind,
-                    target: format!("{o}/{n}"),
-                    range,
-                    note,
-                })
-                .collect(),
-        });
+        versions.push(version_body(&state, &v, &url).await?);
     }
     Ok(Json(PackageVersions { slug: e.slug(), versions }))
+}
+
+/// One published package version, with its thorns and claims.
+async fn version_body(state: &AppState, v: &Version, url: &str) -> ApiResult<PackageVersion> {
+    let thorns: Vec<(String, String, String, serde_json::Value)> =
+        sqlx::query_as("SELECT arrangement, name, dir, facts FROM thorns WHERE version_id = $1 ORDER BY arrangement, name")
+            .bind(v.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(AppError::from)?;
+    let claims: Vec<(String, String, String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1 ORDER BY kind")
+            .bind(v.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(AppError::from)?;
+    Ok(PackageVersion {
+        version: version_info(v),
+        url: url.to_owned(),
+        thorns: thorns
+            .into_iter()
+            .map(|(arrangement, thorn, dir, facts)| ThornInfo {
+                repo_path: crl_repo_path(&arrangement, &thorn, &dir),
+                arrangement,
+                thorn,
+                facts: serde_json::from_value::<ThornFacts>(facts).unwrap_or_default(),
+            })
+            .collect(),
+        claims: claims
+            .into_iter()
+            .map(|(kind, o, n, range, note)| ClaimInfo { kind, target: format!("{o}/{n}"), range, note })
+            .collect(),
+    })
+}
+
+/// The published, valid version of `e` frozen at exactly `commit`, if any: naming that commit is
+/// naming that version.
+async fn version_at_commit(state: &AppState, e: &Entry, commit: &str) -> ApiResult<Option<Version>> {
+    Ok(model::versions(state, e.id)
+        .await?
+        .into_iter()
+        .filter(|v| v.commit.as_deref() == Some(commit) && v.state != "invalid")
+        .max_by(|a, b| a.sort_key.cmp(&b.sort_key)))
 }
 
 #[derive(Deserialize)]
@@ -176,8 +186,8 @@ pub async fn resolve(
             .into());
         }
         let label = tip_label(tip);
-        let trusted = tip_trusted(&state, &e, label).await?;
-        let t = package_tip_cached(&state, &e, ip).await?;
+        let trusted = unreviewed_allowed(&state, &e, label, Unreviewed::Tip).await?;
+        let t = package_snapshot(&state, &e, ip, None).await?;
         let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
         let contact = model::entry_contact(&state, &e, url.as_deref()).await?;
         let body = Resolved {
@@ -188,6 +198,36 @@ pub async fn resolve(
             version: tip_version_info(&e, label, &t),
         };
         return Ok((tip_headers(trusted), Json(body)).into_response());
+    }
+    if let Some(commit) = slug.commit() {
+        if e.kind != "package" {
+            return Err(AppError::bad("only a package can be named by commit; name a stack or sim by its version").into());
+        }
+        // A commit some version froze is that version; any other is the package as it is there.
+        if let Some(v) = version_at_commit(&state, &e, commit).await? {
+            let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
+            let contact = model::manifest_contact(v.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page));
+            return Ok(Json(Resolved {
+                slug: format!("{}@{}", e.slug(), v.label()),
+                kind: e.kind.clone(),
+                url,
+                contact,
+                version: version_info(&v),
+            })
+            .into_response());
+        }
+        let trusted = unreviewed_allowed(&state, &e, commit, Unreviewed::Commit).await?;
+        let t = package_snapshot(&state, &e, ip, Some(commit)).await?;
+        let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
+        let contact = model::entry_contact(&state, &e, url.as_deref()).await?;
+        let body = Resolved {
+            slug: format!("{}@{commit}", e.slug()),
+            kind: e.kind.clone(),
+            url,
+            contact,
+            version: tip_version_info(&e, commit, &t),
+        };
+        return Ok(([untrusted_header(trusted)], Json(body)).into_response());
     }
     let versions = model::versions(&state, e.id).await?;
     // Packages, stacks and sims alike: a semver range (`@1` is 1.x.x), or an exact `=X.Y.Z`.
@@ -224,24 +264,30 @@ pub async fn resolve(
     .into_response())
 }
 
-/// `GET /packages/{owner}/{name}/versions/{head|master}`: the package at its default branch's tip,
-/// read now, in the shape of one released version.
+/// `GET /packages/{owner}/{name}/versions/{head|master|<commit>}`: the package at its default
+/// branch's tip, or at one full commit id, read now, in the shape of one released version. A
+/// commit some version froze answers with that version.
 pub async fn package_tip(
     State(state): State<AppState>,
     ip: ClientIp,
     Path((owner, name, tip)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
-    let label = match tip.as_str() {
-        "head" => "head",
-        "master" => "master",
-        _ => return Err(AppError::NotFound.into()),
-    };
+    let commit = cactup_ecosystem_common::slug::is_commit_id(&tip).then_some(tip.as_str());
+    if commit.is_none() && tip != "head" && tip != "master" {
+        return Err(AppError::NotFound.into());
+    }
     let e = public_entry(&state, &owner, &name, Some("package")).await?;
-    let trusted = tip_trusted(&state, &e, label).await?;
-    let t = package_tip_cached(&state, &e, ip).await?;
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
+    if let Some(c) = commit
+        && let Some(v) = version_at_commit(&state, &e, c).await?
+    {
+        return Ok(Json(version_body(&state, &v, &url).await?).into_response());
+    }
+    let kind = if commit.is_some() { Unreviewed::Commit } else { Unreviewed::Tip };
+    let trusted = unreviewed_allowed(&state, &e, &tip, kind).await?;
+    let t = package_snapshot(&state, &e, ip, commit).await?;
     let body = PackageVersion {
-        version: tip_version_info(&e, label, &t),
+        version: tip_version_info(&e, &tip, &t),
         url,
         thorns: t
             .thorns
@@ -264,7 +310,10 @@ pub async fn package_tip(
             })
             .collect(),
     };
-    Ok((tip_headers(trusted), Json(body)).into_response())
+    Ok(match commit {
+        Some(_) => ([untrusted_header(trusted)], Json(body)).into_response(),
+        None => (tip_headers(trusted), Json(body)).into_response(),
+    })
 }
 
 /// The `!REPO_PATH` a thornlist section cloning the package's repo writes for thorn `arr/name`
@@ -292,9 +341,17 @@ fn tip_label(tip: Tip) -> &'static str {
     }
 }
 
-/// Whether `@head`/`@master` of `e` may be served: always for a trusted entry (the entry or its
-/// owner); for others, only when the site allows untrusted tips. Returns whether it is trusted.
-async fn tip_trusted(state: &AppState, e: &Entry, label: &str) -> ApiResult<bool> {
+/// What unreviewed code a request names: a branch tip, or a commit no version froze.
+#[derive(Clone, Copy, PartialEq)]
+enum Unreviewed {
+    Tip,
+    Commit,
+}
+
+/// Whether unreviewed code of `e` (`@head`/`@master`, or a package commit no version names) may be
+/// served: always for a trusted entry (the entry or its owner); for others, only when the site
+/// allows untrusted artifacts. Returns whether it is trusted.
+async fn unreviewed_allowed(state: &AppState, e: &Entry, at: &str, kind: Unreviewed) -> ApiResult<bool> {
     let trusted = crate::publish::entry_trusted(state, e).await?;
     if !trusted && !crate::site::untrusted_tips_allowed(state).await? {
         let what = if e.kind == "stack" {
@@ -302,14 +359,25 @@ async fn tip_trusted(state: &AppState, e: &Entry, label: &str) -> ApiResult<bool
         } else {
             "Add a release instead (owner/pkg@X.Y.Z or a range)."
         };
+        let never = match kind {
+            Unreviewed::Tip => "its branch tips are never reviewed",
+            Unreviewed::Commit => "no published version is at that commit, so it was never reviewed",
+        };
         return Err(AppError::Denied(format!(
-            "{}@{label} is not served: the {} isn't trusted, and its branch tips are never reviewed. {what}",
+            "{}@{at} is not served: the {} isn't trusted, and {never}. {what}",
             e.slug(),
             e.kind
         ))
         .into());
     }
     Ok(trusted)
+}
+
+fn untrusted_header(trusted: bool) -> (header::HeaderName, header::HeaderValue) {
+    (
+        header::HeaderName::from_static(UNTRUSTED_HEADER),
+        header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
+    )
 }
 
 fn tip_headers(trusted: bool) -> [(header::HeaderName, header::HeaderValue); 2] {
@@ -322,15 +390,20 @@ fn tip_headers(trusted: bool) -> [(header::HeaderName, header::HeaderValue); 2] 
     ]
 }
 
-/// The package read at its default branch's current commit, cached by commit.
-async fn package_tip_cached(
+/// The package read at `commit`, else at its default branch's current commit; cached by commit.
+async fn package_snapshot(
     state: &AppState,
     e: &Entry,
     ip: ClientIp,
+    commit: Option<&str>,
 ) -> ApiResult<std::sync::Arc<tracker::PackageTip>> {
-    // Resolving a tip reads the remote repo; keep anonymous callers from turning that into a flood.
+    // Reading a package outside its versions fetches the remote repo; keep anonymous callers from
+    // turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
-    let commit = tracker::package_tip_commit(state, e).await?;
+    let commit = match commit {
+        Some(c) => c.to_owned(),
+        None => tracker::package_tip_commit(state, e).await?,
+    };
     let key = (e.id, commit.clone());
     if let Some(t) = state.package_tips.lock().expect("package tips lock").get(&key) {
         return Ok(t.clone());
@@ -393,7 +466,7 @@ pub async fn stack_release(
     };
     // A tip is whatever the branches hold now and never passes review: only a trusted stack's is
     // served freely. Otherwise the site setting refuses it, or serves it marked untrusted.
-    let trusted = tip_trusted(&state, &e, &version).await?;
+    let trusted = unreviewed_allowed(&state, &e, &version, Unreviewed::Tip).await?;
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
     let (definition, own) = current_definition(&state, &e).await?;

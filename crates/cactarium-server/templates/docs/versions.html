@@ -28,6 +28,7 @@
     <tr><td><code>owner/pkg@&gt;=1.2, &lt;2</code></td><td>the newest version in that interval</td></tr>
     <tr><td><code>owner/pkg@mixed-precision:1.2</code></td><td>the newest 1.2.x on track <code>mixed-precision</code></td></tr>
     <tr><td><code>owner/pkg@mixed-precision</code></td><td>the newest version on track <code>mixed-precision</code></td></tr>
+    <tr><td><code>owner/pkg@7b3a6b19…</code> (a full commit id)</td><td>the package at that commit (packages only; see <a href="#commits">commits</a>)</td></tr>
   </tbody>
 </table></div>
 <p>With date-like versions such as the Einstein Toolkit's: <code>et/carpetx-stack@2026.5.0</code> is that release, <code>@2026.5</code> the newest 2026.5.N (that release line's updates), and <code>@2026</code> the newest release of 2026.</p>
@@ -56,6 +57,10 @@ since = "2026.5.0"</pre>
 <pre class="code">just cli yank &lt;username&gt; &lt;owner/name&gt; &lt;version&gt; --reason "breaks the build with GCC 14"
 just cli unyank &lt;username&gt; &lt;owner/name&gt; &lt;version&gt;</pre>
 <p>Only the site's operator, who has a shell on the server, can run these.</p>
+
+<h2 id="commits">A package at a commit</h2>
+<p>A package can also be named by a full commit id, 40 hexadecimal digits (64 for a SHA-256 repo): <code>owner/pkg@7b3a6b19bb6278d7ae9205bce817042c253a9591</code>, or one thorn of it, <code>owner/pkg/Thorn@…</code>. Abbreviated ids aren't accepted: the Cactarium would have to fetch the repo's whole history to resolve one, and a short hex string can read as a track name or a version.</p>
+<p>If a published version was frozen at exactly that commit, the reference simply names that version, and it is served like any version. Any other commit is read as the package is there, thorns and manifest, like a tip but pinned. Nobody reviewed it, so the same rule as for tips applies: a trusted package (the entry or its owner) is served; for others the site's setting decides, refusing such commits or serving them marked untrusted so CactUp warns and asks first.</p>
 
 <h2 id="tips">@head and @master</h2>
 <p>A stack's <code>@head</code> and <code>@master</code> are described under <a href="/docs/stacks#tips">Stacks</a>. A package has them too: <code>owner/pkg@head</code> and <code>owner/pkg@master</code> both mean the package at the tip of its default branch, read when asked. The API returns that commit, with the thorns and claims found there. They follow the stacks' rule: served for a trusted package, and for others only when the site allows untrusted branch tips. Neither is ever a version, and neither is reviewed.</p>

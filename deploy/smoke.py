@@ -679,6 +679,31 @@ check("an untrusted package's @head is refused by default", s == 403 and "isn't 
 s, _, _ = anon.get("/api/v1/packages/max/carpetx/versions/tip")
 check("only head and master are tips", s == 404, s)
 
+# A package at one full commit id: a commit a version froze is that version; any other commit is
+# the package as it is there, which an untrusted package serves only if the site allows it.
+v110 = git("carpetx", "rev-parse", "v1.1.0^{commit}")
+s, body, _ = anon.get(f"/api/v1/resolve?req=max/carpetx@{v110}")
+check("a commit a version froze resolves as that version", s == 200 and json.loads(body)["slug"] == "max/carpetx@1.1.0", body[:200])
+# A commit no version froze, on a branch of its own.
+unrel = git("carpetx", "commit-tree", "master^{tree}", "-p", "master", "-m", "Unreleased")
+git("carpetx", "update-ref", "refs/heads/unreleased", unrel)
+s, body, hdrs = anon.get(f"/api/v1/resolve?req=max/carpetx@{unrel}")
+check("another commit of a trusted package is the package at that commit",
+      s == 200 and json.loads(body)["slug"] == f"max/carpetx@{unrel}" and f'"commit":"{unrel}"' in body
+      and hdrs.get("x-cactarium-untrusted") == "false" and "x-cactarium-unpinned" not in hdrs, f"{s} {body[:200]} {hdrs}")
+s, body, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{unrel}")
+check("versions/<commit> gives its thorns", s == 200 and '"thorn":"Arith"' in body and f'"version":"{unrel}"' in body, f"{s} {body[:200]}")
+fv = git("fakelib-moved", "rev-parse", "XT_2026_05_v0^{commit}")
+fold = git("fakelib-moved", "rev-parse", "XT_2025_11_v0^{commit}")
+s, body, _ = anon.get(f"/api/v1/resolve?req=et/fakelib@{fv}")
+check("an untrusted package's version commit is still served, as the version", s == 200 and json.loads(body)["slug"] == "et/fakelib@2026.5.0", body[:200])
+s, body, _ = anon.get(f"/api/v1/packages/et/fakelib/versions/{fv}")
+check("versions/<that commit> is the version", s == 200 and '"version":"2026.5.0"' in body, f"{s} {body[:200]}")
+s, body, _ = anon.get(f"/api/v1/resolve?req=et/fakelib@{fold}")
+check("an untrusted package at a commit no version froze is refused by default", s == 403 and "no published version is at that commit" in body, f"{s} {body[:200]}")
+s, _, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{head[:7]}")
+check("an abbreviated commit is not a commit", s == 404, s)
+
 print()
 if FAILED:
     print(f"{len(FAILED)} failed")

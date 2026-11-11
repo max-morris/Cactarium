@@ -15,8 +15,8 @@
     </form>
   </section>
   <section class="card stack-sm">
-    <h2 class="h-small">Branch tips of untrusted stacks</h2>
-    <p class="muted small"><span class="mono">@head</span> and <span class="mono">@master</span> install whatever a stack's branches hold now, which is never reviewed. A trusted stack (the entry or its owner) always serves them. For the rest:</p>
+    <h2 class="h-small">Unreviewed code of untrusted packages and stacks</h2>
+    <p class="muted small">Some references name code nobody reviewed: <span class="mono">@head</span> and <span class="mono">@master</span> of a stack or package (whatever its branches hold now), and a package at a commit no published version froze (<span class="mono">owner/pkg@&lt;commit&gt;</span>). A trusted entry (the entry or its owner) always serves them, and a commit a version froze is simply that version. For the rest:</p>
     <form method="post" action="/admin/site" class="stack-sm">
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
       <label class="row-wrap"><input type="radio" name="untrusted_tips" value="refuse" {% if untrusted_tips != "allow" %}checked{% endif %}> Refuse: don't serve them at all</label>
