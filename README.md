@@ -47,3 +47,27 @@ Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register`, `publish-sim`, `sync`, `token`. Create the `et` organization
 with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
+
+### First deploy
+
+The whole sequence, rehearsed end to end against the real repos (curating takes about a minute):
+
+1. On the VM, clone this repo and run `just setup`: it writes `deploy/.env` (with a generated database
+   password), adds you to the docker group and points the Apache virtual host at the app. Then edit
+   `deploy/.env`: `CACTARIUM_BASE_URL`, `CACTARIUM_SUPERADMIN`, the GitHub OAuth app (callback
+   `<base>/auth/github/callback`) and optionally ORCID's, and `SSH_FROM`. Never set
+   `CACTARIUM_DEV_LOGIN` there.
+2. `just up`, then `just firewall` from an SSH session that comes through the bastion.
+3. Sign in on the site with GitHub. The account named in `CACTARIUM_SUPERADMIN` is the superadmin;
+   signing in creates your user.
+4. The `et` organization, trusted so its releases skip review:
+   `just cli org create et <you> --display-name "Einstein Toolkit"`, then `just cli admin trust et`.
+5. The curated packages: clone [cactarium-curate](https://github.com/max-morris/cactarium-curate) and
+   run `just curate <you> <path>/cactarium-curate/curate.toml`.
+6. The official stacks, carpetx-stack before cottonmouth-stack (which extends it):
+   `just cli register --owner et <you> https://github.com/max-morris/<stack>` for `et-stack`,
+   `carpet-stack`, `carpetx-stack` and `cottonmouth-stack`.
+7. The starter sim: create a token on the site's Settings page, `cactup login --token <token>`, then,
+   in cactarium-curate, `cactup sim publish sims/wavetoy.sim et/wavetoy`. CactUp talks to
+   `https://cactarium.cct.lsu.edu` unless `CACTARIUM_URL` or the `cactarium-url` knob says otherwise.
+8. Check it from a CactUp: `cactup install et/carpet-stack@2026.5.0` and `cactup import et/wavetoy --run`.
