@@ -11,6 +11,19 @@ pub async fn audit(
     details: serde_json::Value,
     ip: Option<std::net::IpAddr>,
 ) -> AppResult<()> {
+    let mut conn = state.db.acquire().await?;
+    audit_with(&mut conn, actor, action, target, details, ip).await
+}
+
+/// [`audit`] on a given connection: inside a transaction, the entry lands with what it records.
+pub async fn audit_with(
+    db: &mut sqlx::PgConnection,
+    actor: Option<i64>,
+    action: &str,
+    target: Option<&str>,
+    details: serde_json::Value,
+    ip: Option<std::net::IpAddr>,
+) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO audit_log (actor, action, target, details, ip) VALUES ($1, $2, $3, $4, $5)",
     )
@@ -19,7 +32,7 @@ pub async fn audit(
     .bind(target)
     .bind(details)
     .bind(ip.map(|i| i.to_string()))
-    .execute(&state.db)
+    .execute(&mut *db)
     .await?;
     Ok(())
 }

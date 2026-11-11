@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::audit::audit;
 use crate::auth::User;
 use crate::error::{AppError, AppResult};
 use crate::model::{self, Entry, semver_sort_key};
@@ -246,6 +245,7 @@ pub async fn publish(
         )));
     }
     let review = publish::release_review(state, &entry, Some(user)).await?;
+    let mut tx = state.db.begin().await?;
     let vid: i64 = sqlx::query_scalar(
         "INSERT INTO versions (entry_id, track, version, sort_key, published_by, review) VALUES ($1, '', $2, $3, $4, $5) RETURNING id",
     )
@@ -254,12 +254,12 @@ pub async fn publish(
     .bind(semver_sort_key(&v))
     .bind(user.id)
     .bind(review)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
-    let sha = store_version(state, &entry, vid, &label, review, Checked { sim, index }, None).await?;
-    publish::submit_release(state, &entry, vid, review, Some(user)).await?;
-    audit(
-        state,
+    let sha = store_version(&mut tx, &entry, vid, &label, review, Checked { sim, index }, None).await?;
+    publish::submit_release(&mut tx, &entry, vid, review, Some(user)).await?;
+    crate::audit::audit_with(
+        &mut tx,
         Some(user.id),
         "sim.publish",
         Some(&entry.slug()),
@@ -267,6 +267,7 @@ pub async fn publish(
         None,
     )
     .await?;
+    tx.commit().await?;
     Ok((entry, label, review))
 }
 
@@ -274,7 +275,7 @@ pub async fn publish(
 /// keeps the file, its pins and the thorns it builds. For a sim published from its repo,
 /// `description` is the manifest's, which wins over the file's. Returns the stored file's sha256.
 pub async fn store_version(
-    state: &AppState,
+    db: &mut sqlx::PgConnection,
     entry: &Entry,
     vid: i64,
     label: &str,
@@ -286,7 +287,7 @@ pub async fn store_version(
     sim.sim.cactarium = Some(format!("{}@{label}", entry.slug()).parse().map_err(AppError::bad)?);
     let stored = sim.to_toml().map_err(AppError::bad)?;
     let sha = hex::encode(Sha256::digest(stored.as_bytes()));
-    let mut tx = state.db.begin().await?;
+    let mut tx = sqlx::Connection::begin(&mut *db).await?;
     sqlx::query("INSERT INTO sim_files (version_id, sha256, content, index) VALUES ($1, $2, $3, $4)")
         .bind(vid)
         .bind(&sha)
@@ -303,9 +304,9 @@ pub async fn store_version(
             .execute(&mut *tx)
             .await?;
     }
+    tracker::store_pins(&mut tx, vid, &sim.repos).await?;
+    tracker::store_built_thorns(&mut tx, vid, &sim.thornlist.text).await?;
     tx.commit().await?;
-    tracker::store_pins(state, vid, &sim.repos).await?;
-    tracker::store_built_thorns(state, vid, &sim.thornlist.text).await?;
     Ok(sha)
 }
 

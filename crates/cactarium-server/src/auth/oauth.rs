@@ -486,6 +486,9 @@ async fn insert_identity(state: &AppState, user_id: i64, id: &Identity) -> AppRe
 
 async fn create_user(state: &AppState, name: &str, id: &Identity) -> AppResult<i64> {
     let mut tx = state.db.begin().await?;
+    if crate::web::orgs::name_taken_locked(&mut tx, name, "orgs").await? {
+        return Err(AppError::Conflict(format!("'{name}' is taken")));
+    }
     let uid: i64 =
         sqlx::query_scalar("INSERT INTO users (username, display_name) VALUES ($1, $2) RETURNING id")
             .bind(name)

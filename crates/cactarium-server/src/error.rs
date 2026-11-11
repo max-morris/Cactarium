@@ -25,12 +25,22 @@ pub enum AppError {
     Conflict(String),
     #[error("too many requests; try again in a minute")]
     TooManyRequests,
+    /// Something we depend on (an author's repo host) failed; the message is shown, so keep it
+    /// generic and log the details.
+    #[error("{0}")]
+    Upstream(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
 
 impl From<sqlx::Error> for AppError {
     fn from(e: sqlx::Error) -> Self {
+        // A check-then-insert that lost a race with an identical request: the constraint caught it.
+        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+            return AppError::Conflict(
+                "that already exists (perhaps a moment ago, from another request); reload and check".into(),
+            );
+        }
         AppError::Internal(e.into())
     }
 }
@@ -48,6 +58,7 @@ impl AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -127,6 +138,7 @@ impl IntoResponse for ApiError {
             AppError::BadRequest(_) => "bad-request",
             AppError::Conflict(_) => "conflict",
             AppError::TooManyRequests => "rate-limited",
+            AppError::Upstream(_) => "upstream",
             AppError::Internal(_) => "internal",
         };
         let body =

@@ -32,6 +32,10 @@ services:
     ports:
       # Never 0.0.0.0: Docker's published ports bypass the host firewall.
       - "${BIND:-127.0.0.1}:${PORT:-8000}:8000"
+    volumes:
+      # A cache (history-only copies of authors' repos): kept across updates so they needn't be
+      # cloned again, but safe to delete.
+      - mirrors:/var/lib/cactarium/mirrors
     depends_on:
       db:
         condition: service_healthy
@@ -47,3 +51,4 @@ networks:
 
 volumes:
   db-data: {}
+  mirrors: {}

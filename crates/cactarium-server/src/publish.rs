@@ -107,7 +107,7 @@ pub async fn release_review(
 
 /// Queues a new release stored as `pending` for review; does nothing for an approved one.
 pub async fn submit_release(
-    state: &AppState,
+    db: &mut sqlx::PgConnection,
     entry: &Entry,
     version_id: i64,
     review: &str,
@@ -122,10 +122,10 @@ pub async fn submit_release(
     .bind(entry.id)
     .bind(version_id)
     .bind(actor.map(|u| u.id))
-    .execute(&state.db)
+    .execute(&mut *db)
     .await?;
-    audit(
-        state,
+    crate::audit::audit_with(
+        db,
         actor.map(|u| u.id),
         "release.submit",
         Some(&entry.slug()),

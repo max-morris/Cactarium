@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod curate;
 mod error;
+mod flights;
 mod git;
 mod markdown;
 mod model;
@@ -452,8 +453,10 @@ fn make_state(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<AppState> {
             .user_agent("cactarium")
             .build()?,
         limiter: Arc::new(security::RateLimiter::default()),
-        definitions: Arc::default(),
-        package_tips: Arc::default(),
+        definitions: Arc::new(flights::Flights::new(None, 512)),
+        package_tips: Arc::new(flights::Flights::new(None, 512)),
+        // Branch tips move; a stack's resolved tips are reused only briefly.
+        stack_tips: Arc::new(flights::Flights::new(Some(Duration::from_secs(30)), 256)),
         cfg: Arc::new(cfg),
     })
 }
@@ -480,7 +483,17 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
     if let Err(e) = tracker::backfill_built_thorns(&state).await {
         tracing::warn!("backfilling the thorn index failed: {e}");
     }
-    tokio::spawn(tracker::poll_forever(state.clone()));
+    // The poller is restarted if it ever panics, rather than polling silently stopping.
+    let poller = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(tracker::poll_forever(poller.clone())).await {
+                Err(e) if e.is_panic() => tracing::error!("the poller panicked; restarting it in a minute"),
+                _ => tracing::error!("the poller stopped; restarting it in a minute"),
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
     let sweeper = state.clone();
     tokio::spawn(async move {
         loop {
@@ -496,9 +509,29 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
         .with_context(|| format!("cannot listen on {bind}"))?;
     tracing::info!("listening on {bind}, serving {}", state.cfg.base_url);
     axum::serve(listener, web::router(state).into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM: what `docker stop` sends. As PID 1 in its container, the server gets no
+/// default handling of SIGTERM, so without this every stop would wait out the grace period and
+/// end in SIGKILL.
+async fn shutdown_signal() {
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
+    tracing::info!("shutting down");
 }

@@ -603,6 +603,8 @@ pub struct SubRow {
 #[derive(Clone, Debug)]
 pub struct ReviewView {
     pub id: i64,
+    /// The newest version id the reviewer is shown: approving a new entry publishes only up to it.
+    pub seen: i64,
     /// The release under review (`1.2.0`), or empty for a new entry.
     pub release: String,
     pub entry_trusted: bool,

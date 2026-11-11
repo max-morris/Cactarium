@@ -455,6 +455,10 @@ async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<
         }
         None => false,
     };
+    let description_html = match e.description.clone() {
+        Some(d) => tokio::task::spawn_blocking(move || markdown::render(&d)).await.map_err(anyhow::Error::from)?,
+        None => String::new(),
+    };
     Ok(EntryHead {
         contact,
         hearts: model::heart_count(state, e.id).await?,
@@ -464,7 +468,7 @@ async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<
         url: e.url(),
         kind: e.kind.clone(),
         summary: e.summary.clone().unwrap_or_default(),
-        description_html: e.description.as_deref().map(markdown::render).unwrap_or_default(),
+        description_html,
         visibility: e.visibility.clone(),
         verified: e.verified,
         curated: e.curated,

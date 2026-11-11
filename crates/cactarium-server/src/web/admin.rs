@@ -178,6 +178,7 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
     let release = latest.filter(|_| s.version_id.is_some()).map(|v| v.label());
     Ok(ReviewView {
         id: s.id,
+        seen: versions.iter().map(|v| v.id).max().unwrap_or(0),
         release: release.unwrap_or_default(),
         entry_trusted: e.trusted,
         entry: e.slug(),
@@ -245,32 +246,64 @@ pub async fn decide(
             "a release never changes: reject it with a note, and the owner tags a new one",
         ));
     }
-    sqlx::query("UPDATE submissions SET status = $2, note = $3, checklist = $4, reviewer = $5, decided_at = now() WHERE id = $1")
+    // Only an open submission can be decided, and the decision and what it decides land together:
+    // two reviewers (or a stale tab) can't both decide it, nor leave the two halves disagreeing.
+    let mut tx = state.db.begin().await?;
+    let decided = sqlx::query("UPDATE submissions SET status = $2, note = $3, checklist = $4, reviewer = $5, decided_at = now() WHERE id = $1 AND status IN ('open', 'changes-requested')")
         .bind(id)
         .bind(status)
         .bind(&note)
         .bind(serde_json::to_value(&checks).map_err(anyhow::Error::from)?)
         .bind(a.user.id)
-        .execute(&state.db)
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if decided == 0 {
+        return Err(AppError::Conflict("this submission was already decided; reload the queue".into()));
+    }
     match version_id {
         Some(vid) if status != "changes-requested" => {
             sqlx::query("UPDATE versions SET review = $2 WHERE id = $1")
                 .bind(vid)
                 .bind(status)
-                .execute(&state.db)
+                .execute(&mut *tx)
                 .await?;
-            if status == "approved" {
-                crate::publish::touch(&state, entry_id).await?;
-            }
         }
         None if status == "approved" => {
             sqlx::query("UPDATE entries SET visibility = 'public', updated_at = now() WHERE id = $1 AND visibility = 'pending'")
                 .bind(entry_id)
-                .execute(&state.db)
+                .execute(&mut *tx)
                 .await?;
+            // Releases of a pending entry need no review of their own, since the entry's review
+            // covers them, but only the ones the reviewer saw. Any that arrived after the page
+            // was drawn go to the queue as releases.
+            let trusted = e.trusted
+                || crate::publish::owner_trusted(&state, &e.owner).await?
+                || (f.contains_key("trust_entry") && site::may_grant_trust(&state, &a.user).await?);
+            // Trusted: releases skip review anyway, so none is unseen.
+            let seen: i64 =
+                if trusted { i64::MAX } else { f.get("seen").and_then(|s| s.parse().ok()).unwrap_or(0) };
+            let unseen: Vec<i64> = sqlx::query_scalar(
+                "UPDATE versions SET review = 'pending' WHERE entry_id = $1 AND id > $2 AND review = 'approved' AND state <> 'invalid' RETURNING id",
+            )
+            .bind(entry_id)
+            .bind(seen)
+            .fetch_all(&mut *tx)
+            .await?;
+            for vid in unseen {
+                sqlx::query("INSERT INTO submissions (entry_id, version_id, submitter, status) VALUES ($1, $2, $3, 'open')")
+                    .bind(entry_id)
+                    .bind(vid)
+                    .bind(submitter)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         _ => {}
+    }
+    tx.commit().await?;
+    if version_id.is_some() && status == "approved" {
+        crate::publish::touch(&state, entry_id).await?;
     }
     if f.contains_key("trust_entry") && site::may_grant_trust(&state, &a.user).await? {
         sqlx::query("UPDATE entries SET trusted = TRUE WHERE id = $1")

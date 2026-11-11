@@ -88,6 +88,9 @@ pub async fn create(
     }
     let display = display.map(str::trim).filter(|d| !d.is_empty());
     let mut tx = state.db.begin().await?;
+    if name_taken_locked(&mut tx, name, "users").await? {
+        return Err(AppError::Conflict(format!("'{name}' is taken")));
+    }
     let org = sqlx::query_as::<_, Org>("INSERT INTO orgs (name, display_name, created_by) VALUES ($1, $2, $3) RETURNING id, name, display_name, trusted")
         .bind(name)
         .bind(display)
@@ -258,24 +261,29 @@ pub async fn member_action(
     if !leaving && !manages(&state, &org, &s.user).await? {
         return Err(AppError::Forbidden);
     }
-    let owners: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM org_members WHERE org_id = $1 AND role = 'owner'")
-            .bind(org.id)
-            .fetch_one(&state.db)
-            .await?;
-    let target_is_owner = role_of(&state, org.id, uid).await?.as_deref() == Some("owner");
-    if target_is_owner && owners == 1 && f.action != "owner" {
-        return Err(AppError::bad(
-            "an organization needs at least one owner; make someone else an owner first",
-        ));
-    }
     let sql = match f.action.as_str() {
         "remove" => "DELETE FROM org_members WHERE org_id = $1 AND user_id = $2",
         "owner" => "UPDATE org_members SET role = 'owner' WHERE org_id = $1 AND user_id = $2",
         "member" => "UPDATE org_members SET role = 'member' WHERE org_id = $1 AND user_id = $2",
         _ => return Err(AppError::bad("unknown action")),
     };
-    sqlx::query(sql).bind(org.id).bind(uid).execute(&state.db).await?;
+    // The members are locked while counted, so two owners leaving at once can't both see a
+    // second owner and leave the organization with none.
+    let mut tx = state.db.begin().await?;
+    let members: Vec<(i64, String)> =
+        sqlx::query_as("SELECT user_id, role FROM org_members WHERE org_id = $1 FOR UPDATE")
+            .bind(org.id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let owners = members.iter().filter(|(_, r)| r == "owner").count();
+    let target_is_owner = members.iter().any(|(u, r)| *u == uid && r == "owner");
+    if target_is_owner && owners == 1 && f.action != "owner" {
+        return Err(AppError::bad(
+            "an organization needs at least one owner; make someone else an owner first",
+        ));
+    }
+    sqlx::query(sql).bind(org.id).bind(uid).execute(&mut *tx).await?;
+    tx.commit().await?;
     audit(
         &state,
         Some(s.user.id),
@@ -318,4 +326,23 @@ pub async fn set_trust(
     let action = if f.trusted { "org.trust" } else { "org.untrust" };
     audit(&state, Some(s.user.id), action, Some(&org.name), json!({}), None).await?;
     Ok(Redirect::to(&format!("/orgs/{}", org.name)).into_response())
+}
+
+/// Users and organizations share one namespace, but each table's unique constraint covers only
+/// itself. Inside a transaction, this takes a lock on `name` (held until it ends, and taken by the
+/// signup path too) and says whether `table` (`users` or `orgs`) already has it.
+pub async fn name_taken_locked(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    table: &str,
+) -> AppResult<bool> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('owner-name:' || $1))")
+        .bind(name)
+        .execute(&mut **tx)
+        .await?;
+    let sql = match table {
+        "users" => "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1)",
+        _ => "SELECT EXISTS (SELECT 1 FROM orgs WHERE name = $1)",
+    };
+    Ok(sqlx::query_scalar(sql).bind(name).fetch_one(&mut **tx).await?)
 }

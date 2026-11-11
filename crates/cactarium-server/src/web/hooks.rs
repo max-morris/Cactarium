@@ -11,7 +11,6 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::error::{ApiResult, AppError};
-use crate::model;
 use crate::security::ClientIp;
 use crate::state::AppState;
 use crate::tracker;
@@ -48,12 +47,7 @@ pub async fn receive(
     if h("x-github-event") == Some("ping") {
         return Ok(StatusCode::NO_CONTENT);
     }
-    let entry = model::entry_by_id(&state, entry_id).await?;
-    tokio::spawn(async move {
-        if let Err(e) = tracker::sync(&state, &entry).await {
-            tracing::info!("webhook sync of {} failed: {e}", entry.slug());
-        }
-    });
+    tracker::sync_soon(state, entry_id);
     Ok(StatusCode::ACCEPTED)
 }
 

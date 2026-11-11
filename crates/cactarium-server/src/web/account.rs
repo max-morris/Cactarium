@@ -317,6 +317,7 @@ pub async fn cut_release(
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let manifest_json = serde_json::to_value(&m).map_err(anyhow::Error::from)?;
     let review = publish::release_review(state, &entry, Some(user)).await?;
+    let mut tx = state.db.begin().await?;
     let vid: i64 = sqlx::query_scalar(
         "INSERT INTO versions (entry_id, track, version, sort_key, manifest, published_by, review) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
@@ -327,10 +328,10 @@ pub async fn cut_release(
     .bind(&manifest_json)
     .bind(user.id)
     .bind(review)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
     tracker::store_release(
-        state,
+        &mut tx,
         &entry,
         vid,
         &track,
@@ -354,14 +355,13 @@ pub async fn cut_release(
                 .bind(c.target.name.as_str())
                 .bind(c.range.as_ref().map(|r| r.to_string()))
                 .bind(&c.note)
-                .execute(&state.db)
+                .execute(&mut *tx)
                 .await?;
         }
     }
-    publish::touch(state, entry.id).await?;
-    publish::submit_release(state, &entry, vid, review, Some(user)).await?;
-    audit(
-        state,
+    publish::submit_release(&mut tx, &entry, vid, review, Some(user)).await?;
+    crate::audit::audit_with(
+        &mut tx,
         Some(user.id),
         "stack.release",
         Some(&entry.slug()),
@@ -369,6 +369,8 @@ pub async fn cut_release(
         None,
     )
     .await?;
+    tx.commit().await?;
+    publish::touch(state, entry.id).await?;
     Ok((entry, review))
 }
 

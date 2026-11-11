@@ -256,7 +256,7 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) 
     if e.kind != "package" {
         return Err(AppError::bad("only a package can be named by commit; name a stack or sim by its version").into());
     }
-    let commit = full_commit(state, e, prefix).await?;
+    let commit = full_commit(state, e, ip, prefix).await?;
     let url = tracker::repo_of(state, e.id).await?.map(|r| r.url);
     if let Some(v) = version_at_commit(state, e, &commit).await? {
         let contact = model::manifest_contact(v.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page));
@@ -284,10 +284,18 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) 
 
 /// The full commit id `prefix` names in the package's repo (abbreviated ids are resolved against
 /// the repo's history; one that matches several commits is refused, listing them).
-async fn full_commit(state: &AppState, e: &Entry, prefix: &str) -> ApiResult<String> {
+async fn full_commit(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) -> ApiResult<String> {
+    // An abbreviated id may cost a fetch from the author's repo host.
+    if prefix.len() != 40 && prefix.len() != 64 {
+        state.limiter.check("commit", ip.0, 30)?;
+    }
     let repo = tracker::repo_of(state, e.id).await?.ok_or(AppError::NotFound)?;
     let policy = GitPolicy { allow_local: state.cfg.allow_local_repos };
-    match git::resolve_commit_prefix(policy, &repo.url, prefix).await.map_err(AppError::bad)? {
+    let found = git::resolve_commit_prefix(policy, &repo.url, prefix).await.map_err(|err| {
+        tracing::warn!("resolving {prefix} in {}: {err:#}", e.slug());
+        AppError::Upstream(format!("cannot read {}'s history from its repo right now; try again later", e.slug()))
+    })?;
+    match found {
         git::PrefixMatch::One(c) => Ok(c),
         git::PrefixMatch::None => Err(AppError::bad(format!("{} has no commit {prefix}", e.slug())).into()),
         git::PrefixMatch::Many(all) => {
@@ -318,7 +326,7 @@ pub async fn package_tip(
     }
     let e = public_entry(&state, &owner, &name, Some("package")).await?;
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
-    let commit = if is_commit { Some(full_commit(&state, &e, &at).await?) } else { None };
+    let commit = if is_commit { Some(full_commit(&state, &e, ip, &at).await?) } else { None };
     if let Some(c) = &commit
         && let Some(v) = version_at_commit(&state, &e, c).await?
     {
@@ -447,16 +455,24 @@ async fn package_snapshot(
         Some(c) => c.to_owned(),
         None => tracker::package_tip_commit(state, e).await?,
     };
-    let key = (e.id, commit.clone());
-    if let Some(t) = state.package_tips.lock().expect("package tips lock").get(&key) {
-        return Ok(t.clone());
-    }
-    let t = std::sync::Arc::new(tracker::package_tip(state, e, &commit).await?);
-    let mut cache = state.package_tips.lock().expect("package tips lock");
-    if cache.len() > 512 {
-        cache.clear();
-    }
-    cache.insert(key, t.clone());
+    // The reading also depends on the owner, the repo and a curated overlay, which can change
+    // under the same commit (a transfer, a move, a curated update or hand-over).
+    let repo = tracker::repo_of(state, e.id).await?;
+    let fingerprint = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        for part in [e.owner.as_str(), repo.as_ref().map_or("", |r| r.url.as_str()), repo.as_ref().and_then(|r| r.overlay_manifest.as_deref()).unwrap_or("")] {
+            h.update(part.as_bytes());
+            h.update([0]);
+        }
+        hex::encode(h.finalize())
+    };
+    let t = state
+        .package_tips
+        .get_or_try_init((e.id, commit.clone(), fingerprint), || async {
+            tracker::package_tip(state, e, &commit).await.map(std::sync::Arc::new)
+        })
+        .await?;
     Ok(t)
 }
 
@@ -512,25 +528,30 @@ pub async fn stack_release(
     let trusted = unreviewed_allowed(&state, &e, &version, Unreviewed::Tip).await?;
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
-    let (definition, own) = current_definition(&state, &e).await?;
-    let m = Manifest::from_toml(&definition).map_err(AppError::bad)?;
-    let section = m.stack.ok_or_else(|| AppError::bad("the stack definition has no [stack]"))?;
-    let r = stacks::resolve(&state, &e.owner, &section, own.as_deref(), Some(tip)).await?;
-    let frozen = FrozenStack {
-        format: 1,
-        stack: format!("{}@{version}", e.slug()).parse().map_err(AppError::bad)?,
-        root: r.root,
-        thornlist: ThornlistText { filename: format!("{}.th", e.name), text: r.text, untracked: vec![] },
-        repos: r.pins,
-        recipe: Some(definition),
+    // Resolving reads every component repo's branch; requests for the same tip share one
+    // resolution, reused for a few seconds.
+    let resolve = || async {
+        let (definition, own) = current_definition(&state, &e).await?;
+        let m = Manifest::from_toml(&definition).map_err(AppError::bad)?;
+        let section = m.stack.ok_or_else(|| AppError::bad("the stack definition has no [stack]"))?;
+        let r = stacks::resolve(&state, &e.owner, &section, own.as_deref(), Some(tip)).await?;
+        Ok::<_, ApiError>(std::sync::Arc::new(FrozenStack {
+            format: 1,
+            stack: format!("{}@{version}", e.slug()).parse().map_err(AppError::bad)?,
+            root: r.root,
+            thornlist: ThornlistText { filename: format!("{}.th", e.name), text: r.text, untracked: vec![] },
+            repos: r.pins,
+            recipe: Some(definition),
+        }))
     };
+    let frozen = state.stack_tips.get_or_try_init((e.id, version.clone()), resolve).await?;
     let unpinned =
         (header::HeaderName::from_static(UNPINNED_HEADER), header::HeaderValue::from_static("true"));
     let untrusted = (
         header::HeaderName::from_static(UNTRUSTED_HEADER),
         header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
     );
-    Ok(([unpinned, contact_header, untrusted], Json(frozen)).into_response())
+    Ok(([unpinned, contact_header, untrusted], Json(&*frozen)).into_response())
 }
 
 /// The stack's definition as it stands now: its repo's default branch for a manifest repo, else
@@ -539,24 +560,18 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
     if let Some(repo) = tracker::repo_of(state, e.id).await? {
         let policy = GitPolicy { allow_local: state.cfg.allow_local_repos };
         let commit = git::resolve_ref(policy, &repo.url, None).await.map_err(AppError::bad)?;
-        let key = (e.id, commit.clone());
-        if let Some(hit) = state.definitions.lock().expect("definitions lock").get(&key).cloned() {
-            return Ok(hit);
-        }
-        let co = git::checkout(policy, &repo.url, &commit, None).await.map_err(AppError::bad)?;
-        let def = git::read_in(&co, STACK_FILE)
-            .map_err(AppError::bad)?
-            .ok_or_else(|| AppError::bad(format!("no {STACK_FILE} on the default branch")))?;
-        let own = match Manifest::from_toml(&def).ok().and_then(|m| m.stack).and_then(|s| s.thornlist) {
-            Some(p) => git::read_in(&co, &p).map_err(AppError::bad)?,
-            None => None,
+        let read = || async {
+            let co = git::checkout(policy, &repo.url, &commit, None).await.map_err(AppError::bad)?;
+            let def = git::read_in(&co, STACK_FILE)
+                .map_err(AppError::bad)?
+                .ok_or_else(|| AppError::bad(format!("no {STACK_FILE} on the default branch")))?;
+            let own = match Manifest::from_toml(&def).ok().and_then(|m| m.stack).and_then(|s| s.thornlist) {
+                Some(p) => git::read_in(&co, &p).map_err(AppError::bad)?,
+                None => None,
+            };
+            Ok::<_, AppError>((def, own))
         };
-        let mut cache = state.definitions.lock().expect("definitions lock");
-        if cache.len() > 512 {
-            cache.clear();
-        }
-        cache.insert(key, (def.clone(), own.clone()));
-        return Ok((def, own));
+        return Ok(state.definitions.get_or_try_init((e.id, commit.clone()), read).await?);
     }
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT s.recipe, s.own_thornlist FROM stack_releases s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND v.review = 'approved' ORDER BY v.created_at DESC LIMIT 1",

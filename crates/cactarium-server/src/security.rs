@@ -83,6 +83,7 @@ pub fn client_ip(
 }
 
 /// The client's address as an extractor (see [`client_ip`]).
+#[derive(Clone, Copy)]
 pub struct ClientIp(pub Option<IpAddr>);
 
 impl axum::extract::FromRequestParts<AppState> for ClientIp {
@@ -97,30 +98,88 @@ impl axum::extract::FromRequestParts<AppState> for ClientIp {
 }
 
 /// A fixed-window limiter per (bucket, client address).
+/// Per-minute request limits by client: a client's minute starts with its first request, and its
+/// count resets once that minute is over. Clients are kept in two maps, swapped every minute, so
+/// forgetting old ones costs a swap rather than a scan: a client not seen since before the last
+/// swap has had its minute end, and goes with the older map. IPv6 clients are counted by their
+/// /64, which one machine usually controls whole.
 pub struct RateLimiter {
-    hits: Mutex<HashMap<(&'static str, IpAddr), (Instant, u32)>>,
+    windows: Mutex<Windows>,
 }
+
+type Counts = HashMap<(&'static str, IpAddr), (Instant, u32)>;
+
+struct Windows {
+    swapped: Instant,
+    current: Counts,
+    previous: Counts,
+}
+
+const WINDOW: Duration = Duration::from_secs(60);
 
 impl Default for RateLimiter {
     fn default() -> Self {
-        RateLimiter { hits: Mutex::new(HashMap::new()) }
+        RateLimiter {
+            windows: Mutex::new(Windows {
+                swapped: Instant::now(),
+                current: HashMap::new(),
+                previous: HashMap::new(),
+            }),
+        }
+    }
+}
+
+/// The address a client is counted under: itself for IPv4, its /64 for IPv6.
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+        },
     }
 }
 
 impl RateLimiter {
-    /// Allows `limit` requests per minute per address in `bucket`.
+    /// Allows `limit` requests per minute per client in `bucket`.
     pub fn check(&self, bucket: &'static str, ip: Option<IpAddr>, limit: u32) -> Result<(), AppError> {
         let Some(ip) = ip else { return Ok(()) };
-        let mut hits = self.hits.lock().expect("limiter lock");
+        let key = (bucket, client_key(ip));
+        let mut w = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        if hits.len() > 50_000 {
-            hits.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(60));
+        if now.duration_since(w.swapped) >= WINDOW {
+            w.previous = std::mem::take(&mut w.current);
+            w.swapped = now;
         }
-        let e = hits.entry((bucket, ip)).or_insert((now, 0));
-        if now.duration_since(e.0) >= Duration::from_secs(60) {
-            *e = (now, 0);
+        let mut hit = w.current.remove(&key).or_else(|| w.previous.remove(&key)).unwrap_or((now, 0));
+        if now.duration_since(hit.0) >= WINDOW {
+            hit = (now, 0);
         }
-        e.1 += 1;
-        if e.1 > limit { Err(AppError::TooManyRequests) } else { Ok(()) }
+        hit.1 += 1;
+        let count = hit.1;
+        w.current.insert(key, hit);
+        if count > limit { Err(AppError::TooManyRequests) } else { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn limits_per_client_and_groups_ipv6_by_64() {
+        let l = RateLimiter::default();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(l.check("x", Some(a), 2).is_ok());
+        assert!(l.check("x", Some(b), 2).is_ok());
+        assert!(l.check("x", Some(a), 2).is_err(), "same /64");
+        assert!(l.check("x", Some(c), 2).is_ok(), "another /64");
+        assert!(l.check("y", Some(a), 2).is_ok(), "another bucket");
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        assert!(l.check("x", Some(v4), 1).is_ok());
+        assert!(l.check("x", Some(mapped), 1).is_err(), "a mapped v4 is the v4");
     }
 }

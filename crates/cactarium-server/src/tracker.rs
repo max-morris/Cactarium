@@ -5,7 +5,8 @@
 //! change. A tag that later points elsewhere is not followed: the version is marked `tag-moved`,
 //! a tag event alerts the owner and admins, and the frozen commit keeps being served.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cactup_ecosystem_common::ccl;
@@ -90,6 +91,27 @@ impl TagRule {
         }
     }
 }
+
+/// Locks an entry's rows for the rest of `tx` and returns whether it is still curated with an
+/// overlay, at the URL the caller checked. Curated updates and hand-overs read the entry, then do
+/// slow git work, then write: this is the re-check under the lock, so the two can't interleave
+/// into an entry that is neither (not curated, yet still read through an overlay).
+async fn still_curated_at(
+    tx: &mut sqlx::PgConnection,
+    entry_id: i64,
+    url: &str,
+) -> AppResult<bool> {
+    let row: Option<(bool, bool, String)> = sqlx::query_as(
+        "SELECT e.curated, r.overlay_manifest IS NOT NULL, r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.id = $1 FOR UPDATE",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(row.is_some_and(|(curated, overlay, now)| curated && overlay && now == url))
+}
+
+const CURATED_CHANGED: &str = "the entry changed while this ran (another curated update, a hand-over or a move); reload and try again";
 
 /// Keeps the repo's tag rule in step with a manifest.
 async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResult<()> {
@@ -306,8 +328,13 @@ pub async fn update_curated(
     }
     let (pattern, since) = TagRule::of_manifest(&m).stored();
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
-    if repo_of(state, entry.id).await?.is_some_and(|r| r.url != url) {
+    let current = repo_of(state, entry.id).await?.map(|r| r.url).unwrap_or_default();
+    if current != url {
         same_history(state, entry, &url).await?;
+    }
+    let mut tx = state.db.begin().await?;
+    if !still_curated_at(&mut tx, entry.id, &current).await? {
+        return Err(AppError::Conflict(CURATED_CHANGED.into()));
     }
     sqlx::query("UPDATE entry_repos SET url = $2, overlay_manifest = $3, tag_pattern = $4, min_version = $5 WHERE entry_id = $1")
         .bind(entry.id)
@@ -315,15 +342,15 @@ pub async fn update_curated(
         .bind(overlay)
         .bind(&pattern)
         .bind(&since)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE entries SET summary = COALESCE($2, summary) WHERE id = $1")
         .bind(entry.id)
         .bind(summary_of(&m))
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
-    audit(
-        state,
+    crate::audit::audit_with(
+        &mut tx,
         Some(admin.id),
         "curated.update",
         Some(&entry.slug()),
@@ -331,6 +358,7 @@ pub async fn update_curated(
         None,
     )
     .await?;
+    tx.commit().await?;
     sync_as(state, entry, Some(admin)).await
 }
 
@@ -363,18 +391,26 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
             entry.owner
         )));
     }
-    sqlx::query("UPDATE entry_repos SET overlay_manifest = NULL WHERE entry_id = $1")
-        .bind(entry.id)
-        .execute(&state.db)
-        .await?;
+    let mut tx = state.db.begin().await?;
+    if !still_curated_at(&mut tx, entry.id, &repo.url).await? {
+        return Err(AppError::Conflict(CURATED_CHANGED.into()));
+    }
     // From now on the repo's own manifest says how its tags become versions.
-    store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
+    let (pattern, since) = TagRule::of_manifest(&m).stored();
+    sqlx::query("UPDATE entry_repos SET overlay_manifest = NULL, tag_pattern = $2, min_version = $3 WHERE entry_id = $1")
+        .bind(entry.id)
+        .bind(pattern)
+        .bind(since)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("UPDATE entries SET curated = FALSE, updated_at = now() WHERE id = $1")
         .bind(entry.id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
-    audit(state, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
-        .await
+    crate::audit::audit_with(&mut tx, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Checks that `url` holds the history the entry's published versions froze: every tagged version
@@ -508,8 +544,66 @@ pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
     sync_as(state, entry, None).await
 }
 
+/// Syncs of one entry run one at a time: two at once would both see a tag as new and race to
+/// store it. One lock per entry this process has synced; bounded by the entries.
+static ENTRY_SYNCS: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn entry_sync_lock(id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = ENTRY_SYNCS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.entry(id).or_default().clone()
+}
+
+/// How long a background sync (a webhook's or the poller's) may take before it is stopped. Each
+/// version is stored in one transaction, so stopping one leaves no version half-stored.
+const SYNC_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+/// Background syncs at once: the poller's and the webhooks' each have their own few, so neither a
+/// flood of webhooks nor one slow repo can hold the other up.
+static POLL_SYNCS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static HOOK_SYNCS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Entries with a webhook sync queued and not yet started.
+static HOOK_QUEUED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Syncs an entry in the background, for a webhook. Deliveries that arrive while one is queued add
+/// nothing (the queued sync will see what they announce); one that arrives while a sync runs
+/// queues one more, which starts when it ends.
+pub fn sync_soon(state: AppState, entry_id: i64) {
+    if !HOOK_QUEUED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(entry_id) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _permit = HOOK_SYNCS.acquire().await;
+        HOOK_QUEUED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&entry_id);
+        if let Err(e) = budgeted_sync(&state, entry_id).await {
+            tracing::info!("webhook sync of entry {entry_id} failed: {e}");
+        }
+    });
+}
+
+/// [`sync`] within [`SYNC_BUDGET`]; a sync stopped for time is recorded as the repo's poll error.
+async fn budgeted_sync(state: &AppState, entry_id: i64) -> AppResult<usize> {
+    let entry = model::entry_by_id(state, entry_id).await?;
+    match tokio::time::timeout(SYNC_BUDGET, sync(state, &entry)).await {
+        Ok(r) => r,
+        Err(_) => {
+            let why = format!("reading the repo took over {} minutes and was stopped", SYNC_BUDGET.as_secs() / 60);
+            sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
+                .bind(entry_id)
+                .bind(&why)
+                .execute(&state.db)
+                .await?;
+            Err(AppError::bad(why))
+        }
+    }
+}
+
 /// `sync`, with the tags found counted as published by `actor` (the user registering the repo).
 async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppResult<usize> {
+    let lock = entry_sync_lock(entry.id);
+    let _one_at_a_time = lock.lock().await;
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
     let banned: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND banned)")
@@ -517,6 +611,12 @@ async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppRe
             .fetch_one(&state.db)
             .await?;
     if banned || entry.visibility == "hidden" {
+        // Marked as polled all the same: the poller takes the longest-unpolled repos first, and
+        // these would otherwise take its slots every round.
+        sqlx::query("UPDATE entry_repos SET last_polled_at = now() WHERE entry_id = $1")
+            .bind(entry.id)
+            .execute(&state.db)
+            .await?;
         return Ok(0);
     }
     let result = sync_inner(state, entry, &repo, actor).await;
@@ -605,10 +705,11 @@ async fn mark(
     frozen: &str,
     now: Option<&String>,
 ) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
     sqlx::query("UPDATE versions SET state = $2 WHERE id = $1")
         .bind(version_id)
         .bind(new_state)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("INSERT INTO tag_events (entry_id, version_id, tag, frozen_commit, new_commit) VALUES ($1, $2, $3, $4, $5)")
         .bind(entry.id)
@@ -616,10 +717,10 @@ async fn mark(
         .bind(tag)
         .bind(frozen)
         .bind(now)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
-    audit(
-        state,
+    crate::audit::audit_with(
+        &mut tx,
         None,
         &format!("tag.{new_state}"),
         Some(&entry.slug()),
@@ -627,6 +728,7 @@ async fn mark(
         None,
     )
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -661,6 +763,9 @@ async fn ingest(
     } else {
         publish::release_review(state, entry, actor).await?
     };
+    // The version and everything stored with it land together or not at all: a version is never
+    // redone once its row exists, so a half-stored one would stay half-stored.
+    let mut tx = state.db.begin().await?;
     let vid: i64 = sqlx::query_scalar(
         "INSERT INTO versions (entry_id, track, version, sort_key, tag, commit, tree, state, invalid_reason, manifest, readme_html, review)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
@@ -677,14 +782,14 @@ async fn ingest(
     .bind(&manifest_json)
     .bind(&readme)
     .bind(review)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
     if let Some(p) = prepared {
-        store_prepared(state, entry, vid, &track, p).await?;
+        store_prepared(&mut tx, entry, vid, &track, p).await?;
     }
-    publish::submit_release(state, entry, vid, review, actor).await?;
-    audit(
-        state,
+    publish::submit_release(&mut tx, entry, vid, review, actor).await?;
+    crate::audit::audit_with(
+        &mut tx,
         None,
         "version.ingest",
         Some(&entry.slug()),
@@ -692,6 +797,7 @@ async fn ingest(
         None,
     )
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -810,7 +916,14 @@ async fn prepare(
 
     if let Some(pkg) = &m.package {
         let readme_path = pkg.readme.clone().unwrap_or_else(|| "README.md".into());
-        p.readme_html = git::read_in(co, &readme_path).ok().flatten().map(|t| markdown::render(&t));
+        // Up to 4 MB of markdown through the sanitizer: blocking work, off the async threads.
+        if let Some(text) = git::read_in(co, &readme_path).ok().flatten() {
+            p.readme_html = Some(
+                tokio::task::spawn_blocking(move || markdown::render(&text))
+                    .await
+                    .map_err(anyhow::Error::from)?,
+            );
+        }
         let allow = pkg.thorns.as_ref();
         let root = co.path.clone();
         let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root))
@@ -895,7 +1008,7 @@ async fn prepare(
 }
 
 async fn store_prepared(
-    state: &AppState,
+    db: &mut sqlx::PgConnection,
     entry: &Entry,
     vid: i64,
     track: &str,
@@ -909,7 +1022,7 @@ async fn store_prepared(
             .bind(dir)
             .bind(&facts.implements)
             .bind(serde_json::to_value(facts).map_err(anyhow::Error::from)?)
-            .execute(&state.db)
+            .execute(&mut *db)
             .await?;
     }
     for (kind, target, range, note) in &p.claims {
@@ -920,11 +1033,11 @@ async fn store_prepared(
             .bind(target.name.as_str())
             .bind(range)
             .bind(note)
-            .execute(&state.db)
+            .execute(&mut *db)
             .await?;
     }
     if let Some((frozen, toml, own)) = &p.frozen {
-        store_release(state, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone())
+        store_release(db, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone())
             .await?;
     }
     if let Some((checked, description)) = p.sim {
@@ -932,9 +1045,9 @@ async fn store_prepared(
             "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END, review FROM versions WHERE id = $1",
         )
         .bind(vid)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *db)
         .await?;
-        crate::sims::store_version(state, entry, vid, &label, &review, checked, description.as_deref())
+        crate::sims::store_version(db, entry, vid, &label, &review, checked, description.as_deref())
             .await?;
     }
     if p.summary.is_some() {
@@ -943,7 +1056,7 @@ async fn store_prepared(
             .bind(entry.id)
             .bind(&p.summary)
             .bind(vid)
-            .execute(&state.db)
+            .execute(&mut *db)
             .await?;
     }
     Ok(())
@@ -952,7 +1065,7 @@ async fn store_prepared(
 /// Stores a stack release with its diff against the previous published release on the same track.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_release(
-    state: &AppState,
+    db: &mut sqlx::PgConnection,
     entry: &Entry,
     vid: i64,
     track: &str,
@@ -971,7 +1084,7 @@ pub async fn store_release(
     .bind(entry.id)
     .bind(track)
     .bind(vid)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *db)
     .await?;
     let prev: Option<FrozenStack> = prev.and_then(|t| toml::from_str(&t).ok());
     let diff = stacks::diff(prev.as_ref(), frozen);
@@ -982,14 +1095,14 @@ pub async fn store_release(
         .bind(recipe)
         .bind(own_thornlist)
         .bind(serde_json::to_value(&diff).map_err(anyhow::Error::from)?)
-        .execute(&state.db)
+        .execute(&mut *db)
         .await?;
-    store_built_thorns(state, vid, &frozen.thornlist.text).await?;
-    store_pins(state, vid, &frozen.repos).await
+    store_built_thorns(db, vid, &frozen.thornlist.text).await?;
+    store_pins(db, vid, &frozen.repos).await
 }
 
 /// Records the thorns a stack release or a sim builds, so they can be found by thorn.
-pub async fn store_built_thorns(state: &AppState, vid: i64, thornlist: &str) -> AppResult<()> {
+pub async fn store_built_thorns(db: &mut sqlx::PgConnection, vid: i64, thornlist: &str) -> AppResult<()> {
     let Ok(list) = cactup_ecosystem_common::crl::parse(thornlist) else { return Ok(()) };
     for c in list.components().iter().filter(|c| c.checkout.contains('/') && !c.fetch_only) {
         sqlx::query(
@@ -997,7 +1110,7 @@ pub async fn store_built_thorns(state: &AppState, vid: i64, thornlist: &str) -> 
         )
         .bind(vid)
         .bind(&c.checkout)
-        .execute(&state.db)
+        .execute(&mut *db)
         .await?;
     }
     Ok(())
@@ -1010,9 +1123,10 @@ pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
     )
     .fetch_all(&state.db)
     .await?;
+    let mut db = state.db.acquire().await?;
     for (vid, frozen) in stacks {
         if let Ok(f) = toml::from_str::<cactup_ecosystem_common::stack::FrozenStack>(&frozen) {
-            store_built_thorns(state, vid, &f.thornlist.text).await?;
+            store_built_thorns(&mut db, vid, &f.thornlist.text).await?;
         }
     }
     let sims: Vec<(i64, String)> = sqlx::query_as(
@@ -1022,14 +1136,14 @@ pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
     .await?;
     for (vid, content) in sims {
         if let Ok(sim) = cactup_ecosystem_common::sim::SimFile::from_toml(&content) {
-            store_built_thorns(state, vid, &sim.thornlist.text).await?;
+            store_built_thorns(&mut db, vid, &sim.thornlist.text).await?;
         }
     }
     Ok(())
 }
 
 pub async fn store_pins(
-    state: &AppState,
+    db: &mut sqlx::PgConnection,
     vid: i64,
     pins: &[cactup_ecosystem_common::sim::RepoPin],
 ) -> AppResult<()> {
@@ -1041,7 +1155,7 @@ pub async fn store_pins(
             .bind(git::normalize_url(&p.url))
             .bind(&p.git_ref)
             .bind(p.commit.as_ref().or(p.sha256.as_ref()))
-            .execute(&state.db)
+            .execute(&mut *db)
             .await?;
     }
     Ok(())
@@ -1068,6 +1182,7 @@ pub async fn add_virtual_version(
     let r = RemoteRef { name: tv.conventional_tag(), commit: commit.clone() };
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     let prepared = prepare(state, entry, &repo, &co, &r, &tv).await?;
+    let mut tx = state.db.begin().await?;
     let vid: i64 = sqlx::query_scalar(
         "INSERT INTO versions (entry_id, track, version, sort_key, tag, commit, tree, is_virtual, manifest, readme_html, published_by)
          VALUES ($1, $2, $3, $4, NULL, $5, $6, TRUE, $7, $8, $9) RETURNING id",
@@ -1081,15 +1196,15 @@ pub async fn add_virtual_version(
     .bind(&prepared.manifest_json)
     .bind(&prepared.readme_html)
     .bind(admin.id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(d) if d.is_unique_violation() => AppError::Conflict(format!("{label} already exists")),
         _ => e.into(),
     })?;
-    store_prepared(state, entry, vid, &track, prepared).await?;
-    audit(
-        state,
+    store_prepared(&mut tx, entry, vid, &track, prepared).await?;
+    crate::audit::audit_with(
+        &mut tx,
         Some(admin.id),
         "version.virtual",
         Some(&entry.slug()),
@@ -1097,6 +1212,7 @@ pub async fn add_virtual_version(
         None,
     )
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1117,11 +1233,17 @@ async fn poll_once(state: &AppState) -> AppResult<()> {
     .bind(state.cfg.poll_interval as f64)
     .fetch_all(&state.db)
     .await?;
+    // A few at a time, each within the budget: one slow repo can't hold up the others for long.
+    let mut syncs = tokio::task::JoinSet::new();
     for id in due {
-        let entry = model::entry_by_id(state, id).await?;
-        if let Err(e) = sync(state, &entry).await {
-            tracing::info!("sync of {} failed: {e}", entry.slug());
-        }
+        let state = state.clone();
+        syncs.spawn(async move {
+            let _permit = POLL_SYNCS.acquire().await;
+            if let Err(e) = budgeted_sync(&state, id).await {
+                tracing::info!("sync of entry {id} failed: {e}");
+            }
+        });
     }
+    while syncs.join_next().await.is_some() {}
     Ok(())
 }

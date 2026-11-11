@@ -141,6 +141,13 @@ for p in ["/dashboard", "/settings", "/new/repo", "/new/sim", "/new/stack", "/ne
 page(maxv, "/admin/tags", contains="v1.0.0")
 page(maxv, "/dashboard", contains="Publish a new version instead of moving tags")
 
+def seen_of(sid):
+    """The newest version the review page for `sid` shows, as its form submits it."""
+    _, text, _ = maxv.get(f"/admin?s={sid}")
+    m = re.search(r'name="seen" value="(\d+)"', text)
+    return m.group(1) if m else "0"
+
+
 # Review: request changes, alice resubmits, then approve.
 text = page(maxv, "/admin", contains="alice/spacetimex")
 sub = re.search(r'action="/admin/review/(\d+)"', text)
@@ -153,7 +160,7 @@ if sub:
     alice.get("/alice/spacetimex")
     s, _, _ = alice.post("/alice/spacetimex/resubmit", {})
     check("alice resubmits", s == 303, s)
-    s, _, _ = maxv.post(f"/admin/review/{sid}", {"decision": "approve", "check_license": "on"})
+    s, _, _ = maxv.post(f"/admin/review/{sid}", {"decision": "approve", "check_license": "on", "seen": seen_of(sid)})
     check("approve", s == 303, s)
     page(anon, "/alice/spacetimex", contains="spacetimex")
 
@@ -383,8 +390,7 @@ def decide(needle, decision, note=""):
     check(f"the queue lists {needle}", sid is not None)
     if sid is None:
         return 0
-    maxv.get(f"/admin?s={sid}")
-    s, _, _ = maxv.post(f"/admin/review/{sid}", {"decision": decision, "note": note})
+    s, _, _ = maxv.post(f"/admin/review/{sid}", {"decision": decision, "note": note, "seen": seen_of(sid)})
     return s
 
 

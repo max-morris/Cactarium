@@ -44,6 +44,7 @@
       </div>
       <form class="split-side card stack-sm" method="post" action="/admin/review/{{ r.id }}">
         <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="seen" value="{{ r.seen }}">
         <h3 class="h-small">Checklist</h3>
         {% for c in r.checklist %}
           <label class="check"><input type="checkbox" name="check_{{ c.0 }}" {% if c.2 %}checked{% endif %}> <span>{{ c.1 }}</span></label>

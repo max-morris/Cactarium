@@ -15,10 +15,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 # git: the tracker lists and fetches tags from authors' repos.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --home-dir /var/lib/cactarium --create-home cactarium
+ && useradd --system --uid 10001 --home-dir /var/lib/cactarium --create-home cactarium \
+ && install -d -m 0700 -o cactarium -g cactarium /var/lib/cactarium/mirrors
 COPY --from=build /cactarium /usr/local/bin/cactarium
 COPY crates/cactarium-server/static /srv/cactarium/static
+# CACTARIUM_MIRRORS: history-only copies of authors' repos, for abbreviated commit ids (a volume).
 ENV CACTARIUM_STATIC_DIR=/srv/cactarium/static \
+    CACTARIUM_MIRRORS=/var/lib/cactarium/mirrors \
     CACTARIUM_BIND=0.0.0.0:8000 \
     RUST_LOG=info,sqlx=warn
 USER cactarium
