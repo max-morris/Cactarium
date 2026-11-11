@@ -9,7 +9,8 @@
 #   a file of their own, adds one Include line to that virtual host, keeps a copy of the file it
 #   edits, and puts back what it changed if Apache rejects the result.
 # - `sh setup.sh firewall` (`just firewall`, never run by `just setup`): ufw denying everything
-#   inbound but HTTP and HTTPS from anywhere and SSH from the bastion (SSH_FROM in deploy/.env).
+#   inbound but HTTP and HTTPS from anywhere and SSH from the bastion (SSH_FROM in deploy/.env), on
+#   sshd's ports or those SSH_PORTS lists.
 #   It refuses to run unless your own SSH session comes from that bastion, so it can't lock you
 #   out. Docker's published ports bypass ufw, which is why compose.yaml publishes the app on
 #   loopback only.
@@ -122,6 +123,16 @@ ProxyPassReverse / http://127.0.0.1:$port/
 EOF
 }
 
+# The numbers of `ufw status numbered` rules this script made ("# ssh from …") for ports not in $1,
+# highest first.
+stale_ssh_rules() {
+    printf '%s\n' "$2" | awk -v keep=" $(echo $1) " '
+        /# ssh from / {
+            line = $0; sub(/^\[ */, "", line); split(line, f, /[] ]+/); split(f[2], p, "/")
+            if (index(keep, " " p[1] " ") == 0) print f[1]
+        }' | sort -rn
+}
+
 firewall() {
     from=$(get SSH_FROM)
     if [ -z "$from" ]; then
@@ -142,14 +153,33 @@ firewall() {
         echo "since SSH would then only be allowed from $from. Run it over SSH through $from." >&2
         return 1
     fi
-    port=$($sudo sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
-    port=${port:-22}
+    # The SSH ports to allow: SSH_PORTS in deploy/.env (say "22 2525" while sshd moves to a new
+    # port), else every port sshd listens on now. The port this session came in on is always
+    # added, so enabling the firewall can't cut it off.
+    ports=$(get SSH_PORTS | tr ',' ' ')
+    [ -n "$ports" ] || ports=$($sudo sshd -T 2>/dev/null | awk '$1 == "port" {print $2}')
+    ports="$ports $(echo "${SSH_CONNECTION:-}" | awk '{print $4}')"
+    ports=$(printf '%s\n' $ports | sort -un)
+    [ -n "$ports" ] || ports=22
+    for port in $ports; do
+        case $port in
+            *[!0-9]*) echo "firewall: SSH_PORTS has '$port', not a port number" >&2; return 1 ;;
+        esac
+    done
     command -v ufw > /dev/null || $sudo apt-get install -y ufw
     $sudo ufw default deny incoming
     $sudo ufw default allow outgoing
     $sudo ufw default deny routed
     for a in $addrs; do
-        $sudo ufw allow from "$a" to any port "$port" proto tcp comment "ssh from $from"
+        for port in $ports; do
+            $sudo ufw allow from "$a" to any port "$port" proto tcp comment "ssh from $from"
+        done
+    done
+    # Then drop this script's SSH rules for ports no longer listed (after the new ones are in, so
+    # SSH is never shut out in between). Highest rule number first: numbers shift on delete.
+    stale=$(stale_ssh_rules "$ports" "$($sudo ufw status numbered 2>/dev/null)")
+    for n in $stale; do
+        $sudo ufw --force delete "$n"
     done
     $sudo ufw allow 80/tcp comment "http (redirects to https)"
     $sudo ufw allow 443/tcp comment https

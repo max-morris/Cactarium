@@ -58,7 +58,9 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
    `deploy/.env`: `CACTARIUM_BASE_URL`, `CACTARIUM_SUPERADMIN`, the GitHub OAuth app (callback
    `<base>/auth/github/callback`) and optionally ORCID's, and `SSH_FROM`. Never set
    `CACTARIUM_DEV_LOGIN` there.
-2. `just up`, then `just firewall` from an SSH session that comes through the bastion.
+2. `just up`, then `just firewall` from an SSH session that comes through the bastion. It allows SSH
+   from the bastion on the ports sshd listens on now; if sshd is moving to another port, list both in
+   `SSH_PORTS` (e.g. `22 2525`) and run it again with only the new one once that works.
 3. Sign in on the site with GitHub. The account named in `CACTARIUM_SUPERADMIN` is the superadmin;
    signing in creates your user.
 4. The `et` organization, trusted so its releases skip review:
