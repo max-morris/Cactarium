@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{{ doc.title }} · Cactarium docs{% endblock %}
+{% block content %}
+<div class="split">
+  <div class="split-main stack-lg">
+    <article class="prose docs">
+{% block doc %}{% endblock %}
+    </article>
+    <nav class="row-wrap between docs" aria-label="Previous and next page">
+      {% if let Some(p) = doc.prev %}<a href="{{ p.url }}">← {{ p.title }}</a>{% else %}<span></span>{% endif %}
+      {% if let Some(n) = doc.next %}<a href="{{ n.url }}">{{ n.title }} →</a>{% endif %}
+    </nav>
+  </div>
+  <aside class="split-side">
+    <nav class="card stack-sm" aria-label="Docs pages">
+      <span class="eyebrow">Docs</span>
+      {% for p in doc.pages %}{% if p.current %}<a class="strong ink" href="{{ p.url }}" aria-current="page">{{ p.title }}</a>{% else %}<a href="{{ p.url }}">{{ p.title }}</a>{% endif %}
+      {% endfor %}
+    </nav>
+  </aside>
+</div>
+{% endblock %}

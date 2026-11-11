@@ -247,9 +247,8 @@ pub struct PackagePage {
     pub used_by: Vec<EntryRow>,
     pub tabs: Vec<Tab>,
     pub tab: String,
-    pub poll_error: String,
-    pub webhook_url: String,
-    pub webhook_secret: String,
+    /// For the entry's managers: its repo's controls (refresh, last error, webhooks).
+    pub repo: Option<RepoManage>,
     /// Packages that declare themselves forks of this one.
     pub forks: Vec<EntryRow>,
     /// (upstream slug, compare URL) for each package this one forks.
@@ -283,8 +282,8 @@ pub struct StackPage {
     pub extends: Vec<(String, String)>,
     pub claims: Vec<ClaimRow>,
     pub used_by: Vec<EntryRow>,
-    pub repo_backed: bool,
-    pub poll_error: String,
+    /// For the entry's managers when it is released from a repo: the repo's controls.
+    pub repo: Option<RepoManage>,
 }
 
 #[derive(Template)]
@@ -308,6 +307,20 @@ pub struct SimPage {
     pub download_url: String,
     pub authors: String,
     pub license: String,
+    /// For the entry's managers when it is published from a repo: the repo's controls.
+    pub repo: Option<RepoManage>,
+}
+
+/// A repo-backed entry's controls for its managers: check for tags now, the last check's error,
+/// and the webhook (one payload URL per forge, all checked against the same secret).
+#[derive(Clone, Debug)]
+pub struct RepoManage {
+    pub entry_url: String,
+    pub poll_error: String,
+    /// `<base>/hooks`, to which the template appends `/<forge>/<entry id>`.
+    pub webhook_base: String,
+    pub entry_id: i64,
+    pub secret: String,
 }
 
 #[derive(Template)]
@@ -421,11 +434,148 @@ pub struct ComparePage {
     pub both: Vec<String>,
 }
 
-#[derive(Template)]
-#[template(path = "docs.html")]
-pub struct DocsPage {
-    pub ctx: PageCtx,
+// ---------- docs ----------
+
+/// The docs pages in sidebar order: (path under `/docs`, title, one-line summary). The empty path
+/// is `/docs` itself.
+pub const DOC_PAGES: &[(&str, &str, &str)] = &[
+    ("", "Overview", "What the Cactarium holds, accounts, and how CactUp uses it."),
+    (
+        "publishing",
+        "Publishing",
+        "Registering a repo, uploading, publishing under an organization, the dashboard.",
+    ),
+    (
+        "packages",
+        "Packages: cactarium.toml",
+        "Every field of the package manifest, claims, caveats and repo layouts.",
+    ),
+    (
+        "stacks",
+        "Stacks: cactarium-stack.toml",
+        "Flat, recipe and combined stacks, overrides, pins, releases, @head and @master.",
+    ),
+    (
+        "sims",
+        "Sims",
+        "Publishing .sim files by upload or from a repo, the checks, warnings and versions.",
+    ),
+    (
+        "versions",
+        "Versions and tracks",
+        "Semver, tags, tracks and ranges, tag patterns, frozen commits, yanking.",
+    ),
+    ("review", "Review and trust", "What is reviewed, what pending means, and who is trusted."),
+    (
+        "organizations",
+        "Organizations",
+        "Shared namespaces: owners, members, publishing under one, trust.",
+    ),
+    (
+        "curated",
+        "Curated packages",
+        "Manifests kept on the Cactarium for repos without one, and handing them over.",
+    ),
+    ("finding", "Finding things", "Search, thorn pages, forks and comparisons, saves."),
+    ("api", "HTTP API", "Every endpoint under /api/v1, its headers, and API tokens."),
+];
+
+#[derive(Clone, Debug)]
+pub struct DocLink {
+    pub url: String,
+    pub title: &'static str,
+    pub summary: &'static str,
+    pub current: bool,
+}
+
+/// What every docs page needs: the sidebar, the neighboring pages, and the links out.
+#[derive(Clone, Debug)]
+pub struct DocsCtx {
+    pub title: &'static str,
+    pub pages: Vec<DocLink>,
+    pub prev: Option<DocLink>,
+    pub next: Option<DocLink>,
+    /// The site's public origin without a trailing slash, for examples.
     pub base_url: String,
+    cactup_docs: String,
+}
+
+impl DocsCtx {
+    /// The page at `/docs/{path}` (`""` for `/docs`), or `None` if there is no such page.
+    pub fn new(path: &str, base_url: String, cactup_docs: String) -> Option<DocsCtx> {
+        let i = DOC_PAGES.iter().position(|p| p.0 == path)?;
+        let link = |j: usize| {
+            let (p, title, summary) = DOC_PAGES[j];
+            DocLink {
+                url: if p.is_empty() { "/docs".into() } else { format!("/docs/{p}") },
+                title,
+                summary,
+                current: j == i,
+            }
+        };
+        Some(DocsCtx {
+            title: DOC_PAGES[i].1,
+            pages: (0..DOC_PAGES.len()).map(link).collect(),
+            prev: i.checked_sub(1).map(link),
+            next: (i + 1 < DOC_PAGES.len()).then(|| link(i + 1)),
+            base_url,
+            cactup_docs,
+        })
+    }
+
+    /// A link into CactUp's own docs on `topic` (`cli`, `sim-format`, `inputs`, `publishing`).
+    /// Every topic leads to the docs' base URL (`CACTUP_DOCS_URL`) for now; once CactUp's pages
+    /// settle, map each topic to its page here.
+    pub fn cactup(&self, _topic: &str) -> &str {
+        &self.cactup_docs
+    }
+}
+
+macro_rules! doc_page {
+    ($ty:ident, $path:literal) => {
+        #[derive(Template)]
+        #[template(path = $path)]
+        pub struct $ty {
+            pub ctx: PageCtx,
+            pub doc: DocsCtx,
+        }
+    };
+}
+
+doc_page!(DocsOverviewPage, "docs/index.html");
+doc_page!(DocsPublishingPage, "docs/publishing.html");
+doc_page!(DocsPackagesPage, "docs/packages.html");
+doc_page!(DocsStacksPage, "docs/stacks.html");
+doc_page!(DocsSimsPage, "docs/sims.html");
+doc_page!(DocsVersionsPage, "docs/versions.html");
+doc_page!(DocsReviewPage, "docs/review.html");
+doc_page!(DocsOrganizationsPage, "docs/organizations.html");
+doc_page!(DocsCuratedPage, "docs/curated.html");
+doc_page!(DocsFindingPage, "docs/finding.html");
+doc_page!(DocsApiPage, "docs/api.html");
+
+/// Renders the docs page at `/docs/{path}` (`""` for `/docs`), or `None` if there is no such page.
+pub fn docs_page(
+    path: &str,
+    ctx: PageCtx,
+    base_url: String,
+    cactup_docs: String,
+) -> Option<AppResult<Html<String>>> {
+    let doc = DocsCtx::new(path, base_url, cactup_docs)?;
+    Some(match path {
+        "" => page(&DocsOverviewPage { ctx, doc }),
+        "publishing" => page(&DocsPublishingPage { ctx, doc }),
+        "packages" => page(&DocsPackagesPage { ctx, doc }),
+        "stacks" => page(&DocsStacksPage { ctx, doc }),
+        "sims" => page(&DocsSimsPage { ctx, doc }),
+        "versions" => page(&DocsVersionsPage { ctx, doc }),
+        "review" => page(&DocsReviewPage { ctx, doc }),
+        "organizations" => page(&DocsOrganizationsPage { ctx, doc }),
+        "curated" => page(&DocsCuratedPage { ctx, doc }),
+        "finding" => page(&DocsFindingPage { ctx, doc }),
+        "api" => page(&DocsApiPage { ctx, doc }),
+        _ => return None,
+    })
 }
 
 // ---------- admin ----------
@@ -594,4 +744,28 @@ pub struct AdminSitePage {
     pub untrusted_tips: String,
     /// (name, display name, members, trusted)
     pub orgs: Vec<(String, String, i64, bool)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_docs_page_renders() {
+        for (path, title, _) in DOC_PAGES {
+            let html = docs_page(
+                path,
+                PageCtx::anonymous(),
+                "https://cactarium.example.org".into(),
+                "https://cactup.example.org/docs".into(),
+            )
+            .unwrap_or_else(|| panic!("/docs/{path} has no template"))
+            .unwrap_or_else(|e| panic!("/docs/{path} doesn't render: {e}"))
+            .0;
+            assert!(html.contains(&format!("<title>{title} · Cactarium docs</title>")), "/docs/{path}");
+            assert!(html.contains(r#"aria-current="page""#), "/docs/{path}");
+        }
+        let any = |p: &str| docs_page(p, PageCtx::anonymous(), String::new(), String::new()).is_some();
+        assert!(!any("nonsense") && !any("index"));
+    }
 }

@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(public::home))
         .route("/search", get(public::search))
         .route("/docs", get(public::docs))
+        .route("/docs/{page}", get(public::docs_page))
         .route("/sources", get(public::sources))
         .route("/compare", get(public::compare))
         .route("/thorns/{name}", get(public::thorn_by_name))

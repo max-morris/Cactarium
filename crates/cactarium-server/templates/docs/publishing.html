@@ -1,0 +1,66 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Publishing</h1>
+<p>There are two ways to publish. <strong>From a repo</strong>: commit a manifest, push a version tag and register the repo; from then on the Cactarium follows its tags. <strong>By upload</strong>: hand the Cactarium the stack definition or the <code>.sim</code> file itself, on the site or through CactUp.</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Kind</th><th scope="col">From a repo</th><th scope="col">By upload</th></tr></thead>
+  <tbody>
+    <tr><td>Package</td><td><code>cactarium.toml</code> (<a href="/docs/packages">reference</a>)</td><td>No: a package is a repo</td></tr>
+    <tr><td>Stack</td><td><code>cactarium-stack.toml</code> (<a href="/docs/stacks">reference</a>)</td><td><a href="/new/stack">Publish a stack</a></td></tr>
+    <tr><td>Sim</td><td><code>cactarium-sim.toml</code> (<a href="/docs/sims">reference</a>)</td><td><a href="/new/sim">Upload a sim</a></td></tr>
+  </tbody>
+</table></div>
+<p>A stack or a sim uses one way only. Once it is registered from a repo, uploads to it are refused: a new release is a new tag.</p>
+
+<h2 id="repo">From a repo</h2>
+<ol class="steps">
+  <li>Commit a manifest at the repo root: <code>cactarium.toml</code> for a package, <code>cactarium-stack.toml</code> for a stack, <code>cactarium-sim.toml</code> for a sim. A repo may carry any of the three; each becomes its own entry.</li>
+  <li>List the name you publish under (yours, or your organization's) in the manifest's <code>owners</code>.</li>
+  <li>Push a version tag: <code>v1.0.0</code>, or <code>mixed-precision/v1.0.0</code> on a track. See <a href="/docs/versions">Versions and tracks</a>; a manifest can also name a different tag scheme.</li>
+  <li>On your dashboard, choose <a href="/new/repo">Register a repo</a> and paste the repo's <code>https://</code> URL.</li>
+</ol>
+
+<h3 id="owners">Owners: proof that you control the repo</h3>
+<p>The Cactarium never asks a forge who may push to a repo. Instead, each manifest names in <code>owners</code> the Cactarium users or organizations allowed to publish it. Only someone who can push to the repo can put a name there, so a manifest that names you proves that you control the repo. This works the same on GitHub, GitLab, Bitbucket or any other public host.</p>
+<p>When you register, the name you publish under must be in the <code>owners</code> of every manifest the repo carries at its newest version tag. Every later tag is checked again: a tag whose manifest no longer names the entry's owner is not published.</p>
+
+<h3 id="registering">What registering does</h3>
+<p>The Cactarium reads the repo at its newest version tag (on the default track if it has one), creates one entry per manifest found there, named after the manifest's <code>name</code>, and then reads every version tag. Each tag becomes a version: the Cactarium checks out exactly the tagged commit, reads the manifest and the files it names, and freezes the commit. Tags that already exist when you register count as published by you, which matters for <a href="/docs/review">review</a>.</p>
+<p>Repo URLs must be public <code>https://</code> URLs without credentials in them. The code stays in your repo. The Cactarium keeps only what it read: the manifest, the facts in each thorn's CCL files, the README, the frozen thornlist of a stack, or the <code>.sim</code> file of a sim.</p>
+<p>A tag whose manifest is missing or wrong still becomes a version, marked <em>invalid</em> with the reason, so it isn't fetched again on every check. Invalid versions are never served. Fix the manifest and push a new tag.</p>
+
+<h3 id="new-tags">New tags: polling, webhooks and "Check for new tags now"</h3>
+<p>The Cactarium finds later tags in three ways:</p>
+<ul>
+  <li><strong>Polling.</strong> It checks every registered repo for new, moved and deleted tags on a fixed interval, every four hours unless the site is configured otherwise.</li>
+  <li><strong>A webhook.</strong> On a package's page, people who manage it find a payload URL and a secret under <em>Manage</em>, <em>Webhook for instant updates</em>. On GitHub, add them under Settings, Webhooks, with content type <code>application/json</code> and "Just the push event"; each push then makes the Cactarium check the repo at once. GitLab ("Tag push events", with the secret as the token) and Bitbucket use the same URL with <code>gitlab</code> or <code>bitbucket</code> in place of <code>github</code>, as in <code>/hooks/gitlab/…</code>.</li>
+  <li><strong>Check for new tags now.</strong> This button, in the <em>Manage</em> box of a package or a repo-backed stack, runs the same check on demand. Scripts and CactUp can call <code>POST /api/v1/packages/{owner}/{name}/refresh</code> with an API token (see <a href="/docs/api#refresh">the API</a>).</li>
+</ul>
+<p>One check reads at most 50 new tags; the rest follow on the next check. If a check fails, the <em>Manage</em> box shows why.</p>
+
+<h2 id="upload">By upload</h2>
+<h3 id="upload-stack">Publish a stack</h3>
+<p><a href="/new/stack">Publish a stack</a> takes three things: a stack definition (what a <code>cactarium-stack.toml</code> would hold), optionally the stack's own thornlist, and the version to publish, such as <code>1.0.0</code>, or <code>mixed-precision:1.0.0</code> on a track. The Cactarium merges the sources, pins every repo and freezes the result as that version. An uploaded definition needs no <code>owners</code>.</p>
+<p>For the next release, open the stack's page and choose <em>Upload a new release</em>: the form starts from the latest release's definition and thornlist. CactUp publishes stack releases through <code>POST /api/v1/stacks/{owner}/{name}/releases</code>. See <a href="/docs/stacks">Stacks</a> for the definition.</p>
+
+<h3 id="upload-sim">Upload a sim</h3>
+<p><a href="/new/sim">Upload a sim</a> takes a <code>.sim</code> file of up to 1 MiB. The entry's name defaults to the name inside the file; type another under <em>Publish as</em>, or <code>owner/name</code> to choose the namespace too. The version is optional: without one, the upload becomes the next major version (1.0.0, then 2.0.0, and so on). The file must be fully specified and consistent; <a href="/docs/sims#checks">Sims</a> lists the checks. CactUp uploads through <code>POST /api/v1/sims/{owner}/{name}</code>; see <a href="{{ doc.cactup("publishing") }}">CactUp's docs on publishing</a>.</p>
+
+<h2 id="under">Publish under</h2>
+<p>Everything you publish goes under your own name or under an <a href="/docs/organizations">organization</a> you belong to. Once you belong to one, each form that publishes shows a <em>Publish under</em> choice. When you publish a repo under an organization, its manifest lists the organization's name in <code>owners</code>, not yours. An API token publishes under the same namespaces as its user.</p>
+<p>Admins can also publish under a namespace that is no user's, for example a reserved name before its organization exists.</p>
+
+<h2 id="dashboard">The dashboard</h2>
+<p>Your <a href="/dashboard">dashboard</a> shows:</p>
+<ul>
+  <li>your entries and your organizations' entries, with their latest versions and whether they are public, pending review or hidden;</li>
+  <li>tag alerts: a version tag that was moved or deleted upstream (see <a href="/docs/versions#frozen">frozen commits</a>);</li>
+  <li>your organizations;</li>
+  <li>the entries you saved;</li>
+  <li>the outcome of your submissions in review, with the reviewer's notes.</li>
+</ul>
+<p>Its buttons lead to <em>Register a repo</em>, <em>Publish a stack</em> and <em>Upload a sim</em>.</p>
+
+<h2 id="review">Review</h2>
+<p>An admin reviews each new entry, and each new release of it, before it is public, unless you, the organization you publish under, or the entry itself is trusted. Until then only the entry's managers and the admins see it. See <a href="/docs/review">Review and trust</a>.</p>
+{% endblock %}

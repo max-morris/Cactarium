@@ -67,15 +67,10 @@
       {% for u in used_by %}<a class="mono" href="{{ u.url }}">{{ u.slug }}</a>{% else %}<p class="muted small">Nothing yet.</p>{% endfor %}
     </section>
     {% if e.can_manage %}
-    <section class="card stack-sm">
+    {% if let Some(r) = repo %}{% include "_repo_manage.html" %}{% else %}<section class="card stack-sm">
       <h2 class="h-small">Manage</h2>
-      {% if repo_backed %}
-      <form method="post" action="{{ e.url }}/refresh"><input type="hidden" name="_csrf" value="{{ ctx.csrf }}"><button class="button small ghost" type="submit">Check for new tags now</button></form>
-      {% if !poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ poll_error }}</p>{% endif %}
-      {% else %}
       <a class="button small" href="/new/stack?name={{ e.slug }}">Upload a new release</a>
-      {% endif %}
-    </section>
+    </section>{% endif %}
     {% endif %}
   </aside>
 </div>

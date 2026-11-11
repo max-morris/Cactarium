@@ -1,0 +1,26 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>The Cactarium</h1>
+<p>The Cactarium is a registry for the Cactus and Einstein Toolkit community. It holds three kinds of entry, each named <code>owner/name</code>, where the owner is a user or an <a href="/docs/organizations">organization</a>:</p>
+<ul>
+  <li><strong>Packages</strong>: a git repo of thorns, versioned by its tags. The code stays in its repo. For each version the Cactarium records the commit the tag named when it first saw it, the thorns it found there, and what their CCL files declare.</li>
+  <li><strong>Stacks</strong>: versioned thornlists. A stack can be a plain thornlist, a recipe built on other stacks, or both. Every release pins every repo to a commit and never changes afterward.</li>
+  <li><strong>Sims</strong>: a parfile together with the exact configuration it ran on, as one <code>.sim</code> file: the thornlist, a pin for every repo, and the inputs the parfile needs from outside the source tree.</li>
+</ul>
+<p>Thorns have pages of their own: <code>/thorns/CarpetX/Loop</code> lists the packages that provide the thorn and the stacks and sims that build it. See <a href="/docs/finding">Finding things</a>.</p>
+
+<h2 id="accounts">Accounts</h2>
+<p>Reading needs no account. Every public page, every download and the whole read API are open to anyone.</p>
+<p>To publish, sign in with GitHub or ORCID. The first time, you choose your Cactarium name: the namespace everything you publish lives under, as in <code>yourname/package</code>. Names use lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, start with a letter or a digit, and are at most 64 characters long. Users and organizations share one namespace, and a few names, such as <code>docs</code>, <code>api</code> and <code>cactarium</code>, are reserved.</p>
+<p>Your Settings page lets you link the other sign-in method, so either one reaches the same account. It also holds your API tokens, which let CactUp publish on your behalf (see <a href="/docs/api#tokens">the API</a>).</p>
+
+<h2 id="cactup">How CactUp uses it</h2>
+<p>CactUp is the Cactarium's client. When you add a package, CactUp sends the reference you typed, such as <code>max-morris/carpetx@mixed-precision:^1</code>, to the Cactarium, which picks the version and returns its frozen commit; CactUp then fetches exactly that commit. CactUp also installs stack releases, imports sims, and publishes sims and stack releases with your API token.</p>
+<p>The commands and the <code>.sim</code> format are documented with CactUp, not here: see <a href="{{ doc.cactup("cli") }}">CactUp's docs on its commands</a> and <a href="{{ doc.cactup("sim-format") }}">CactUp's docs on the .sim format</a>. These pages cover what is specific to the Cactarium: the manifests you commit, how versions are frozen and reviewed, and the HTTP API.</p>
+
+<h2 id="map">Where to find what</h2>
+<ul>
+{% for p in doc.pages %}{% if !p.current %}  <li><a href="{{ p.url }}">{{ p.title }}</a>: {{ p.summary }}</li>
+{% endif %}{% endfor %}
+</ul>
+{% endblock %}

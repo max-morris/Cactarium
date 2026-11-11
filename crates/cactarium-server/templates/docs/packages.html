@@ -1,0 +1,116 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Packages: cactarium.toml</h1>
+<p>A package is a git repo of thorns. Its manifest, <code>cactarium.toml</code> at the repo root, says what the package is called, who may publish it, and which tags are versions. The Cactarium reads it at every version tag, so each version carries the manifest it was tagged with.</p>
+
+<h2 id="example">An example</h2>
+<pre class="code">format = 1
+
+[package]
+name = "carpetx"
+owners = ["max-morris"]
+description = "CarpetX with mixed-precision grid functions"
+license = "LGPL-2.1-or-later"
+contact = "https://github.com/max-morris/CarpetX/issues"
+thorns = ["CarpetX", "Loop", "TestReal2", "TestReal4"]
+default-track = "mixed-precision"
+
+[tracks.mixed-precision]
+description = "CCTK_REAL4/REAL2 storage; needs a mixed-precision flesh"
+
+[[fork-of]]
+target = "et/carpetx"
+
+[[depends-on]]
+target = "max-morris/cactus"
+range = "mixed-precision:^1"
+
+[[works-with]]
+target = "max-morris/carpetx-mp"
+range = "^1"
+
+[[incompatible-with]]
+target = "et/et-stack"
+note = "needs the mixed-precision flesh"
+
+[[caveat]]
+thorn = "TestReal2"
+note = "needs _Float16 (GCC 12 or newer)"</pre>
+<p>Only <code>format = 1</code> and a <code>[package]</code> with <code>name</code> and <code>owners</code> are required. The reader is strict: an unknown key, or a <code>format</code> newer than 1, is an error, and the tag becomes an invalid version with that message.</p>
+
+<h2 id="package">[package]</h2>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Field</th><th scope="col">What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>name</code><br><span class="small muted">required</span></td><td>The entry's name, the second half of <code>owner/name</code>. Lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, starting with a letter or a digit, at most 64 characters. Every later tag must give the same name.</td></tr>
+    <tr><td><code>owners</code><br><span class="small muted">required</span></td><td>The Cactarium users or organizations allowed to publish this repo, such as <code>["max-morris", "et"]</code>. This is the <a href="/docs/publishing#owners">proof that you control the repo</a>. It may not be empty, and it must keep naming the entry's owner: a tag whose manifest drops it becomes an invalid version.</td></tr>
+    <tr><td><code>description</code></td><td>What the package is. Its first line, up to 200 characters, becomes the summary shown in listings and search.</td></tr>
+    <tr><td><code>license</code></td><td>An SPDX license expression, such as <code>LGPL-2.1-or-later</code> or <code>GPL-2.0-or-later OR MIT</code>. It is recorded with each version's manifest; the Cactarium does not check it against the repo.</td></tr>
+    <tr><td><code>homepage</code></td><td>A web page about the package, recorded with each version's manifest.</td></tr>
+    <tr><td><code>contact</code></td><td>Where to go for help or to report a problem: an <code>https://</code> URL (an issue tracker, a forum) or a <code>mailto:</code> address. Shown on the package page as "Help and problems" and returned by the API. Default: the repo.</td></tr>
+    <tr><td><code>readme</code></td><td>The README to show on the package page, a path relative to the repo root. It is rendered as Markdown and sanitized. Default: <code>README.md</code>.</td></tr>
+    <tr><td><code>arrangement</code></td><td>The arrangement the thorns belong to, for a repo whose thorns sit at its root, or that is itself one thorn (see <a href="#layouts">repo layouts</a>). A repo laid out as <code>Arrangement/Thorn/</code> doesn't need it.</td></tr>
+    <tr><td><code>thorns</code></td><td>The thorns to publish, by directory name, such as <code>["CarpetX", "Loop"]</code>. Thorns found but not listed are left out. A repo that is itself one thorn names that thorn here. Default: every directory with an <code>interface.ccl</code>.</td></tr>
+    <tr><td><code>default-track</code></td><td>The track the package page shows first: a track name, or <code>"default"</code> for the unprefixed tags. Only the page uses it: a reference without a track always means the unprefixed track. Default: the unprefixed track.</td></tr>
+    <tr><td><code>tag-pattern</code></td><td>How release tags become versions when they aren't <code>vX.Y.Z</code>, such as <code>"ET_{major}_{minor}_v{patch}"</code>. With a pattern, only the tags it matches are versions, all on the default track. See <a href="/docs/versions#tag-pattern">tag patterns</a>. Default: <code>vX.Y.Z</code> and <code>track/vX.Y.Z</code>.</td></tr>
+    <tr><td><code>since</code></td><td>A version, such as <code>"2026.5.0"</code>: release tags below it aren't versions, for example releases from before the repo carried this file. Default: every release tag counts.</td></tr>
+  </tbody>
+</table></div>
+<p>The Cactarium reads <code>tag-pattern</code> and <code>since</code> from the manifest on the default branch when the repo is registered. After that it takes them from the newest version's manifest, so a change takes effect once a version that carries it has been read.</p>
+
+<h2 id="tracks">[tracks.NAME]</h2>
+<p>A track is a tag prefix: <code>mixed-precision/v1.2.0</code> is version 1.2.0 on track <code>mixed-precision</code> (see <a href="/docs/versions#tracks">tracks</a>). A track exists as soon as a tag uses it; this table only describes it.</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Field</th><th scope="col">What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>description</code></td><td>Shown under the track selector on the package page. The descriptions come from the newest published manifest.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="claims">Claims</h2>
+<p>Claims declare how the package relates to other entries. The Cactarium shows them under <em>Compatibility</em> on the package page and returns them from the API. They are statements, not instructions: nothing resolves them into a build.</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Table</th><th scope="col">Fields</th><th scope="col">Means</th></tr></thead>
+  <tbody>
+    <tr><td><code>[[fork-of]]</code></td><td><code>target</code>, <code>note</code></td><td>This package is a fork of the <code>target</code> package. It is listed under <em>Forks</em> on the upstream's page, with a link to <a href="/docs/finding#forks">compare the two</a>.</td></tr>
+    <tr><td><code>[[depends-on]]</code></td><td><code>target</code>, <code>range</code>, <code>note</code></td><td>This package needs the target package or stack.</td></tr>
+    <tr><td><code>[[works-with]]</code></td><td><code>target</code>, <code>range</code>, <code>note</code></td><td>Known to work with the target.</td></tr>
+    <tr><td><code>[[incompatible-with]]</code></td><td><code>target</code>, <code>range</code>, <code>note</code></td><td>Known not to work with the target.</td></tr>
+  </tbody>
+</table></div>
+<p><code>target</code> is a bare <code>owner/name</code>; versions go in <code>range</code>. A range is a version range on a track, such as <code>^1</code>, <code>mixed-precision:^1.2</code>, or a bare track name, meaning any version on that track. Without <code>range</code>, the claim covers every version on the target's default track. <code>note</code> is free text shown with the claim.</p>
+
+<h2 id="caveat">[[caveat]]</h2>
+<p>A note attached to one thorn, such as a platform requirement. <code>thorn</code> names the thorn and <code>note</code> says what to know. The package page marks the thorn on its <em>Thorns</em> tab and lists the note under <em>Compatibility</em>.</p>
+
+<h2 id="layouts">Repo layouts</h2>
+<p>A thorn is a directory with an <code>interface.ccl</code>. The Cactarium looks for thorns at three depths and needs to be told the arrangement when the path doesn't give it:</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Layout</th><th scope="col">The manifest needs</th></tr></thead>
+  <tbody>
+    <tr><td><code>Arrangement/Thorn/</code>, one or more arrangements</td><td>Nothing: the path names both.</td></tr>
+    <tr><td><code>Thorn/</code> at the root: the repo is one arrangement</td><td><code>arrangement = "CarpetX"</code></td></tr>
+    <tr><td>The repo root is itself one thorn</td><td><code>arrangement</code>, and <code>thorns</code> naming that one thorn</td></tr>
+  </tbody>
+</table></div>
+<p>The last layout is how the Einstein Toolkit's ExternalLibraries repos work: <code>ExternalLibraries-HDF5</code> holds the thorn <code>ExternalLibraries/HDF5</code> at its root.</p>
+<pre class="code">format = 1
+
+[package]
+name = "hdf5"
+owners = ["et"]
+arrangement = "ExternalLibraries"
+thorns = ["HDF5"]</pre>
+<p>Hidden directories and symbolic links are skipped. A version in which no thorn is found is invalid.</p>
+
+<h3 id="repo-path">Each thorn's place in a thornlist</h3>
+<p>For each thorn, the API tells CactUp the <code>!REPO_PATH</code> a thornlist section that clones the package's repo should use (<code>repo-path</code> in the API's thorn list), derived from where the thorn sits:</p>
+<ul>
+  <li><code>Arrangement/Thorn/</code>: <code>$1/$2</code>;</li>
+  <li><code>Thorn/</code> at the root: <code>$2</code>;</li>
+  <li>the repo is the thorn: <code>../$1-$2</code>, so the clone must be named <code>Arrangement-Thorn</code>, the Einstein Toolkit's convention for ExternalLibraries.</li>
+</ul>
+
+<h3 id="ccl">What is read from the CCL files</h3>
+<p>From each thorn's <code>interface.ccl</code> and <code>configuration.ccl</code>, the Cactarium reads <code>IMPLEMENTS</code>, <code>INHERITS</code>, <code>FRIEND</code>, the functions it requires, uses and provides, and the capabilities in <code>REQUIRES</code>, <code>REQUIRES THORNS</code>, <code>OPTIONAL</code> and <code>PROVIDES</code>. They appear on the package's <em>Thorns</em> tab and on thorn pages, feed search, and come back from the API. The Cactarium only reads text files; it never builds or runs anything from a repo.</p>
+{% endblock %}

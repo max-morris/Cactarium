@@ -223,10 +223,10 @@ pub fn repo_page(url: &str) -> String {
     u.strip_suffix(".git").unwrap_or(u).to_owned()
 }
 
-/// The contact a manifest declares (`[package] contact` or `[stack] contact`).
+/// The contact a manifest declares (`[package]`, `[stack]` or `[sim]` contact).
 pub fn manifest_contact(manifest: Option<&serde_json::Value>) -> Option<String> {
     let m = manifest?;
-    ["package", "stack"]
+    ["package", "stack", "sim"]
         .iter()
         .find_map(|k| m[k]["contact"].as_str().map(str::to_owned))
 }
@@ -238,7 +238,22 @@ pub async fn entry_contact(
     e: &Entry,
     repo_url: Option<&str>,
 ) -> AppResult<Option<String>> {
-    let declared = if e.kind == "sim" {
+    // A sim published from its repo: its cactarium-sim.toml's contact wins over the file's.
+    let from_manifest = if e.kind == "sim" {
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND review = 'approved' ORDER BY sort_key DESC LIMIT 1",
+        )
+        .bind(e.id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+        manifest_contact(m.as_ref())
+    } else {
+        None
+    };
+    let declared = if let Some(c) = from_manifest {
+        Some(c)
+    } else if e.kind == "sim" {
         let content: Option<String> = sqlx::query_scalar(
             "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND v.review = 'approved' ORDER BY v.sort_key DESC LIMIT 1",
         )

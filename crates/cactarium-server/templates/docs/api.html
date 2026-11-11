@@ -1,0 +1,94 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>HTTP API</h1>
+<p>CactUp talks to the Cactarium through a small JSON API. Its base URL is <code>{{ doc.base_url }}/api/v1</code>. Reads need no token and see public entries and published versions only: a pending or hidden entry answers 404, like a missing one. Writes need an <a href="#tokens">API token</a>.</p>
+<p>The response bodies are the Rust types in <a href="https://github.com/max-morris/cactup-ecosystem-common/blob/master/src/api.rs"><code>api.rs</code></a> of the shared crate <code>cactup-ecosystem-common</code>, which the server and CactUp both compile against; a stack release is <code>FrozenStack</code> in its <code>stack.rs</code>. Field names are kebab-case.</p>
+
+<h2 id="headers">Response headers</h2>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Header</th><th scope="col">Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>api-generation</code></td><td>On every response under <code>/api/v1</code>; currently <code>1</code>. A client that sees a generation it doesn't know should ask its user to upgrade rather than guess.</td></tr>
+    <tr><td><code>x-cactarium-unpinned</code></td><td><code>true</code> on every <code>@head</code> or <code>@master</code> response: the body is not a release and its repos are not all pinned.</td></tr>
+    <tr><td><code>x-cactarium-untrusted</code></td><td>On every <code>@head</code> or <code>@master</code> response: <code>true</code> when the entry isn't trusted (neither it nor its owner), whose branch tips nobody reviewed, else <code>false</code>. Releases don't carry it.</td></tr>
+    <tr><td><code>x-cactarium-contact</code></td><td>On every stack release response, <code>@head</code> and <code>@master</code> included: where to go for help with the stack, its declared <code>contact</code>, else its repo. Empty when it has neither.</td></tr>
+    <tr><td><code>x-sha256</code></td><td>On a sim download: the file's sha256, in hex.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="errors">Errors and limits</h2>
+<p>An error is a non-2xx status with a body like</p>
+<pre class="code">{"error": {"code": "not-found", "message": "Not found"}}</pre>
+<p>The code is one of <code>not-found</code>, <code>unauthorized</code>, <code>forbidden</code>, <code>bad-request</code>, <code>conflict</code>, <code>rate-limited</code> or <code>internal</code>, and the message is meant to be shown to the user as it is. Some endpoints are rate-limited per client address, per minute; past the limit they answer 429 with <code>rate-limited</code>.</p>
+
+<h2 id="reads">Read endpoints</h2>
+
+<h3 id="resolve"><code>GET /resolve?req=owner/name@range</code></h3>
+<p>The best version of a package, stack or sim matching a <a href="/docs/versions#ranges">reference</a>: the highest published, non-yanked, valid version in the range, on the track the range names. An exact request such as <code>@=1.2.3</code> also reaches a yanked version, which the response marks <code>"yanked": true</code>. For a package, <code>@head</code> and <code>@master</code> resolve to its default branch's tip, with the unpinned headers; for a stack they are refused (fetch <code>releases/head</code> instead).</p>
+<p>Response: <code>Resolved</code>. <code>slug</code> is the exact reference chosen, <code>kind</code> is <code>package</code>, <code>stack</code> or <code>sim</code>, <code>url</code> is the repo to fetch from (for an entry registered from a repo), <code>contact</code> is the version's declared contact or the repo, and the fields of <code>VersionInfo</code> follow inline.</p>
+<pre class="code">curl -G {{ doc.base_url }}/api/v1/resolve --data-urlencode 'req=max-morris/carpetx@mixed-precision:^1'</pre>
+<pre class="code">{
+  "slug": "max-morris/carpetx@mixed-precision:1.4.0",
+  "kind": "package",
+  "url": "https://github.com/max-morris/CarpetX.git",
+  "contact": "https://github.com/max-morris/CarpetX/issues",
+  "version": "mixed-precision:1.4.0",
+  "track": "mixed-precision",
+  "tag": "mixed-precision/v1.4.0",
+  "commit": "3f2c9e1a00112233445566778899aabbccddeeff",
+  "tree": "…",
+  "yanked": false,
+  "yank-reason": null,
+  "state": "ok",
+  "curated": false,
+  "published": 1762300800
+}</pre>
+<p><code>state</code> is <code>ok</code>, <code>invalid</code>, <code>tag-moved</code> (the tag points elsewhere upstream now; the frozen <code>commit</code> still counts) or <code>upstream-missing</code>. <code>published</code> is in Unix seconds. <code>tag</code> is null for versions named by commit and for uploads.</p>
+
+<h3 id="entry"><code>GET /entries/{owner}/{name}</code></h3>
+<p>Any entry. Response: <code>EntryInfo</code>: its <code>slug</code>, <code>kind</code>, <code>summary</code>, whether it is <code>verified</code> or <code>curated</code>, its <code>repo</code> and <code>contact</code>, its number of saves (<code>hearts</code>), its <code>tracks</code> (the default track as <code>""</code>) and the labels of its published <code>versions</code>.</p>
+
+<h3 id="package-versions"><code>GET /packages/{owner}/{name}/versions</code></h3>
+<p>Every published version of a package, newest first within each track, yanked and invalid ones included and marked. Response: <code>PackageVersions</code>, whose <code>versions</code> are <code>PackageVersion</code>s: the <code>VersionInfo</code> fields, the repo <code>url</code>, the <code>thorns</code> (<code>ThornInfo</code>: <code>arrangement</code>, <code>thorn</code>, the <a href="/docs/packages#repo-path"><code>repo-path</code></a> to write in a thornlist, and the CCL <code>facts</code>) and the <code>claims</code> (<code>ClaimInfo</code>: <code>kind</code>, <code>target</code>, <code>range</code>, <code>note</code>).</p>
+
+<h3 id="package-tip"><code>GET /packages/{owner}/{name}/versions/{head|master}</code></h3>
+<p>The package at its default branch's tip, read now, in the shape of one <code>PackageVersion</code> whose <code>version</code> is <code>head</code> or <code>master</code> (the two mean the same for a package). Carries <code>x-cactarium-unpinned</code> and <code>x-cactarium-untrusted</code>. For an untrusted package it answers 403 unless the site allows untrusted branch tips. Limited to 12 requests a minute.</p>
+
+<h3 id="stack-releases"><code>GET /stacks/{owner}/{name}/releases</code></h3>
+<p>A stack's published releases. Response: <code>StackReleases</code>: the <code>slug</code> and a list of <code>VersionInfo</code>.</p>
+
+<h3 id="stack-release"><code>GET /stacks/{owner}/{name}/releases/{version}</code></h3>
+<p>One release, by its exact version: <code>1.2.0</code>, or <code>track:1.2.0</code>. A yanked release is still served. Response: <code>FrozenStack</code>: <code>format</code>, the exact <code>stack</code> reference, <code>root</code>, the <code>thornlist</code> (<code>filename</code> and verbatim <code>text</code>), one <code>repo</code> entry per repo with its pin, and the <code>recipe</code> (the definition) it was cut from. Carries <code>x-cactarium-contact</code>.</p>
+<p>With <code>head</code> or <code>master</code> in place of the version, the response is the stack's <a href="/docs/stacks#tips">unpinned form</a>, resolved now: repos left on a branch tip have no <code>commit</code>, and <code>stack</code> ends in <code>@head</code> or <code>@master</code>. It carries <code>x-cactarium-unpinned</code> and <code>x-cactarium-untrusted</code>, answers 403 for an untrusted stack unless the site allows untrusted branch tips, and is limited to 12 requests a minute.</p>
+
+<h3 id="sim-download"><code>GET /sims/{owner}/{name}/{version}/download</code></h3>
+<p>One sim version's <code>.sim</code> file, by its exact version, such as <code>1.0.0</code>; a yanked version is still served. The body is the stored file (content type <code>application/toml</code>), with its sha256 in <code>x-sha256</code>.</p>
+
+<h2 id="tokens">API tokens</h2>
+<p>Write endpoints take a token in the <code>Authorization</code> header:</p>
+<pre class="code">Authorization: Bearer cactarium_…</pre>
+<p>Create tokens on your <a href="/settings">Settings</a> page, under API tokens: give each a name and a lifetime from 1 to 366 days. A token is shown once, when it is created, and stored only as a hash; revoke it there at any time. Every token has the scope <code>publish</code>: it publishes sims and stack releases, and refreshes repos, as its user, under the user's own name and the organizations the user belongs to. The site's operator can also create one with <code>just cli token &lt;username&gt;</code> (90 days unless <code>--days</code> says otherwise).</p>
+<p>A missing, expired or revoked token, or one whose user is banned, gets 401.</p>
+
+<h2 id="writes">Token endpoints</h2>
+<p>All three answer with what was created or found. <code>Published</code> holds the new version's exact <code>slug</code>, the <code>url</code> of its page on the site, its <code>visibility</code> (<code>public</code>, or <code>pending</code> while the entry or the release waits for <a href="/docs/review">review</a>), and <code>warnings</code> a reviewer will look at.</p>
+
+<h3 id="sim-publish"><code>POST /sims/{owner}/{name}</code></h3>
+<p>Publishes the request body, a <code>.sim</code> file, as a version of <code>owner/name</code>, creating the sim if it is new. The optional query parameter <code>version=X.Y.Z</code> names the version; without it the upload becomes the next major version. The file must pass <a href="/docs/sims#checks">the checks</a>; the <a href="/docs/sims#warnings">warnings</a> come back in <code>warnings</code>. Answers 409 if the version exists or <code>owner/name</code> is not a sim, 403 for a namespace you can't publish under, and 400 for a repo-backed sim or a file that fails a check. Limited to 20 requests a minute. Response: <code>Published</code>.</p>
+<pre class="code">curl -X POST -H "Authorization: Bearer $TOKEN" --data-binary @bhns.sim \
+  '{{ doc.base_url }}/api/v1/sims/max-morris/bhns-gw230529-dense?version=1.0.1'</pre>
+
+<h3 id="stack-publish"><code>POST /stacks/{owner}/{name}/releases</code></h3>
+<p>Cuts a release of an uploaded stack, creating the stack if it is new. The body is a JSON <code>ReleaseRequest</code>: the <code>definition</code> (the <code>cactarium-stack.toml</code> text, whose <code>[stack] name</code> must be <code>{name}</code>), the stack's own <code>thornlist</code> or <code>null</code>, and the <code>version</code>, <code>1.2.0</code> or <code>track:1.2.0</code>. Refused for a repo-backed stack or a version that exists. Limited to 10 requests a minute. Response: <code>Published</code>.</p>
+<pre class="code">{
+  "definition": "format = 1\n\n[stack]\nname = \"carpetx-mp\"\nextends = [\"et/carpetx-stack@1.0.0\"]\n",
+  "thornlist": null,
+  "version": "1.0.0"
+}</pre>
+
+<h3 id="refresh"><code>POST /packages/{owner}/{name}/refresh</code></h3>
+<p>Checks the entry's repo for new, moved and deleted tags now, like <em>Check for new tags now</em> on the site. The token's user must manage the entry. Despite the path, it works for any entry registered from a repo. Limited to 10 requests a minute. Response: <code>Refreshed</code>: the <code>slug</code>, how many versions this check added (<code>new-versions</code>), and how many of the entry's versions wait for review (<code>awaiting-review</code>).</p>
+
+<h2 id="other">Outside the API</h2>
+<p>The site's own downloads, <code>/{owner}/{name}/{version}/download.sim</code> for a sim and <code>/{owner}/{name}/{version}/download.th</code> for a stack's frozen thornlist, serve plain files. Forge webhooks go to <code>/hooks/{github|gitlab|bitbucket}/{entry-id}</code>; see <a href="/docs/publishing#new-tags">Publishing</a>.</p>
+{% endblock %}

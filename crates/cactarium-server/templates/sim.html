@@ -54,7 +54,7 @@
       {% for w in warnings %}<p class="alert warn small">{{ w }}</p>{% endfor %}
     </section>
     {% endif %}
-    {% if e.can_manage %}<a class="button ghost small" href="/new/sim?name={{ e.slug }}">Upload a new version</a>{% endif %}
+    {% if let Some(r) = repo %}{% include "_repo_manage.html" %}{% else if e.can_manage %}<a class="button ghost small" href="/new/sim?name={{ e.slug }}">Upload a new version</a>{% endif %}
   </aside>
 </div>
 {% endblock %}

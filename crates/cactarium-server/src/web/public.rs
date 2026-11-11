@@ -377,12 +377,54 @@ pub async fn owner(
     .into_response())
 }
 
+/// `/docs`: the overview.
 pub async fn docs(State(state): State<AppState>, v: Visitor) -> AppResult<Response> {
-    Ok(page(&DocsPage {
-        ctx: PageCtx::new(&state, v.0.as_ref()),
-        base_url: state.cfg.base_url.as_str().trim_end_matches('/').to_owned(),
-    })?
-    .into_response())
+    doc_page(&state, &v, "")
+}
+
+/// `/docs/{page}`: one page of the docs (see `DOC_PAGES`).
+pub async fn docs_page(
+    State(state): State<AppState>,
+    v: Visitor,
+    Path(name): Path<String>,
+) -> AppResult<Response> {
+    doc_page(&state, &v, &name)
+}
+
+fn doc_page(state: &AppState, v: &Visitor, name: &str) -> AppResult<Response> {
+    let html = crate::templates::docs_page(
+        name,
+        PageCtx::new(state, v.0.as_ref()),
+        state.cfg.base_url.as_str().trim_end_matches('/').to_owned(),
+        state.cfg.cactup_docs_url.clone(),
+    )
+    .ok_or(AppError::NotFound)??;
+    Ok(html.into_response())
+}
+
+/// The repo controls an entry's managers see, if it is released from a repo.
+async fn repo_manage(
+    state: &AppState,
+    entry: &Entry,
+    can_manage: bool,
+) -> AppResult<Option<RepoManage>> {
+    if !can_manage {
+        return Ok(None);
+    }
+    let Some(repo) = tracker::repo_of(state, entry.id).await? else { return Ok(None) };
+    let poll_error: Option<String> =
+        sqlx::query_scalar("SELECT poll_error FROM entry_repos WHERE entry_id = $1")
+            .bind(entry.id)
+            .fetch_optional(&state.db)
+            .await?
+            .flatten();
+    Ok(Some(RepoManage {
+        entry_url: entry.url(),
+        poll_error: poll_error.unwrap_or_default(),
+        webhook_base: state.cfg.url("/hooks"),
+        entry_id: entry.id,
+        secret: repo.webhook_secret,
+    }))
 }
 
 async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<EntryHead> {
@@ -663,15 +705,7 @@ async fn package_page(
     .bind(normalize_url(&e.repo_url))
     .fetch_all(&state.db)
     .await?;
-    let repo = tracker::repo_of(state, entry.id).await?;
-    let poll_error: String = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT poll_error FROM entry_repos WHERE entry_id = $1",
-    )
-    .bind(entry.id)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten()
-    .unwrap_or_default();
+    let repo = repo_manage(state, entry, e.can_manage).await?;
     let version_note = match current {
         Some(v) if v.state == "invalid" => {
             format!("This tag could not be published: {}", v.invalid_reason.as_deref().unwrap_or(""))
@@ -724,13 +758,7 @@ async fn package_page(
         tracks,
         add_cmd,
         version_note,
-        poll_error,
-        webhook_url: state.cfg.url(&format!("/hooks/github/{}", entry.id)),
-        webhook_secret: if e.can_manage {
-            repo.map(|r| r.webhook_secret).unwrap_or_default()
-        } else {
-            String::new()
-        },
+        repo,
         forks: entry_rows(state, forks).await?,
         upstreams,
         ctx,
@@ -797,14 +825,7 @@ async fn stack_page(
         Some(v) => claims_of(state, v.id).await?,
         None => vec![],
     };
-    let poll_error: String = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT poll_error FROM entry_repos WHERE entry_id = $1",
-    )
-    .bind(entry.id)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten()
-    .unwrap_or_default();
+    let repo = repo_manage(state, entry, e.can_manage).await?;
     let p = StackPage {
         version: current.map(|v| version_row(entry, v, None)),
         releases: versions.iter().map(|v| version_row(entry, v, current.map(|c| c.id))).collect(),
@@ -832,8 +853,7 @@ async fn stack_page(
         extends,
         claims,
         used_by: entry_rows(state, used_by).await?,
-        repo_backed: !e.repo_url.is_empty(),
-        poll_error,
+        repo,
         ctx,
         e,
     };
@@ -919,7 +939,9 @@ async fn sim_page(
         ParfileKind::Par => "",
         ParfileKind::Py => " (Python generator)",
     };
+    let repo = repo_manage(state, entry, e.can_manage).await?;
     let p = SimPage {
+        repo,
         tabs: tabs(
             &format!("{}/{}", entry.url(), current.label()),
             &[

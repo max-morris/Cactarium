@@ -1,0 +1,30 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Finding things</h1>
+
+<h2 id="search">Search</h2>
+<p>The search box at the top of every page, and the <a href="/search">search page</a>, match entry names (<code>owner/name</code>), summaries, the thorns and implementations a package provides, and the thorns a stack or a sim builds. Searching <code>CarpetX</code> among stacks lists the stacks one of whose releases builds a CarpetX thorn. Entries whose name matches exactly come first.</p>
+<p>Filter by kind: packages, stacks, sims or thorns. A thorn search matches thorn names, implementations and arrangements, and lists each thorn with the package that provides it and that package's latest version containing it. Only public, published versions count.</p>
+
+<h2 id="thorns">Thorn pages</h2>
+<p>Every thorn has a page: <code>/thorns/Arrangement/Thorn</code>, or <code>/thorns/Thorn</code> to match the name in any arrangement (Cactus thorn names are global). It shows:</p>
+<ul>
+  <li><strong>Provided by</strong>: the packages that contain the thorn, with the latest version that has it;</li>
+  <li><strong>Built by</strong>: the public stacks and sims whose newest release builds it. A thorn a thornlist only checks out (on its <code>!CHECKOUT</code> line) isn't built, so it doesn't count.</li>
+</ul>
+<p>Implementations have pages too: <code>/implementations/driver</code> lists the thorns that implement <code>driver</code>.</p>
+
+<h2 id="entries">On an entry's page</h2>
+<ul>
+  <li>A <strong>package</strong> has tabs for its README, its thorns with their CCL facts, its versions, and <em>Used by</em>: the stacks and sims that pin its repo. Its <em>Compatibility</em> box lists its claims and caveats. A track selector appears when it has several tracks, and the <code>cactup add</code> command is ready to copy.</li>
+  <li>A <strong>stack</strong> shows its frozen thornlist, the pin of every repo, what changed since the previous release, what it extends, and <em>Used as a base by</em>: the stacks that extend it.</li>
+  <li>A <strong>sim</strong> has tabs for its parfile, thornlist, pins, inputs, run hints and versions, and the <code>cactup import</code> command.</li>
+</ul>
+<p>In a pin table, a repo that a registered package uses links to that package (to the exact version, when the pinned commit is a version). Any other repo is marked <em>unregistered source</em> and links to a page listing everything on the Cactarium that pins it.</p>
+
+<h2 id="forks">Forks and the compare page</h2>
+<p>A package that declares <code>[[fork-of]]</code> appears under <em>Forks</em> on its upstream's page, and the fork's page links back. <em>Compare</em> opens <code>/compare?a=owner/upstream&amp;b=owner/fork</code>: the two packages side by side, with their newest versions, tracks, repos, contacts and claims, and which thorns only one of them has and which both have. Any two packages can be compared this way.</p>
+
+<h2 id="saves">Saves</h2>
+<p>Signed in, the heart button on an entry's page saves it; pressing it again removes the save. Saved entries are listed on your <a href="/dashboard">dashboard</a>. The number of saves is public: it shows on every entry's page, comes back from the API as <code>hearts</code>, and orders the stacks and sims on thorn pages.</p>
+{% endblock %}

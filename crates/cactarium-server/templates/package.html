@@ -52,21 +52,7 @@
       {% for f in forks %}<span><a class="mono" href="{{ f.url }}">{{ f.slug }}</a> <a class="small" href="/compare?a={{ e.slug }}&amp;b={{ f.slug }}">compare</a></span>{% if !f.summary.is_empty() %}<span class="small muted">{{ f.summary }}</span>{% endif %}{% endfor %}
     </section>
     {% endif %}
-    {% if e.can_manage %}
-    <section class="card stack-sm">
-      <h2 class="h-small">Manage</h2>
-      <form method="post" action="{{ e.url }}/refresh">
-        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
-        <button class="button small ghost" type="submit">Check for new tags now</button>
-      </form>
-      {% if !poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ poll_error }}</p>{% endif %}
-      <details><summary class="small">Webhook for instant updates</summary>
-        <p class="small">Payload URL: <code class="mono">{{ webhook_url }}</code></p>
-        <p class="small">Secret: <code class="mono">{{ webhook_secret }}</code></p>
-        <p class="muted small">GitHub: Settings › Webhooks, content type application/json, "Just the push event". GitLab: Tag push events, use the secret as the token.</p>
-      </details>
-    </section>
-    {% endif %}
+    {% if let Some(r) = repo %}{% include "_repo_manage.html" %}{% endif %}
   </aside>
 </div>
 {% endblock %}

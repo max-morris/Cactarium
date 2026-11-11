@@ -1,0 +1,45 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Review and trust</h1>
+<p>Anyone who signs in can publish, so an admin looks at what is new before it goes public, unless someone trusted vouches for it.</p>
+
+<h2 id="what">What is reviewed</h2>
+<ul>
+  <li><strong>New entries</strong>: a new package, stack or sim.</li>
+  <li><strong>Every new release of a public entry</strong>: a newly pushed version tag, an uploaded stack release, a new sim version.</li>
+</ul>
+<p>While an entry is itself waiting for review, its releases wait with it and are published when it is approved. Tags that already exist when a repo is registered count as published by the person registering it, so they are reviewed, or not, according to that person's trust. A tag found later by polling or a webhook has no publishing user; the trust of the entry and its owner decides.</p>
+
+<h2 id="pending">What pending means</h2>
+<p>A pending entry or release is hidden. Only the entry's managers (its owner, the members of the organization it belongs to) and the admins see it, marked "pending review" or "awaiting review". For everyone else it doesn't exist yet: it isn't listed or searchable, the API doesn't serve it, no range chooses it, and no stack can use it as a base.</p>
+<p>You can follow your submissions on your <a href="/dashboard">dashboard</a>, which lists each one's status and the reviewer's note.</p>
+
+<h2 id="decisions">Approve, request changes, reject</h2>
+<p>A reviewer sees the manifest or definition, the thorns and their CCL facts, the README, the claims, the frozen thornlist of a stack and what changed since its last release, a sim's <a href="/docs/sims#warnings">warnings</a>, and a checklist (for a package: a license, a README naming a maintainer, documentation, tests, thorn names that don't clash). Then they decide:</p>
+<ul>
+  <li><strong>Approve</strong>: the entry or release is published.</li>
+  <li><strong>Request changes</strong> (new entries only): the reviewer's note says what to change. The entry's page shows the note to its managers; once you've made the changes, <em>I've made the changes</em> puts it back in the queue.</li>
+  <li><strong>Reject</strong>: it stays hidden, and its managers see the note.</li>
+</ul>
+<p>A release can't get "changes requested", because a release never changes. To ask for a fix, the reviewer rejects it with a note, and the owner publishes a new version. A rejected release stays hidden for good.</p>
+
+<h2 id="trust">Trust</h2>
+<p>Trust lets publishing skip review. Three kinds of thing can be trusted:</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Trusted</th><th scope="col">Skips review for</th></tr></thead>
+  <tbody>
+    <tr><td>A user</td><td>the entries they create and every release they publish, and every new release of entries under their name. Admins count as trusted.</td></tr>
+    <tr><td>An organization</td><td>entries created under it, and every new release of its entries.</td></tr>
+    <tr><td>An entry</td><td>every new release of that entry.</td></tr>
+  </tbody>
+</table></div>
+<p>In full: a new entry is public at once when the user creating it is trusted (or an admin), or when it goes under a trusted user's or a trusted organization's name. A new release is published at once when the entry, its owner (user or organization), or the user publishing it is trusted. Anything else waits for review.</p>
+<p>Trusting someone later doesn't approve what is already waiting. Trust is also not the <em>verified</em> badge: an admin grants that per entry as a public signal, and it skips nothing.</p>
+
+<h2 id="granting">Who grants trust</h2>
+<p>By default only the superadmin grants or withdraws trust. The superadmin can let any admin do it, with the site setting <em>Who can mark users, organizations and entries trusted</em> under Admin, Site.</p>
+<p>Whoever may grant trust does it from Admin, Users (for a user), Admin, Entries (for an entry), the organization's page (for an organization), or the review form, which has boxes to trust the submitter or the entry along with the decision. The site's operator can also run <code>just cli admin trust &lt;name&gt;</code> with a username, an organization or an <code>owner/name</code>.</p>
+
+<h2 id="hidden">Hidden entries</h2>
+<p>Admins can also hide an entry that is already public. A hidden entry looks like a missing one to everyone but its managers and the admins, and its repo is no longer checked for new tags. The repos of banned users aren't checked either.</p>
+{% endblock %}

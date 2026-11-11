@@ -1,0 +1,30 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Organizations</h1>
+<p>Every entry lives in a namespace: the first half of <code>owner/name</code>. Your own namespace is your Cactarium name. An organization is a namespace that several people share, such as <code>et</code> for the Einstein Toolkit. Users and organizations share one set of names, so no organization can take a username or the other way round.</p>
+
+<h2 id="creating">Creating one</h2>
+<p>Anyone signed in can create an organization: <em>New organization</em> on the dashboard, or <a href="/orgs/new">/orgs/new</a>. Give it a name, which follows the same rules as usernames, and optionally a display name such as "Einstein Toolkit". You become its first owner.</p>
+<p>Some names are reserved, and so is a namespace that already holds entries. Only an admin can create an organization under one of those; an organization created for a namespace with entries takes them over.</p>
+
+<h2 id="roles">Owners and members</h2>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Role</th><th scope="col">Can</th></tr></thead>
+  <tbody>
+    <tr><td>Member</td><td>publish under the organization, and manage its entries as their own: check for new tags, upload new releases, yank versions, answer reviews.</td></tr>
+    <tr><td>Owner</td><td>everything a member can, plus add and remove members and make other owners.</td></tr>
+  </tbody>
+</table></div>
+<p>An organization always keeps at least one owner: make someone else an owner before the last one steps down. Any member can leave. Admins can manage every organization.</p>
+<p>The organization's management page, <code>/orgs/{name}</code>, lists its members and entries; its public page, <code>/{name}</code>, shows its entries to everyone.</p>
+
+<h2 id="publishing">Publishing under an organization</h2>
+<p>Once you belong to an organization, each form that publishes has a <em>Publish under</em> choice. A repo published under an organization lists the organization's name in its manifest's <code>owners</code>:</p>
+<pre class="code">[package]
+name = "carpetx"
+owners = ["et"]</pre>
+<p>A member's API token publishes under the organization too, so CactUp can publish sims and stack releases there.</p>
+
+<h2 id="trust">Organization trust</h2>
+<p>An organization can be trusted. Entries created under a trusted organization, and every new release of its entries, publish without review. Under an untrusted one they are reviewed, unless the entry or the member publishing is trusted. Organizations are trusted by the same people who trust users: the superadmin, or any admin if the superadmin allows it. See <a href="/docs/review#trust">Review and trust</a>.</p>
+{% endblock %}

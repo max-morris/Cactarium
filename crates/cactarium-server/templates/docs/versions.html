@@ -1,0 +1,61 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Versions and tracks</h1>
+<p>Packages, stack releases and sims are all versioned the same way: semantic versions, optionally on a named track.</p>
+
+<h2 id="semver">Semantic versions</h2>
+<p>A version is <code>MAJOR.MINOR.PATCH</code>, optionally with a pre-release suffix such as <code>2.0.0-rc.1</code>, which sorts before <code>2.0.0</code>. Bump the major version for incompatible changes, the minor one for additions, the patch for fixes.</p>
+
+<h2 id="tags">Version tags</h2>
+<p>In a repo, a version is a git tag: <code>v1.2.3</code> (the <code>v</code> is optional) on the default track, or <code>track/v1.2.3</code> on a track. Any other tag is ignored, not an error: <code>ET_2026_05</code>, <code>v1.2</code>, <code>a/b/v1.2.3</code> and <code>Upper/v1.2.3</code> are not versions. If two tags name the same version, the first one wins. A manifest can also choose a different scheme with a <a href="#tag-pattern">tag pattern</a>.</p>
+
+<h2 id="tracks">Tracks</h2>
+<p>A repo can carry several independent version lines, called tracks, as tag prefixes. Git refs can't contain a colon, so git writes the track with a slash and the Cactarium and CactUp write it with a colon: the tag <code>mixed-precision/v1.2.3</code> is version <code>1.2.3</code> on track <code>mixed-precision</code>, written <code>owner/pkg@mixed-precision:1.2.3</code>. Unprefixed tags are on the default track.</p>
+<p>Track names start with a lowercase letter, continue with lowercase letters, digits, <code>.</code>, <code>_</code> or <code>-</code>, and are at most 64 characters long. <code>default</code>, <code>x</code>, <code>head</code> and <code>master</code> are reserved. Each track has its own list of versions and its own latest version; a package's <code>default-track</code> only chooses which one its page shows first.</p>
+<p>Tracks are for variants within one repo. A fork in another repo is a separate package that declares <code>[[fork-of]]</code>.</p>
+
+<h2 id="ranges">References and ranges</h2>
+<p>What follows the <code>@</code> in a reference is a version range, in the same syntax as Cargo's:</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Reference</th><th scope="col">Chooses</th></tr></thead>
+  <tbody>
+    <tr><td><code>owner/pkg</code></td><td>the newest version on the default track</td></tr>
+    <tr><td><code>owner/pkg@1</code></td><td>the newest 1.x.x (the same as <code>^1</code>)</td></tr>
+    <tr><td><code>owner/pkg@^1.2</code></td><td>the newest 1.x.x from 1.2.0 on</td></tr>
+    <tr><td><code>owner/pkg@~1.2</code></td><td>the newest 1.2.x</td></tr>
+    <tr><td><code>owner/pkg@1.2.3</code></td><td>the newest 1.x.x from 1.2.3 on: a bare version is a caret range</td></tr>
+    <tr><td><code>owner/pkg@=1.2.3</code></td><td>exactly 1.2.3</td></tr>
+    <tr><td><code>owner/pkg@&gt;=1.2, &lt;2</code></td><td>the newest version in that interval</td></tr>
+    <tr><td><code>owner/pkg@mixed-precision:^1</code></td><td>the newest 1.x.x on track <code>mixed-precision</code></td></tr>
+    <tr><td><code>owner/pkg@mixed-precision</code></td><td>the newest version on track <code>mixed-precision</code></td></tr>
+  </tbody>
+</table></div>
+<p>Ranges never cross tracks: a reference without a track only ever matches the default track. A range chooses the highest matching version that is published (approved in review), not yanked and not invalid.</p>
+
+<h2 id="tag-pattern">Release tags that aren't vX.Y.Z: tag-pattern and since</h2>
+<p>Some projects tag releases their own way. A manifest's <code>tag-pattern</code> says how: literal text around <code>{major}</code>, <code>{minor}</code> and <code>{patch}</code>, each exactly once, with no spaces. The Einstein Toolkit's pattern is</p>
+<pre class="code">tag-pattern = "ET_{major}_{minor}_v{patch}"
+since = "2026.5.0"</pre>
+<p>which reads the tag <code>ET_2026_05_v0</code> as version 2026.5.0 and <code>ET_2025_11_v1</code> as 2025.11.1. With a pattern, only the tags it matches are versions, all on the default track. <code>since</code> leaves out every release tag below the version it names, for example releases from before the repo carried a manifest.</p>
+<p>Both fields exist in all three manifests (<code>[package]</code>, <code>[stack]</code>, <code>[sim]</code>) and in the overlay manifest of a <a href="/docs/curated">curated package</a>. The Cactarium reads them from the manifest on the default branch when the repo is registered, and afterward from the newest version's manifest.</p>
+
+<h2 id="frozen">Frozen commits</h2>
+<p>The first time the Cactarium sees a version tag, it records the commit and tree the tag names, and from then on that version means that commit. Moving a tag afterward changes nothing here:</p>
+<ul>
+  <li>If a tag <strong>moves</strong>, the Cactarium doesn't follow it. The version is marked "tag moved upstream; the frozen commit is still served", and an alert appears on the owner's dashboard and in the admins' <em>Tag alerts</em>.</li>
+  <li>If a tag is <strong>deleted</strong>, the version is marked "tag deleted upstream" and keeps its frozen commit. If the tag comes back at the same commit, the mark goes away.</li>
+</ul>
+<p>So don't move or reuse tags: publish a new version instead. Stack releases and sims are frozen the same way when they are published: their content never changes.</p>
+
+<h2 id="yanking">Yanking</h2>
+<p>Yanking marks a version as one not to use, typically a broken release. A yanked version stays downloadable by its exact version, but no range ever chooses it and listings skip it; its reason is shown with it. Nothing is deleted, and a yank can be undone.</p>
+<p>"Exact" means <code>=1.2.3</code> in a reference, a stack release or sim version fetched by its version, and a stack's <code>extends</code>, which names exact releases.</p>
+<p>Whoever manages the entry can yank: the user it belongs to, any member of the organization it belongs to, and admins. On the entry's page, open the <em>Versions</em> tab of a package or a sim, or the <em>Releases</em> list of a stack, type a reason next to the version and choose <em>Yank</em>. <em>Unyank</em> reverses it.</p>
+<p>The server's command line can do the same, acting as a user who manages the entry:</p>
+<pre class="code">just cli yank &lt;username&gt; &lt;owner/name&gt; &lt;version&gt; --reason "breaks the build with GCC 14"
+just cli unyank &lt;username&gt; &lt;owner/name&gt; &lt;version&gt;</pre>
+<p>Only the site's operator, who has a shell on the server, can run these.</p>
+
+<h2 id="tips">@head and @master</h2>
+<p>A stack's <code>@head</code> and <code>@master</code> are described under <a href="/docs/stacks#tips">Stacks</a>. A package has them too: <code>owner/pkg@head</code> and <code>owner/pkg@master</code> both mean the package at the tip of its default branch, read when asked. The API returns that commit, with the thorns and claims found there. They follow the stacks' rule: served for a trusted package, and for others only when the site allows untrusted branch tips. Neither is ever a version, and neither is reviewed.</p>
+{% endblock %}

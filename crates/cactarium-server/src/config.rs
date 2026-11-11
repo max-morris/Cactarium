@@ -32,7 +32,14 @@ pub struct Config {
     pub poll_interval: u64,
     /// Where the static files are.
     pub static_dir: String,
+    /// The base URL of CactUp's own documentation (its CLI and the `.sim` format), which the
+    /// site's docs link to instead of repeating it. No trailing slash.
+    pub cactup_docs_url: String,
 }
+
+/// Where CactUp's docs live until `CACTUP_DOCS_URL` says otherwise.
+const DEFAULT_CACTUP_DOCS_URL: &str =
+    "https://github.com/max-morris/Cactup/tree/feature/cactarium/cactupdocs/content";
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
@@ -88,6 +95,13 @@ impl Config {
                 .transpose()?
                 .unwrap_or(4 * 3600),
             static_dir: var("CACTARIUM_STATIC_DIR").unwrap_or_else(|| "static".into()),
+            cactup_docs_url: var("CACTUP_DOCS_URL")
+                .unwrap_or_else(|| DEFAULT_CACTUP_DOCS_URL.into())
+                .parse::<Url>()
+                .context("CACTUP_DOCS_URL is not a URL")?
+                .as_str()
+                .trim_end_matches('/')
+                .to_owned(),
             base_url,
         };
         if (cfg.dev_login || cfg.allow_local_repos) && !cfg.is_local() {

@@ -1,0 +1,15 @@
+<section class="card stack-sm">
+  <h2 class="h-small">Manage</h2>
+  <form method="post" action="{{ r.entry_url }}/refresh">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <button class="button small ghost" type="submit">Check for new tags now</button>
+  </form>
+  {% if !r.poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ r.poll_error }}</p>{% endif %}
+  <details><summary class="small">Webhook for instant updates</summary>
+    <p class="small">Secret: <code class="mono">{{ r.secret }}</code></p>
+    <p class="small"><strong>GitHub</strong> (Settings › Webhooks; content type application/json; "Just the push event"): <code class="mono">{{ r.webhook_base }}/github/{{ r.entry_id }}</code></p>
+    <p class="small"><strong>GitLab</strong> (Settings › Webhooks; Tag push events; the secret as the token): <code class="mono">{{ r.webhook_base }}/gitlab/{{ r.entry_id }}</code></p>
+    <p class="small"><strong>Bitbucket</strong> (Repository settings › Webhooks; Repository push; the secret): <code class="mono">{{ r.webhook_base }}/bitbucket/{{ r.entry_id }}</code></p>
+    <p class="muted small">Without a webhook, new tags are picked up within a few hours anyway.</p>
+  </details>
+</section>

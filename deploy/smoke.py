@@ -614,7 +614,7 @@ os.makedirs(os.path.join(srepo, "runs"))
 open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(qc0)
 open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(
     'format = 1\n\n[sim]\nname = "repo-sim"\nowners = ["max"]\nfile = "runs/qc0.sim"\n'
-    'description = "A sim kept in its repo"\n')
+    'description = "A sim kept in its repo"\ncontact = "https://example.org/sim-help"\n')
 sh("git", "init", "-q", "-b", "master", cwd=srepo)
 sh("git", "add", "-A", cwd=srepo); sh("git", *ident, "commit", "-q", "-m", "sim", cwd=srepo); sh("git", "tag", "v1.0.0", cwd=srepo)
 stag = sh("git", "rev-parse", "HEAD", cwd=srepo)
@@ -630,6 +630,15 @@ check("its tag is a sim version, with the repo and commit to fetch from",
 s, body, _ = anon.get("/api/v1/sims/max/repo-sim/1.0.0/download")
 check("the stored file is stamped with its version", s == 200 and 'cactarium = "max/repo-sim@1.0.0"' in body, body[:200])
 page(anon, "/max/repo-sim", contains="A sim kept in its repo")
+s, body, _ = anon.get("/api/v1/resolve?req=max/repo-sim@1")
+check("cactarium-sim.toml's contact wins over the file's", '"contact":"https://example.org/sim-help"' in body, body[:300])
+text = page(maxv, "/max/repo-sim")
+check("its managers get the repo controls, with each forge's webhook URL",
+      "Check for new tags now" in text and "/hooks/gitlab/" in text and "/hooks/bitbucket/" in text and "Upload a new version" not in text)
+for d in ["/docs/publishing", "/docs/packages", "/docs/stacks", "/docs/sims", "/docs/versions", "/docs/review",
+          "/docs/organizations", "/docs/curated", "/docs/finding", "/docs/api"]:
+    page(anon, d)
+page(anon, "/docs/nonsense", expect=404)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/repo-sim", raw=qc0.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
 check("a sim released from its repo takes no uploads", s == 400 and "released from its repo" in body, f"{s} {body[:200]}")
 

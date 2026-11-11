@@ -1,0 +1,54 @@
+{% extends "docs/_layout.html" %}
+{% block doc %}
+<h1>Curated packages</h1>
+<p>Many repos, including most of the Einstein Toolkit's, have no <code>cactarium.toml</code> of their own yet. A curated package covers such a repo: Cactarium admins write its manifest, and the Cactarium keeps it instead of reading it from the repo. Everything else works as for any package. The page marks it <em>curated</em>: published by Cactarium admins for a repo whose authors haven't published it themselves.</p>
+<p>A curated package is a stopgap. When the maintainers commit their own manifest, it is handed over to them.</p>
+
+<h2 id="versions">Where its versions come from</h2>
+<ul>
+  <li><strong>Upstream tags.</strong> Tags named <code>vX.Y.Z</code>, or those matching the manifest's <code>tag-pattern</code> (such as <code>ET_{major}_{minor}_v{patch}</code>), from its <code>since</code> on. They are read and frozen exactly as for a registered package; see <a href="/docs/versions#frozen">frozen commits</a>. A new upstream tag goes through review unless the entry or its owner is trusted.</li>
+  <li><strong>Commits.</strong> For a repo without usable tags, an admin names a version and the full commit id it stands for. The commit must be fetchable from the repo. These versions are frozen the same way, published at once, and marked <em>curated</em> on the Versions tab; the API gives them no tag and <code>"curated": true</code>.</li>
+</ul>
+
+<h2 id="maintainers">For maintainers: taking it over</h2>
+<p>If your repo is on the Cactarium as a curated package and you'd like to maintain the entry yourself:</p>
+<ol class="steps">
+  <li>Commit a <code>cactarium.toml</code> (see <a href="/docs/packages">the reference</a>) to your repo's default branch. Give it the same <code>name</code> as the curated package, and list the package's current owner, the part before the slash (such as <code>et</code>), in <code>owners</code>. If you'd like the entry moved under your own name or organization, list that as well.</li>
+  <li>Ask a Cactarium admin to choose <em>Use the repo's manifest</em> for the package, and to move it to your namespace if you want that.</li>
+</ol>
+<p>The hand-over keeps the package's name, its URL and every version already published. From then on the Cactarium reads your manifest at each new tag: its <code>tag-pattern</code> and <code>since</code> decide which tags are versions, and its <code>owners</code> must keep naming the entry's owner. The <em>curated</em> mark goes away.</p>
+
+<h2 id="admins">For admins</h2>
+<h3 id="creating">Creating one</h3>
+<p>Under Admin, Curated, <em>New curated package</em> takes the owner namespace (<code>cactarium</code> by default, or an organization such as <code>et</code>), the repo's URL, and the overlay manifest: a <code>cactarium.toml</code> in the usual schema. Its <code>owners</code> may not be empty, but nothing checks it against the repo. The repo's existing tags become versions at once, vouched for by you.</p>
+<pre class="code">format = 1
+
+[package]
+name = "carpetx"
+owners = ["et"]
+description = "CarpetX, the AMReX-based driver"
+tag-pattern = "ET_{major}_{minor}_v{patch}"
+since = "2026.5.0"</pre>
+<p>Each curated package's card has <em>Add version</em>: a version (<code>1.0.0</code>, or <code>track:1.0.0</code>) and a full commit id.</p>
+
+<h3 id="bulk">Many at once</h3>
+<p><code>just curate &lt;admin&gt; curate.toml</code> creates or updates curated packages from a file that lists one <code>[[package]]</code> per repo, as the given admin:</p>
+<pre class="code">[[package]]
+owner = "et"
+url = "https://github.com/EinsteinToolkit/ExternalLibraries-HDF5"
+manifest = "manifests/hdf5.toml"   # relative to this file
+
+[[package.version]]                 # optional: versions by commit
+version = "2026.5.0"
+commit = "…full commit id…"</pre>
+<p>Running it again updates the URL and manifest of packages that changed and adds missing versions. A package that has been handed over to its repo's manifest is left alone. <code>tag-pattern</code> and <code>since</code> belong in each manifest, not in this file.</p>
+
+<h3 id="hand-over">Handing over</h3>
+<p><em>Use the repo's manifest</em> checks the <code>cactarium.toml</code> on the repo's default branch: it must give the package's name and list its owner in <code>owners</code>. Then the overlay is dropped, the package stops being curated, its tag rule becomes the repo manifest's, and its tags are checked at once. To move the entry to the maintainers' namespace, use <em>transfer</em> under Admin, Entries.</p>
+
+<h3 id="moved">A repo that moved</h3>
+<p>When a repo moves, say to another GitHub owner, Admin, Entries, <em>move repo</em> points the entry at the new URL, after checking that the new URL holds the same history: every frozen tag at the same commit, every commit-named version fetchable. A changed URL in a curate file gets the same check.</p>
+
+<h3 id="stacks">Curated stacks</h3>
+<p>Stacks need no special mechanism: keep a manifest repo of our own with the stack file, tag it, and register it like any repo.</p>
+{% endblock %}
