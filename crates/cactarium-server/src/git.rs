@@ -234,6 +234,76 @@ pub async fn resolve_tag(policy: GitPolicy, url: &str, tag: &str) -> anyhow::Res
         .map(|r| r.commit))
 }
 
+/// What an abbreviated commit id matches in a repo's history.
+pub enum PrefixMatch {
+    One(String),
+    None,
+    /// More than one commit starts with it: the full ids.
+    Many(Vec<String>),
+}
+
+/// Where the history-only mirrors live: `CACTARIUM_MIRRORS`, else a folder in the temp dir. They
+/// are a cache; deleting one only costs a clone.
+fn mirror_root() -> PathBuf {
+    std::env::var_os("CACTARIUM_MIRRORS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("cactarium-mirrors"))
+}
+
+/// One mirror operation at a time: clones and fetches of the same mirror must not overlap.
+static MIRRORS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Resolves an abbreviated commit id against the repo's history, kept in a bare, blobless mirror
+/// (commits and trees, no file contents): cloned on first use, fetched again when the prefix isn't
+/// found. A full id is returned as it is; whether it exists is for the checkout to find out.
+pub async fn resolve_commit_prefix(policy: GitPolicy, url: &str, prefix: &str) -> anyhow::Result<PrefixMatch> {
+    if prefix.len() == 40 || prefix.len() == 64 {
+        return Ok(PrefixMatch::One(prefix.to_owned()));
+    }
+    let t = check(policy, url).await?;
+    let _one_at_a_time = MIRRORS.lock().await;
+    let root = mirror_root();
+    std::fs::create_dir_all(&root).with_context(|| format!("cannot create '{}'", root.display()))?;
+    let dir = root.join(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(t.url.as_bytes())));
+    let home = tempfile::tempdir()?;
+    if !dir.join("HEAD").exists() {
+        let mut c = git_to(policy, home.path(), &t);
+        c.args(["clone", "--quiet", "--bare", "--filter=blob:none", "--", &t.url]).arg(&dir);
+        run(c, "mirroring the repo's history").await?;
+    }
+    let lookup = |home: &Path| {
+        let mut c = git(policy, home);
+        c.arg("-C").arg(&dir).args(["rev-parse", &format!("--disambiguate={prefix}")]);
+        c
+    };
+    let mut found = commits_only(policy, home.path(), &dir, &run(lookup(home.path()), "looking up the commit").await.unwrap_or_default()).await?;
+    if found.is_empty() {
+        let mut c = git_to(policy, home.path(), &t);
+        c.arg("-C").arg(&dir).args(["fetch", "--quiet", "--prune", "--tags", "origin"]);
+        run(c, "updating the repo's history").await?;
+        found = commits_only(policy, home.path(), &dir, &run(lookup(home.path()), "looking up the commit").await.unwrap_or_default()).await?;
+    }
+    Ok(match found.len() {
+        0 => PrefixMatch::None,
+        1 => PrefixMatch::One(found.remove(0)),
+        _ => PrefixMatch::Many(found),
+    })
+}
+
+/// The commits among the object ids `git rev-parse --disambiguate` listed (trees share prefixes).
+async fn commits_only(policy: GitPolicy, home: &Path, dir: &Path, listed: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for id in listed.split_whitespace() {
+        let mut c = git(policy, home);
+        c.arg("-C").arg(dir).args(["cat-file", "-t", id]);
+        if run(c, "reading an object's type").await.is_ok_and(|t| t.trim() == "commit") {
+            out.push(id.to_owned());
+        }
+    }
+    Ok(out)
+}
+
 /// A commit checked out into a temporary directory, removed when dropped.
 pub struct Checkout {
     _dir: tempfile::TempDir,

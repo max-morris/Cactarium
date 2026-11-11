@@ -688,8 +688,8 @@ check("a commit a version froze resolves as that version", s == 200 and json.loa
 unrel = git("carpetx", "commit-tree", "master^{tree}", "-p", "master", "-m", "Unreleased")
 git("carpetx", "update-ref", "refs/heads/unreleased", unrel)
 s, body, hdrs = anon.get(f"/api/v1/resolve?req=max/carpetx@{unrel}")
-check("another commit of a trusted package is the package at that commit",
-      s == 200 and json.loads(body)["slug"] == f"max/carpetx@{unrel}" and f'"commit":"{unrel}"' in body
+check("another commit of a trusted package is the package at that commit (named with #)",
+      s == 200 and json.loads(body)["slug"] == f"max/carpetx#{unrel}" and f'"commit":"{unrel}"' in body
       and hdrs.get("x-cactarium-untrusted") == "false" and "x-cactarium-unpinned" not in hdrs, f"{s} {body[:200]} {hdrs}")
 s, body, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{unrel}")
 check("versions/<commit> gives its thorns", s == 200 and '"thorn":"Arith"' in body and f'"version":"{unrel}"' in body, f"{s} {body[:200]}")
@@ -701,8 +701,22 @@ s, body, _ = anon.get(f"/api/v1/packages/et/fakelib/versions/{fv}")
 check("versions/<that commit> is the version", s == 200 and '"version":"2026.5.0"' in body, f"{s} {body[:200]}")
 s, body, _ = anon.get(f"/api/v1/resolve?req=et/fakelib@{fold}")
 check("an untrusted package at a commit no version froze is refused by default", s == 403 and "no published version is at that commit" in body, f"{s} {body[:200]}")
-s, _, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{head[:7]}")
-check("an abbreviated commit is not a commit", s == 404, s)
+# Abbreviated ids (7+ hex digits), resolved against the repo's history; '#' names only commits,
+# '@' tries a commit only after every other reading.
+s, body, _ = anon.get(f"/api/v1/resolve?req=" + urllib.parse.quote(f"max/carpetx#{unrel[:7]}"))
+check("#<abbreviated> resolves to the full commit", s == 200 and json.loads(body)["slug"] == f"max/carpetx#{unrel}", body[:200])
+s, body, _ = anon.get(f"/api/v1/resolve?req=max/carpetx@{unrel[:9]}")
+check("@<abbreviated> falls back to the commit when it names no version", s == 200 and json.loads(body)["slug"] == f"max/carpetx#{unrel}", body[:200])
+s, body, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{unrel[:8]}")
+check("versions/<abbreviated> reads the package there", s == 200 and f'"version":"{unrel}"' in body, f"{s} {body[:200]}")
+s, body, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{v110[:7]}")
+check("an abbreviated version commit is the version", s == 200 and '"version":"1.1.0"' in body, f"{s} {body[:200]}")
+s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote("max/carpetx#0000000"))
+check("a prefix no commit has is refused", s == 400 and "has no commit 0000000" in body, f"{s} {body[:200]}")
+s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote("max/carpetx#beef12"))
+check("'#' needs at least 7 hex digits", s == 400, f"{s} {body[:200]}")
+s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@1.0.0")
+check("@ prefers a version over everything else", s == 200 and json.loads(body)["slug"] == "max/carpetx@1.0.0", body[:200])
 
 print()
 if FAILED:

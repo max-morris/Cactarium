@@ -199,54 +199,39 @@ pub async fn resolve(
         };
         return Ok((tip_headers(trusted), Json(body)).into_response());
     }
-    if let Some(commit) = slug.commit() {
-        if e.kind != "package" {
-            return Err(AppError::bad("only a package can be named by commit; name a stack or sim by its version").into());
-        }
-        // A commit some version froze is that version; any other is the package as it is there.
-        if let Some(v) = version_at_commit(&state, &e, commit).await? {
-            let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
-            let contact = model::manifest_contact(v.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page));
-            return Ok(Json(Resolved {
-                slug: format!("{}@{}", e.slug(), v.label()),
-                kind: e.kind.clone(),
-                url,
-                contact,
-                version: version_info(&v),
-            })
-            .into_response());
-        }
-        let trusted = unreviewed_allowed(&state, &e, commit, Unreviewed::Commit).await?;
-        let t = package_snapshot(&state, &e, ip, Some(commit)).await?;
-        let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
-        let contact = model::entry_contact(&state, &e, url.as_deref()).await?;
-        let body = Resolved {
-            slug: format!("{}@{commit}", e.slug()),
-            kind: e.kind.clone(),
-            url,
-            contact,
-            version: tip_version_info(&e, commit, &t),
-        };
-        return Ok(([untrusted_header(trusted)], Json(body)).into_response());
+    // `#<sha>` names only a commit.
+    if let Some(prefix) = slug.sha() {
+        return commit_answer(&state, &e, ip, prefix).await;
     }
     let versions = model::versions(&state, e.id).await?;
-    // Packages, stacks and sims alike: a semver range (`@1` is 1.x.x), or an exact `=X.Y.Z`.
-    let best = {
-        let req = slug.req().map_err(AppError::bad)?;
-        // An exact request (`=1.2.3`) still reaches a yanked version, which the response marks
-        // `yanked`; a range never chooses one.
-        let exact = req.req.comparators.len() == 1 && {
-            let c = &req.req.comparators[0];
-            c.op == semver::Op::Exact && c.minor.is_some() && c.patch.is_some()
-        };
-        versions
-            .iter()
-            .filter(|v| v.usable() || (exact && v.yanked && v.approved() && v.state != "invalid"))
-            .filter_map(|v| model::tracked(v).map(|t| (t, v)))
-            .filter(|(t, _)| req.matches(t))
-            .max_by(|a, b| a.0.version.cmp(&b.0.version))
-            .map(|(_, v)| v)
-            .ok_or_else(|| AppError::bad(format!("no version of {} matches {req}", e.slug())))?
+    // Packages, stacks and sims alike: a semver range (`@1` is 1.x.x), or an exact version. Every
+    // reading of `@<x>` other than a commit wins; a package tries `<x>` as a commit only when it
+    // matches nothing (or isn't a version or range at all) and looks like one.
+    let matched: Result<&Version, AppError> = match slug.req() {
+        Err(e) => Err(AppError::bad(e)),
+        Ok(req) => {
+            // An exact request (`1.2.3`) still reaches a yanked version, which the response marks
+            // `yanked`; a range never chooses one.
+            let exact = req.req.comparators.len() == 1 && {
+                let c = &req.req.comparators[0];
+                c.op == semver::Op::Exact && c.minor.is_some() && c.patch.is_some()
+            };
+            versions
+                .iter()
+                .filter(|v| v.usable() || (exact && v.yanked && v.approved() && v.state != "invalid"))
+                .filter_map(|v| model::tracked(v).map(|t| (t, v)))
+                .filter(|(t, _)| req.matches(t))
+                .max_by(|a, b| a.0.version.cmp(&b.0.version))
+                .map(|(_, v)| v)
+                .ok_or_else(|| AppError::bad(format!("no version of {} matches {req}", e.slug())))
+        }
+    };
+    let best = match matched {
+        Ok(v) => v,
+        Err(err) => match slug.commit_fallback() {
+            Some(prefix) if e.kind == "package" => return commit_answer(&state, &e, ip, prefix).await,
+            _ => return Err(err.into()),
+        },
     };
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
     let contact = match e.kind.as_str() {
@@ -264,30 +249,87 @@ pub async fn resolve(
     .into_response())
 }
 
+/// `@<commit>` (as a fallback) or `#<commit>` on `/resolve`: the version frozen at that commit if
+/// there is one, else the package read there, served under the untrusted-code rule. The answer
+/// always names the full commit (`owner/pkg#<sha>`).
+async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) -> ApiResult<Response> {
+    if e.kind != "package" {
+        return Err(AppError::bad("only a package can be named by commit; name a stack or sim by its version").into());
+    }
+    let commit = full_commit(state, e, prefix).await?;
+    let url = tracker::repo_of(state, e.id).await?.map(|r| r.url);
+    if let Some(v) = version_at_commit(state, e, &commit).await? {
+        let contact = model::manifest_contact(v.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page));
+        return Ok(Json(Resolved {
+            slug: format!("{}@{}", e.slug(), v.label()),
+            kind: e.kind.clone(),
+            url,
+            contact,
+            version: version_info(&v),
+        })
+        .into_response());
+    }
+    let trusted = unreviewed_allowed(state, e, &commit, Unreviewed::Commit).await?;
+    let t = package_snapshot(state, e, ip, Some(&commit)).await?;
+    let contact = model::entry_contact(state, e, url.as_deref()).await?;
+    let body = Resolved {
+        slug: format!("{}#{commit}", e.slug()),
+        kind: e.kind.clone(),
+        url,
+        contact,
+        version: tip_version_info(e, &commit, &t),
+    };
+    Ok(([untrusted_header(trusted)], Json(body)).into_response())
+}
+
+/// The full commit id `prefix` names in the package's repo (abbreviated ids are resolved against
+/// the repo's history; one that matches several commits is refused, listing them).
+async fn full_commit(state: &AppState, e: &Entry, prefix: &str) -> ApiResult<String> {
+    let repo = tracker::repo_of(state, e.id).await?.ok_or(AppError::NotFound)?;
+    let policy = GitPolicy { allow_local: state.cfg.allow_local_repos };
+    match git::resolve_commit_prefix(policy, &repo.url, prefix).await.map_err(AppError::bad)? {
+        git::PrefixMatch::One(c) => Ok(c),
+        git::PrefixMatch::None => Err(AppError::bad(format!("{} has no commit {prefix}", e.slug())).into()),
+        git::PrefixMatch::Many(all) => {
+            let shown: Vec<String> = all.iter().take(5).map(|c| c[..12].to_owned()).collect();
+            Err(AppError::bad(format!(
+                "{prefix} matches {} commits of {} ({}); give more digits",
+                all.len(),
+                e.slug(),
+                shown.join(", ")
+            ))
+            .into())
+        }
+    }
+}
+
 /// `GET /packages/{owner}/{name}/versions/{head|master|<commit>}`: the package at its default
-/// branch's tip, or at one full commit id, read now, in the shape of one released version. A
-/// commit some version froze answers with that version.
+/// branch's tip, or at a commit (full or abbreviated, at least 7 hex digits), read now, in the
+/// shape of one released version. A commit some version froze answers with that version.
 pub async fn package_tip(
     State(state): State<AppState>,
     ip: ClientIp,
     Path((owner, name, tip)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
-    let commit = cactup_ecosystem_common::slug::is_commit_id(&tip).then_some(tip.as_str());
-    if commit.is_none() && tip != "head" && tip != "master" {
+    let at = tip.to_ascii_lowercase();
+    let is_commit = cactup_ecosystem_common::slug::is_commit_prefix(&at);
+    if !is_commit && at != "head" && at != "master" {
         return Err(AppError::NotFound.into());
     }
     let e = public_entry(&state, &owner, &name, Some("package")).await?;
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
-    if let Some(c) = commit
+    let commit = if is_commit { Some(full_commit(&state, &e, &at).await?) } else { None };
+    if let Some(c) = &commit
         && let Some(v) = version_at_commit(&state, &e, c).await?
     {
         return Ok(Json(version_body(&state, &v, &url).await?).into_response());
     }
+    let label = commit.clone().unwrap_or(at);
     let kind = if commit.is_some() { Unreviewed::Commit } else { Unreviewed::Tip };
-    let trusted = unreviewed_allowed(&state, &e, &tip, kind).await?;
-    let t = package_snapshot(&state, &e, ip, commit).await?;
+    let trusted = unreviewed_allowed(&state, &e, &label, kind).await?;
+    let t = package_snapshot(&state, &e, ip, commit.as_deref()).await?;
     let body = PackageVersion {
-        version: tip_version_info(&e, &tip, &t),
+        version: tip_version_info(&e, &label, &t),
         url,
         thorns: t
             .thorns
@@ -363,8 +405,9 @@ async fn unreviewed_allowed(state: &AppState, e: &Entry, at: &str, kind: Unrevie
             Unreviewed::Tip => "its branch tips are never reviewed",
             Unreviewed::Commit => "no published version is at that commit, so it was never reviewed",
         };
+        let sep = if kind == Unreviewed::Commit { '#' } else { '@' };
         return Err(AppError::Denied(format!(
-            "{}@{at} is not served: the {} isn't trusted, and {never}. {what}",
+            "{}{sep}{at} is not served: the {} isn't trusted, and {never}. {what}",
             e.slug(),
             e.kind
         ))
