@@ -926,6 +926,7 @@ async fn sim_page(
             description: i.description.clone().unwrap_or_default(),
             url: i.url.clone().unwrap_or_default(),
             sha256: i.sha256.clone().unwrap_or_default(),
+            repo_file: i.repo_file.clone().unwrap_or_default(),
             unpack: i.unpack,
             path: i.path.clone().unwrap_or_default(),
             fixups: i

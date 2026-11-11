@@ -874,6 +874,20 @@ async fn prepare(
             .map_err(AppError::bad)?
             .ok_or_else(|| AppError::bad(format!("'{}' does not exist at this tag", sim.file)))?;
         let checked = crate::sims::check(text.as_bytes())?;
+        // Inputs read from this repo must be files at this tag (inside the repo, not via a link).
+        for i in &checked.sim.inputs {
+            let Some(f) = &i.repo_file else { continue };
+            let path = co.path.join(f);
+            let inside = std::fs::canonicalize(&path).is_ok_and(|real| {
+                std::fs::canonicalize(&co.path).is_ok_and(|root| real.starts_with(root))
+            });
+            if !(inside && path.is_file()) {
+                return Err(AppError::bad(format!(
+                    "input {}: '{f}' is not a file in the repo at this tag",
+                    i.knob
+                )));
+            }
+        }
         p.sim = Some((checked, sim.description.clone()));
     }
     let _ = r;

@@ -110,9 +110,10 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     // Not a problem, but what an import fetches and writes is worth a reviewer's look.
     for i in sim.inputs.iter().filter(|i| i.unpack) {
         warnings.push(format!(
-            "input {} downloads and unpacks {}{}",
+            "input {} {} {}{}",
             i.knob,
-            i.url.as_deref().unwrap_or("?"),
+            if i.repo_file.is_some() { "unpacks the repo's" } else { "downloads and unpacks" },
+            i.url.as_deref().or(i.repo_file.as_deref()).unwrap_or("?"),
             match i.fixups.len() {
                 0 => String::new(),
                 n => format!(", then edits {n} line(s) in it"),
@@ -208,6 +209,12 @@ pub async fn publish(
             .await?
         }
     };
+    if let Some(i) = sim.inputs.iter().find(|i| i.repo_file.is_some()) {
+        return Err(AppError::bad(format!(
+            "input {} reads a file from the sim's repo (repo-file), so only a sim published from its repo can carry it; give it a url and sha256 instead",
+            i.knob
+        )));
+    }
     if tracker::repo_of(state, entry.id).await?.is_some() {
         return Err(AppError::bad(format!(
             "{} is released from its repo; push a version tag instead",
@@ -380,6 +387,7 @@ commit = "{SHA}"
             description: None,
             url: None,
             sha256: None,
+            repo_file: None,
             unpack: false,
             path: None,
             fixups: vec![],

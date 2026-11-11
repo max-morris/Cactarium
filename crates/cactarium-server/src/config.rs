@@ -37,9 +37,9 @@ pub struct Config {
     pub cactup_docs_url: String,
 }
 
-/// Where CactUp's docs live until `CACTUP_DOCS_URL` says otherwise.
-const DEFAULT_CACTUP_DOCS_URL: &str =
-    "https://github.com/max-morris/Cactup/tree/feature/cactarium/cactupdocs/content";
+/// Where CactUp's docs are published (from its master branch), unless `CACTUP_DOCS_URL` says
+/// otherwise.
+const DEFAULT_CACTUP_DOCS_URL: &str = "https://max-morris.github.io/Cactup";
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())

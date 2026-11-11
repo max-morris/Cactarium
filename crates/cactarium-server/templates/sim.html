@@ -18,7 +18,11 @@
       {% for i in inputs %}<div class="card stack-sm">
         <span class="mono strong">{{ i.knob }}</span>
         {% if !i.description.is_empty() %}<span>{{ i.description }}</span>{% endif %}
-        {% if i.url.is_empty() %}<span class="small muted">cactup asks for a value on import (or <span class="mono">--input {{ i.knob }}=…</span>).</span>
+        {% if !i.repo_file.is_empty() %}
+          <span class="small">{% if i.unpack %}Unpacks{% else %}Uses{% endif %} <span class="mono">{{ i.repo_file }}</span> from the sim's repo, at this version's commit.</span>
+          {% if i.unpack %}<span class="small">The input is set to {% if i.path.is_empty() %}the unpacked folder{% else %}<span class="mono">{{ i.path }}</span> inside it{% endif %}.</span>{% endif %}
+          {% for f in i.fixups %}<span class="small">Then, in <span class="mono">{{ f.0 }}</span>, replaces <span class="mono">{{ f.1 }}</span> with <span class="mono">{{ f.2 }}</span> (<span class="mono">{dir}</span> is where it was unpacked).</span>{% endfor %}
+        {% else if i.url.is_empty() %}<span class="small muted">cactup asks for a value on import (or <span class="mono">--input {{ i.knob }}=…</span>).</span>
         {% else %}
           <span class="small">{% if i.unpack %}Downloads and unpacks{% else %}Downloads{% endif %} <a class="mono" href="{{ i.url }}">{{ i.url }}</a></span>
           {% if !i.sha256.is_empty() %}<span class="small muted mono">sha256 {{ i.sha256 }}</span>{% endif %}

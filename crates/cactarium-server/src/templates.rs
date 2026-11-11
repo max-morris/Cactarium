@@ -100,6 +100,8 @@ pub struct InputRow {
     pub description: String,
     pub url: String,
     pub sha256: String,
+    /// A file in the sim's own repo, at the version's commit.
+    pub repo_file: String,
     pub unpack: bool,
     /// The file in the unpacked archive the knob is set to (empty: the folder itself).
     pub path: String,
@@ -523,11 +525,16 @@ impl DocsCtx {
         })
     }
 
-    /// A link into CactUp's own docs on `topic` (`cli`, `sim-format`, `inputs`, `publishing`).
-    /// Every topic leads to the docs' base URL (`CACTUP_DOCS_URL`) for now; once CactUp's pages
-    /// settle, map each topic to its page here.
-    pub fn cactup(&self, _topic: &str) -> &str {
-        &self.cactup_docs
+    /// A link into CactUp's own docs (`CACTUP_DOCS_URL`) on `topic`: `cli`, `sim-format`,
+    /// `inputs` or `publishing`.
+    pub fn cactup(&self, topic: &str) -> String {
+        let page = match topic {
+            "cli" => "reference/cli.html",
+            "sim-format" => "reference/sim-format.html",
+            "inputs" | "publishing" => "users/sharing-simulations.html",
+            _ => "",
+        };
+        format!("{}/{page}", self.cactup_docs)
     }
 }
 

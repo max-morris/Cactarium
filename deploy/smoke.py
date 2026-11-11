@@ -611,7 +611,11 @@ check("versions now name the new URL", s == 200 and "fakelib-moved.git" in body,
 _, qc0, _ = anon.get("/api/v1/sims/max/qc0-demo/1.0.0/download")
 srepo = os.path.join(work, "simrepo")
 os.makedirs(os.path.join(srepo, "runs"))
-open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(qc0)
+# Its .sim reads one input from the repo itself (repo-file, sim format 3).
+repo_input = '\n[[input]]\nknob = "repo-data"\ndescription = "a file kept beside the sim"\nrepo-file = "data/blob.txt"\n'
+open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(qc0.replace("format = 1", "format = 3", 1) + repo_input)
+os.makedirs(os.path.join(srepo, "data"))
+open(os.path.join(srepo, "data", "blob.txt"), "w").write("data\n")
 open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(
     'format = 1\n\n[sim]\nname = "repo-sim"\nowners = ["max"]\nfile = "runs/qc0.sim"\n'
     'description = "A sim kept in its repo"\ncontact = "https://example.org/sim-help"\n')
@@ -641,6 +645,18 @@ for d in ["/docs/publishing", "/docs/packages", "/docs/stacks", "/docs/sims", "/
 page(anon, "/docs/nonsense", expect=404)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/repo-sim", raw=qc0.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
 check("a sim released from its repo takes no uploads", s == 400 and "released from its repo" in body, f"{s} {body[:200]}")
+page(anon, "/max/repo-sim/1.0.0?tab=inputs", contains="from the sim's repo")
+s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=(qc0.replace("format = 1", "format = 3", 1) + repo_input).encode(),
+                      headers={"Authorization": f"Bearer {tok.group(1)}"})
+check("an uploaded sim can't read files from a repo", s == 400 and "repo-file" in body, f"{s} {body[:200]}")
+# A tag whose repo-file is missing becomes an invalid version, with the reason.
+os.remove(os.path.join(srepo, "data", "blob.txt"))
+sh("git", "add", "-A", cwd=srepo); sh("git", *ident, "commit", "-q", "-m", "drop the data", cwd=srepo); sh("git", "tag", "v1.1.0", cwd=srepo)
+sh("git", "push", "-q", sbare, "master", "--tags", cwd=srepo)
+maxv.get("/max/repo-sim")
+maxv.post("/max/repo-sim/refresh", {})
+text = page(maxv, "/max/repo-sim?tab=versions")
+check("a tag whose repo-file is missing is invalid, with the reason", "1.1.0" in text and "not a file in the repo" in text, text[text.find("<table"):][:600])
 
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
