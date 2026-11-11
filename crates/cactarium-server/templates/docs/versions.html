@@ -15,21 +15,22 @@
 <p>Tracks are for variants within one repo. A fork in another repo is a separate package that declares <code>[[fork-of]]</code>.</p>
 
 <h2 id="ranges">References and ranges</h2>
-<p>What follows the <code>@</code> in a reference is a version range, in the same syntax as Cargo's:</p>
+<p>What follows the <code>@</code> in a reference is a version or a version range, read the way npm reads them: a full version is exact, a partial one is a range.</p>
 <div class="table-box"><table>
   <thead><tr><th scope="col">Reference</th><th scope="col">Chooses</th></tr></thead>
   <tbody>
     <tr><td><code>owner/pkg</code></td><td>the newest version on the default track</td></tr>
+    <tr><td><code>owner/pkg@1.2.3</code></td><td>exactly 1.2.3 (<code>=1.2.3</code> means the same)</td></tr>
+    <tr><td><code>owner/pkg@1.2</code></td><td>the newest 1.2.x (the same as <code>~1.2</code>)</td></tr>
     <tr><td><code>owner/pkg@1</code></td><td>the newest 1.x.x (the same as <code>^1</code>)</td></tr>
-    <tr><td><code>owner/pkg@^1.2</code></td><td>the newest 1.x.x from 1.2.0 on</td></tr>
-    <tr><td><code>owner/pkg@~1.2</code></td><td>the newest 1.2.x</td></tr>
-    <tr><td><code>owner/pkg@1.2.3</code></td><td>the newest 1.x.x from 1.2.3 on: a bare version is a caret range</td></tr>
-    <tr><td><code>owner/pkg@=1.2.3</code></td><td>exactly 1.2.3</td></tr>
+    <tr><td><code>owner/pkg@^1.2.3</code></td><td>the newest 1.x.x from 1.2.3 on: caret allows anything that keeps the leftmost non-zero number</td></tr>
+    <tr><td><code>owner/pkg@~1.2.3</code></td><td>the newest 1.2.x from 1.2.3 on: tilde allows patch updates only</td></tr>
     <tr><td><code>owner/pkg@&gt;=1.2, &lt;2</code></td><td>the newest version in that interval</td></tr>
-    <tr><td><code>owner/pkg@mixed-precision:^1</code></td><td>the newest 1.x.x on track <code>mixed-precision</code></td></tr>
+    <tr><td><code>owner/pkg@mixed-precision:1.2</code></td><td>the newest 1.2.x on track <code>mixed-precision</code></td></tr>
     <tr><td><code>owner/pkg@mixed-precision</code></td><td>the newest version on track <code>mixed-precision</code></td></tr>
   </tbody>
 </table></div>
+<p>With date-like versions such as the Einstein Toolkit's: <code>et/carpetx-stack@2026.5.0</code> is that release, <code>@2026.5</code> the newest 2026.5.N (that release line's updates), and <code>@2026</code> the newest release of 2026.</p>
 <p>Ranges never cross tracks: a reference without a track only ever matches the default track. A range chooses the highest matching version that is published (approved in review), not yanked and not invalid.</p>
 
 <h2 id="tag-pattern">Release tags that aren't vX.Y.Z: tag-pattern and since</h2>
@@ -49,7 +50,7 @@ since = "2026.5.0"</pre>
 
 <h2 id="yanking">Yanking</h2>
 <p>Yanking marks a version as one not to use, typically a broken release. A yanked version stays downloadable by its exact version, but no range ever chooses it and listings skip it; its reason is shown with it. Nothing is deleted, and a yank can be undone.</p>
-<p>"Exact" means <code>=1.2.3</code> in a reference, a stack release or sim version fetched by its version, and a stack's <code>extends</code>, which names exact releases.</p>
+<p>"Exact" means a full version in a reference (<code>@1.2.3</code> or <code>@=1.2.3</code>), a stack release or sim version fetched by its version, and a stack's <code>extends</code>, which names exact releases.</p>
 <p>Whoever manages the entry can yank: the user it belongs to, any member of the organization it belongs to, and admins. On the entry's page, open the <em>Versions</em> tab of a package or a sim, or the <em>Releases</em> list of a stack, type a reason next to the version and choose <em>Yank</em>. <em>Unyank</em> reverses it.</p>
 <p>The server's command line can do the same, acting as a user who manages the entry:</p>
 <pre class="code">just cli yank &lt;username&gt; &lt;owner/name&gt; &lt;version&gt; --reason "breaks the build with GCC 14"

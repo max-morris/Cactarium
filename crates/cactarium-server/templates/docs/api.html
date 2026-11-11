@@ -24,7 +24,7 @@
 <h2 id="reads">Read endpoints</h2>
 
 <h3 id="resolve"><code>GET /resolve?req=owner/name@range</code></h3>
-<p>The best version of a package, stack or sim matching a <a href="/docs/versions#ranges">reference</a>: the highest published, non-yanked, valid version in the range, on the track the range names. An exact request such as <code>@=1.2.3</code> also reaches a yanked version, which the response marks <code>"yanked": true</code>. For a package, <code>@head</code> and <code>@master</code> resolve to its default branch's tip, with the unpinned headers; for a stack they are refused (fetch <code>releases/head</code> instead).</p>
+<p>The best version of a package, stack or sim matching a <a href="/docs/versions#ranges">reference</a>: the highest published, non-yanked, valid version in the range, on the track the range names. An exact request such as <code>@1.2.3</code> also reaches a yanked version, which the response marks <code>"yanked": true</code>. For a package, <code>@head</code> and <code>@master</code> resolve to its default branch's tip, with the unpinned headers; for a stack they are refused (fetch <code>releases/head</code> instead).</p>
 <p>Response: <code>Resolved</code>. <code>slug</code> is the exact reference chosen, <code>kind</code> is <code>package</code>, <code>stack</code> or <code>sim</code>, <code>url</code> is the repo to fetch from (for an entry registered from a repo), <code>contact</code> is the version's declared contact or the repo, and the fields of <code>VersionInfo</code> follow inline.</p>
 <pre class="code">curl -G {{ doc.base_url }}/api/v1/resolve --data-urlencode 'req=max-morris/carpetx@mixed-precision:^1'</pre>
 <pre class="code">{

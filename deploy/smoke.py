@@ -272,6 +272,13 @@ if tok:
         s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=bad.encode(), headers=auth)
         check(f"refused: {what}", s == 400, f"{s} {body[:200]}")
 
+# Bare versions read npm-style: a full version is exact, 1.2 is ~1.2, 1 is ^1.
+for req, want in [("1.0.0", "1.0.0"), ("=1.0.0", "1.0.0"), ("1.0", "1.0.0"), ("1", "1.1.0"), ("^1.0.0", "1.1.0"), ("~1.0.0", "1.0.0")]:
+    s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote(f"max/carpetx@{req}"))
+    check(f"max/carpetx@{req} resolves to {want}", s == 200 and json.loads(body)["slug"] == f"max/carpetx@{want}", body[:200])
+s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@1.0.9")
+check("an exact version that doesn't exist matches nothing", s == 400, f"{s} {body[:200]}")
+
 # Yank and unyank.
 text = page(maxv, "/max/carpetx?tab=versions")
 vid = re.search(r'name="version_id" value="(\d+)"', text)
@@ -280,7 +287,7 @@ if vid:
     check("yank", s == 303, s)
     s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@^1")
     check("resolve skips the yanked version", s == 200 and json.loads(body)["slug"] != "max/carpetx@1.1.0", body[:200])
-    s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@%3D1.1.0")
+    s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@1.1.0")
     check("an exact request still reaches it, marked yanked",
           s == 200 and json.loads(body)["slug"] == "max/carpetx@1.1.0" and '"yanked":true' in body, body[:300])
     maxv.get("/max/carpetx?tab=versions")

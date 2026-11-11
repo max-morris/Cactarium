@@ -57,7 +57,7 @@ A black hole and neutron star merger like GW230529, at high resolution.
 
 <h2 id="versions">Versions</h2>
 <p>Sim versions are semantic versions, like those of packages and stacks. An upload names its version, such as <code>1.0.1</code> for a fix to 1.0.0, or, without one, becomes the next major version: 1.0.0 for the first, then 2.0.0, and so on. A repo-backed sim takes its versions from its tags. A version never changes and is never reused: publish a new one instead.</p>
-<p>References work as for packages: <code>owner/name@1</code> means the newest 1.x.x, and <code>owner/name@=1.0.1</code> exactly 1.0.1 (see <a href="/docs/versions#ranges">ranges</a>).</p>
+<p>References work as for packages: <code>owner/name@1</code> means the newest 1.x.x, and <code>owner/name@1.0.1</code> exactly 1.0.1 (see <a href="/docs/versions#ranges">ranges</a>).</p>
 <p>The stored copy of each version records its own reference in <code>[sim] cactarium</code>, such as <code>"max-morris/bhns-gw230529-dense@1.0.0"</code>. The thornlist and the parfile stay byte for byte as published. <em>Download .sim</em> on the sim's page and the API serve that stored copy.</p>
 
 <h2 id="inputs">Inputs</h2>
