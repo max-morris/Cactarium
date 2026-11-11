@@ -371,6 +371,8 @@ pub struct NewStackPage {
     pub definition: String,
     pub thornlist: String,
     pub version: String,
+    /// `owner/name` when uploading a new release of an existing uploaded stack; empty otherwise.
+    pub release_of: String,
 }
 
 #[derive(Clone, Debug)]

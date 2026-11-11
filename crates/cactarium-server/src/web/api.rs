@@ -190,13 +190,8 @@ pub async fn resolve(
         return Ok((tip_headers(trusted), Json(body)).into_response());
     }
     let versions = model::versions(&state, e.id).await?;
-    let best = if e.kind == "sim" {
-        match slug.number().map_err(AppError::bad)? {
-            Some(n) => versions.iter().find(|v| v.version == n.to_string()),
-            None => versions.iter().find(|v| v.usable()),
-        }
-        .ok_or(AppError::NotFound)?
-    } else {
+    // Packages, stacks and sims alike: a semver range (`@1` is 1.x.x), or an exact `=X.Y.Z`.
+    let best = {
         let req = slug.req().map_err(AppError::bad)?;
         // An exact request (`=1.2.3`) still reaches a yanked version, which the response marks
         // `yanked`; a range never chooses one.
@@ -485,17 +480,25 @@ pub async fn sim_download(
 }
 
 /// Publishes a `.sim` (the request body) as the next version of the token owner's sim.
+#[derive(Deserialize, Default)]
+pub struct SimPublishQ {
+    /// The version to publish (default: the next major).
+    version: Option<String>,
+}
+
 pub async fn sim_publish(
     State(state): State<AppState>,
     TokenUser(user): TokenUser,
     ip: ClientIp,
     Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<SimPublishQ>,
     body: Bytes,
 ) -> ApiResult<Json<Published>> {
     state.limiter.check("upload", ip.0, 20)?;
     let checked = sims::check(&body)?;
     let warnings = checked.index.warnings.clone();
-    let (entry, n, review) = sims::publish(&state, &user, Some(&owner), Some(&name), checked).await?;
+    let (entry, n, review) =
+        sims::publish(&state, &user, Some(&owner), Some(&name), q.version.as_deref(), checked).await?;
     Ok(Json(Published {
         slug: format!("{}@{n}", entry.slug()),
         url: state.cfg.url(&format!("{}/{n}", entry.url())),

@@ -9,11 +9,13 @@
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <label for="simfile">The .sim file (up to 1 MB)</label>
     <input id="simfile" name="file" type="file" accept=".sim,.toml" required>
-    {% include "_publish_under.html" %}
+    {% let owner_id = "owner" %}{% include "_publish_under.html" %}
     <label for="simname">Publish as <span class="muted">(defaults to the name inside the file)</span></label>
     <div class="row">{% if !ctx.has_namespaces() %}<span class="mono muted">{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}/</span>{% endif %}<input id="simname" name="name" class="mono" placeholder="bhns-gw230529-dense"></div>
+    <label for="simver">Version <span class="muted">(optional; default the next major: 1.0.0, then 2.0.0, …)</span></label>
+    <input id="simver" name="version" class="mono" placeholder="e.g. 1.0.1 for a fix to 1.0.0">
     <button class="button" type="submit">Publish</button>
   </form>
-  <p class="muted small">Only fully specified sims can be published: every repo pinned to a commit, nothing dirty. A new sim is reviewed once; later versions publish right away.</p>
+  <p class="muted small">Only fully specified sims can be published: every repo pinned to a commit, nothing dirty. Versions are semver: <span class="mono">owner/name@1</span> means the newest 1.x.x. A new sim, and each new version, is reviewed unless you, the organization you publish under, or the sim is trusted. To publish a sim from a repo instead, where each version tag becomes a version, commit a <span class="mono">cactarium-sim.toml</span> beside it and <a href="/new/repo">register the repo</a>.</p>
 </section>
 {% endblock %}

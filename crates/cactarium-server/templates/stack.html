@@ -73,7 +73,7 @@
       <form method="post" action="{{ e.url }}/refresh"><input type="hidden" name="_csrf" value="{{ ctx.csrf }}"><button class="button small ghost" type="submit">Check for new tags now</button></form>
       {% if !poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ poll_error }}</p>{% endif %}
       {% else %}
-      <a class="button small" href="/new/stack?name={{ e.slug }}">Cut a release</a>
+      <a class="button small" href="/new/stack?name={{ e.slug }}">Upload a new release</a>
       {% endif %}
     </section>
     {% endif %}

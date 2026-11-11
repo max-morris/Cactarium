@@ -94,9 +94,9 @@ for p in ["/", "/search", "/search?kind=package", "/search?kind=stack", "/search
           "/implementations/driver", "/sources?url=" + REPOS + "/cactus.git", "/max", "/et",
           "/max/carpetx", "/max/carpetx?tab=thorns", "/max/carpetx?tab=versions", "/max/carpetx?tab=usedby",
           "/max/carpetx?track=default", "/max/carpetx/mixed-precision:1.0.0", "/max/carpetx/1.0.0",
-          "/et/et-stack", "/et/et-stack/2026.5.0", "/max/carpetx-mp", "/max/qc0-demo", "/max/qc0-demo/1?tab=pins",
-          "/max/qc0-demo/1?tab=thornlist", "/max/qc0-demo/1?tab=inputs", "/max/qc0-demo/1?tab=run",
-          "/max/carpetx-mp/1.0.0/download.th", "/max/qc0-demo/1/download.sim", "/auth/login"]:
+          "/et/et-stack", "/et/et-stack/2026.5.0", "/max/carpetx-mp", "/max/qc0-demo", "/max/qc0-demo/1.0.0?tab=pins",
+          "/max/qc0-demo/1.0.0?tab=thornlist", "/max/qc0-demo/1.0.0?tab=inputs", "/max/qc0-demo/1.0.0?tab=run",
+          "/max/carpetx-mp/1.0.0/download.th", "/max/qc0-demo/1.0.0/download.sim", "/auth/login"]:
     page(anon, p)
 page(anon, "/max/carpetx", contains="mixed-precision")
 # Forks and the compare page.
@@ -229,9 +229,17 @@ s, text, _ = maxv.post("/settings/tokens", {"name": "smoke", "days": "30"})
 tok = re.search(r"(cactarium_[A-Za-z0-9_-]+)", text)
 check("create an API token", s == 200 and tok is not None, s)
 if tok:
-    _, sim, _ = anon.get("/api/v1/sims/max/qc0-demo/1/download")
+    _, sim, _ = anon.get("/api/v1/sims/max/qc0-demo/1.0.0/download")
     s, body, hdrs = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=sim.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
-    check("publish a sim version through the API", s == 200 and '"max/qc0-demo@2"' in body, f"{s} {body[:200]}")
+    check("publish a sim version through the API: the next major by default", s == 200 and '"max/qc0-demo@2.0.0"' in body, f"{s} {body[:200]}")
+    s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=2.0.1", raw=sim.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
+    check("or the version the uploader names", s == 200 and '"max/qc0-demo@2.0.1"' in body, f"{s} {body[:200]}")
+    s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=2.0.1", raw=sim.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
+    check("a sim version never changes", s == 409, f"{s} {body[:200]}")
+    s, body, _ = anon.get("/api/v1/resolve?req=max/qc0-demo@2")
+    check("@2 means the newest 2.x.x", s == 200 and json.loads(body)["slug"] == "max/qc0-demo@2.0.1", body[:200])
+    s, body, _ = anon.get("/api/v1/resolve?req=max/qc0-demo@1")
+    check("and @1 the newest 1.x.x", s == 200 and json.loads(body)["slug"] == "max/qc0-demo@1.0.0", body[:200])
     check("API responses carry api-generation", hdrs.get("api-generation") == "1", hdrs.get("api-generation"))
     s, body, _ = anon.req("POST", "/api/v1/sims/alice/qc0-demo", raw=sim.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
     check("a token cannot publish under another owner", s == 403, s)
@@ -408,7 +416,7 @@ tagged = ('format = 1\n\n[stack]\nname = "tagged"\nthornlist = "tagged.th"\npin-
           '[[stack.pin]]\nname = "carpetx"\ntag = "v1.0.0"\n')
 maxv.get("/new/stack")
 s, text, _ = maxv.post("/new/stack", {"definition": tagged, "thornlist": tagged_th, "version": "0.1.0"})
-check("cut a release pinned by tags", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+check("publish a release pinned by tags", s == 303, f"{s} {text[text.find('alert'):][:300]}")
 s, body, _ = anon.get("/api/v1/stacks/max/tagged/releases/0.1.0")
 got = {p["name"]: p.get("commit") for p in json.loads(body)["repo"]} if s == 200 else {}
 check("a repo's own tag pin wins over pin-tag", got.get("carpetx") == want["carpetx"], got)
@@ -598,6 +606,32 @@ s, _, _ = maxv.post(f"/admin/entries/{feid}", {"action": "move-repo", "new_url":
 check("the same repo at a new URL is accepted", s == 303, s)
 s, body, _ = anon.get("/api/v1/packages/et/fakelib/versions")
 check("versions now name the new URL", s == 200 and "fakelib-moved.git" in body, body[:300])
+
+# A sim published from its repo: cactarium-sim.toml names the .sim; each version tag is a version.
+_, qc0, _ = anon.get("/api/v1/sims/max/qc0-demo/1.0.0/download")
+srepo = os.path.join(work, "simrepo")
+os.makedirs(os.path.join(srepo, "runs"))
+open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(qc0)
+open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(
+    'format = 1\n\n[sim]\nname = "repo-sim"\nowners = ["max"]\nfile = "runs/qc0.sim"\n'
+    'description = "A sim kept in its repo"\n')
+sh("git", "init", "-q", "-b", "master", cwd=srepo)
+sh("git", "add", "-A", cwd=srepo); sh("git", *ident, "commit", "-q", "-m", "sim", cwd=srepo); sh("git", "tag", "v1.0.0", cwd=srepo)
+stag = sh("git", "rev-parse", "HEAD", cwd=srepo)
+sbare = ENV["DEMO_REPOS"] + "/simrepo.git"
+subprocess.run(["rm", "-rf", sbare], check=True)
+sh("git", "clone", "-q", "--bare", srepo, sbare, cwd=work)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/simrepo.git", "owner": "max"})
+check("register a repo that carries cactarium-sim.toml", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+s, body, _ = anon.get("/api/v1/resolve?req=max/repo-sim@1")
+check("its tag is a sim version, with the repo and commit to fetch from",
+      s == 200 and '"slug":"max/repo-sim@1.0.0"' in body and "simrepo.git" in body and stag in body, body[:300])
+s, body, _ = anon.get("/api/v1/sims/max/repo-sim/1.0.0/download")
+check("the stored file is stamped with its version", s == 200 and 'cactarium = "max/repo-sim@1.0.0"' in body, body[:200])
+page(anon, "/max/repo-sim", contains="A sim kept in its repo")
+s, body, _ = anon.req("POST", "/api/v1/sims/max/repo-sim", raw=qc0.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
+check("a sim released from its repo takes no uploads", s == 400 and "released from its repo" in body, f"{s} {body[:200]}")
 
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.

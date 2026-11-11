@@ -147,8 +147,8 @@ pub async fn new_sim(
     mut form: Multipart,
 ) -> AppResult<Response> {
     state.limiter.check("upload", ip.0, 20)?;
-    let (mut csrf, mut owner_field, mut name, mut file) =
-        (String::new(), String::new(), String::new(), None);
+    let (mut csrf, mut owner_field, mut name, mut version, mut file) =
+        (String::new(), String::new(), String::new(), String::new(), None);
     while let Some(field) = form
         .next_field()
         .await
@@ -158,6 +158,7 @@ pub async fn new_sim(
             Some("_csrf") => csrf = field.text().await.unwrap_or_default(),
             Some("name") => name = field.text().await.unwrap_or_default(),
             Some("owner") => owner_field = field.text().await.unwrap_or_default(),
+            Some("version") => version = field.text().await.unwrap_or_default(),
             Some("file") => {
                 file =
                     Some(field.bytes().await.map_err(|e| AppError::bad(format!("upload failed: {e}")))?)
@@ -176,7 +177,7 @@ pub async fn new_sim(
     };
     let result = async {
         let checked = sims::check(&bytes)?;
-        sims::publish(&state, &s.user, owner.as_deref(), Some(&name), checked).await
+        sims::publish(&state, &s.user, owner.as_deref(), Some(&name), Some(&version), checked).await
     }
     .await;
     match result {
@@ -201,8 +202,8 @@ pub async fn new_stack_page(
     s: SignedIn,
     Query(q): Query<NewStackQ>,
 ) -> AppResult<Response> {
-    // Pre-fill from the stack's latest release when cutting the next one.
-    let (mut definition, mut thornlist) = (String::new(), String::new());
+    // Pre-fill from the stack's latest release when uploading the next one.
+    let (mut definition, mut thornlist, mut release_of) = (String::new(), String::new(), String::new());
     if let Some(slug) = q.name.as_deref()
         && let Some((owner, name)) = slug.split_once('/')
         && let Some(e) = model::find_entry(&state, owner, name).await?
@@ -218,6 +219,7 @@ pub async fn new_stack_page(
             definition = r.unwrap_or_default();
             thornlist = t.unwrap_or_default();
         }
+        release_of = e.slug();
     }
     Ok(page(&NewStackPage {
         ctx: PageCtx::new(&state, Some(&s.session)),
@@ -225,6 +227,7 @@ pub async fn new_stack_page(
         definition,
         thornlist,
         version: String::new(),
+        release_of,
     })?
     .into_response())
 }
@@ -388,6 +391,7 @@ pub async fn new_stack(
                 definition: f.definition,
                 thornlist: f.thornlist,
                 version: f.version,
+                release_of: String::new(),
             })?
             .into_response())
         }

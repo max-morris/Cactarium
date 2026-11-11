@@ -5,7 +5,7 @@
   <h1>Register a repo</h1>
   <p class="lead">Your code stays in your repo. The Cactarium reads it at every version tag and freezes the commit the tag names.</p>
   <ol class="steps">
-    <li>Commit <span class="mono">cactarium.toml</span> (a package) and/or <span class="mono">cactarium-stack.toml</span> (a stack) at the repo root, with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span> (or the organization you publish under). Only someone who can push to the repo can put that name there; that is the proof you control it.</li>
+    <li>Commit <span class="mono">cactarium.toml</span> (a package), <span class="mono">cactarium-stack.toml</span> (a stack) and/or <span class="mono">cactarium-sim.toml</span> (a sim: it names the <span class="mono">.sim</span> file to publish) at the repo root, each with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span> (or the organization you publish under). Only someone who can push to the repo can put that name there; that is the proof you control it.</li>
     <li>Tag a release: <span class="mono">v1.0.0</span>, or on a track, <span class="mono">mixed-precision/v1.0.0</span>.</li>
     <li>Paste the repo's https URL below.</li>
   </ol>
@@ -14,9 +14,9 @@
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <label for="url">Repo URL</label>
     <input id="url" name="url" class="mono" value="{{ url }}" placeholder="https://github.com/you/YourArrangement" required>
-    {% include "_publish_under.html" %}
+    {% let owner_id = "owner" %}{% include "_publish_under.html" %}
     <button class="button" type="submit">Register</button>
   </form>
-  <p class="muted small">See the <a href="/docs#manifests">manifest reference</a>. New entries, and each new version tag, are reviewed by an admin before they are public, unless you, the organization you publish under, or the entry is trusted.</p>
+  <p class="muted small">See the <a href="/docs/manifests">manifest reference</a>. New entries, and each new version tag, are reviewed by an admin before they are public, unless you, the organization you publish under, or the entry is trusted.</p>
 </section>
 {% endblock %}

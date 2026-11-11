@@ -67,6 +67,9 @@ enum Command {
         file: std::path::PathBuf,
         #[arg(long)]
         name: Option<String>,
+        /// The version to publish (default: the next major, 1.0.0, 2.0.0, …).
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Manage organizations from the command line.
     Org {
@@ -191,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::PublishSim { username, file, name } => {
+        Command::PublishSim { username, file, name, version } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
             let bytes =
@@ -201,10 +204,16 @@ async fn main() -> anyhow::Result<()> {
                 Some((o, n)) => (Some(o.to_owned()), Some(n.to_owned())),
                 None => (None, name),
             };
-            let (e, n, review) =
-                sims::publish(&state, &user, owner.as_deref(), name.as_deref(), checked)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (e, n, review) = sims::publish(
+                &state,
+                &user,
+                owner.as_deref(),
+                name.as_deref(),
+                version.as_deref(),
+                checked,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let shown =
                 if review == "pending" { "release awaiting review" } else { e.visibility.as_str() };
             println!("Published {}@{n} ({shown})", e.slug());

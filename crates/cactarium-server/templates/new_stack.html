@@ -1,9 +1,27 @@
 {% extends "base.html" %}
-{% block title %}Cut a stack release · Cactarium{% endblock %}
+{% block title %}{% if release_of.is_empty() %}Publish a stack{% else %}Upload a new release of {{ release_of }}{% endif %} · Cactarium{% endblock %}
 {% block content %}
 <section class="stack-lg">
-  <h1>Cut a stack release</h1>
-  <p class="lead">For a stack kept in a repo, push a version tag instead. Here you give the definition directly; the Cactarium resolves every branch to its current commit and freezes the result.</p>
+  {% if release_of.is_empty() %}
+  <h1>Publish a stack</h1>
+  <p class="lead">A stack is a versioned thornlist. Publish it from a repo, where each version tag becomes a release, or upload its definition here and name the version yourself. Either way, every release pins each repo to a commit and never changes. One stack uses one way, not both.</p>
+  <section class="card stack-sm">
+    <h2 class="h-small">From a repo</h2>
+    <p class="small">Commit <span class="mono">cactarium-stack.toml</span> (and its thornlist) at the repo root, listing your name or organization in <span class="mono">owners</span>, and push a version tag such as <span class="mono">v1.0.0</span>. Then register the repo; later tags become new releases by themselves. See <a href="/docs/stacks">the stack reference</a>.</p>
+    <form class="row-wrap" method="post" action="/new/repo">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label class="sr-only" for="rurl">Repo URL</label>
+      <input id="rurl" name="url" class="mono" placeholder="https://github.com/you/your-stack" required>
+      {% let owner_id = "rowner" %}{% include "_publish_under.html" %}
+      <button class="button" type="submit">Register the repo</button>
+    </form>
+  </section>
+  <h2 class="h-small">By upload</h2>
+  <p class="small muted">Give the definition directly. The Cactarium merges its sources, pins every repo (its pins first, then each branch's current commit) and freezes the result as the version you name.</p>
+  {% else %}
+  <h1>Upload a new release of <span class="mono">{{ release_of }}</span></h1>
+  <p class="lead">Filled in from its latest release. Change what you need and name the new version; the Cactarium pins every repo and freezes the result.</p>
+  {% endif %}
   {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
   <form class="stack" method="post" action="/new/stack">
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
@@ -15,10 +33,10 @@
         <textarea id="th" name="thornlist" class="mono" rows="14" spellcheck="false">{{ thornlist }}</textarea>
       </div>
       <div class="split-side stack-sm">
-        {% include "_publish_under.html" %}
+        {% let owner_id = "owner" %}{% include "_publish_under.html" %}
         <label for="ver">Release version</label>
         <input id="ver" name="version" class="mono" value="{{ version }}" placeholder="1.0.0 or mixed-precision:1.0.0" required>
-        <button class="button" type="submit">Resolve and release</button>
+        <button class="button" type="submit">Publish</button>
         <pre class="code small">format = 1
 
 [stack]

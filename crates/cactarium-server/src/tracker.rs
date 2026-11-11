@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use cactup_ecosystem_common::ccl;
-use cactup_ecosystem_common::manifest::{Manifest, PACKAGE_FILE, STACK_FILE};
+use cactup_ecosystem_common::manifest::{Manifest, PACKAGE_FILE, SIM_FILE, STACK_FILE};
 use cactup_ecosystem_common::slug::Slug;
 use cactup_ecosystem_common::stack::FrozenStack;
 use cactup_ecosystem_common::version::TrackedVersion;
@@ -46,9 +46,10 @@ pub struct TagRule {
 
 impl TagRule {
     pub fn of_manifest(m: &Manifest) -> TagRule {
-        let (pattern, since) = match (&m.package, &m.stack) {
-            (Some(p), _) => (p.tag_pattern.as_deref(), p.since.clone()),
-            (_, Some(s)) => (s.tag_pattern.as_deref(), s.since.clone()),
+        let (pattern, since) = match (&m.package, &m.stack, &m.sim) {
+            (Some(p), _, _) => (p.tag_pattern.as_deref(), p.since.clone()),
+            (_, Some(s), _) => (s.tag_pattern.as_deref(), s.since.clone()),
+            (_, _, Some(s)) => (s.tag_pattern.as_deref(), s.since.clone()),
             _ => (None, None),
         };
         // The manifest was validated, so the pattern parses.
@@ -121,7 +122,7 @@ pub struct Found {
 
 fn read_manifests(co: &git::Checkout, at: &str) -> AppResult<Vec<(&'static str, Manifest)>> {
     let mut manifests = Vec::new();
-    for file in [PACKAGE_FILE, STACK_FILE] {
+    for file in [PACKAGE_FILE, STACK_FILE, SIM_FILE] {
         if let Some(text) = git::read_in(co, file).map_err(AppError::bad)? {
             let m = Manifest::from_repo_file(file, &text)
                 .map_err(|e| AppError::bad(format!("{file} at {at}: {e}")))?;
@@ -164,9 +165,10 @@ pub async fn inspect(state: &AppState, url: &str) -> AppResult<Found> {
 }
 
 fn owners_of(m: &Manifest) -> Vec<String> {
-    match (&m.package, &m.stack) {
-        (Some(p), _) => p.owners.iter().map(|o| o.to_string()).collect(),
-        (_, Some(s)) => s.owners.iter().map(|o| o.to_string()).collect(),
+    match (&m.package, &m.stack, &m.sim) {
+        (Some(p), _, _) => p.owners.iter().map(|o| o.to_string()).collect(),
+        (_, Some(s), _) => s.owners.iter().map(|o| o.to_string()).collect(),
+        (_, _, Some(s)) => s.owners.iter().map(|o| o.to_string()).collect(),
         _ => vec![],
     }
 }
@@ -176,6 +178,7 @@ fn name_of(m: &Manifest) -> String {
         .as_ref()
         .map(|p| p.name.to_string())
         .or_else(|| m.stack.as_ref().map(|s| s.name.to_string()))
+        .or_else(|| m.sim.as_ref().map(|s| s.name.to_string()))
         .unwrap_or_default()
 }
 
@@ -184,7 +187,8 @@ fn summary_of(m: &Manifest) -> Option<String> {
         .package
         .as_ref()
         .and_then(|p| p.description.clone())
-        .or_else(|| m.stack.as_ref().and_then(|s| s.description.clone()))?;
+        .or_else(|| m.stack.as_ref().and_then(|s| s.description.clone()))
+        .or_else(|| m.sim.as_ref().and_then(|s| s.description.clone()))?;
     Some(d.lines().next().unwrap_or("").chars().take(200).collect())
 }
 
@@ -217,7 +221,11 @@ pub async fn register(
         }
     }
     for (file, m) in found.manifests {
-        let kind = if file == PACKAGE_FILE { "package" } else { "stack" };
+        let kind = match file {
+            PACKAGE_FILE => "package",
+            STACK_FILE => "stack",
+            _ => "sim",
+        };
         let entry = publish::create_entry(
             state,
             user,
@@ -741,6 +749,9 @@ struct Prepared {
     thorns: Vec<(String, String, String, ccl::ThornFacts)>,
     claims: Vec<(&'static str, Slug, Option<String>, Option<String>)>,
     frozen: Option<(FrozenStack, String, Option<String>)>,
+    /// A sim published from its repo: the `.sim` the manifest names, checked as an upload is,
+    /// and the manifest's own description.
+    sim: Option<(crate::sims::Checked, Option<String>)>,
 }
 
 async fn prepare(
@@ -794,6 +805,7 @@ async fn prepare(
         thorns: vec![],
         claims,
         frozen: None,
+        sim: None,
     };
 
     if let Some(pkg) = &m.package {
@@ -856,6 +868,14 @@ async fn prepare(
         let toml = toml::to_string(&frozen).map_err(anyhow::Error::from)?;
         p.frozen = Some((frozen, toml, own));
     }
+    if let Some(sim) = &m.sim {
+        // The file the manifest names, held to exactly what an upload must satisfy.
+        let text = git::read_in(co, &sim.file)
+            .map_err(AppError::bad)?
+            .ok_or_else(|| AppError::bad(format!("'{}' does not exist at this tag", sim.file)))?;
+        let checked = crate::sims::check(text.as_bytes())?;
+        p.sim = Some((checked, sim.description.clone()));
+    }
     let _ = r;
     Ok(p)
 }
@@ -891,6 +911,16 @@ async fn store_prepared(
     }
     if let Some((frozen, toml, own)) = &p.frozen {
         store_release(state, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone())
+            .await?;
+    }
+    if let Some((checked, description)) = p.sim {
+        let (label, review): (String, String) = sqlx::query_as(
+            "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END, review FROM versions WHERE id = $1",
+        )
+        .bind(vid)
+        .fetch_one(&state.db)
+        .await?;
+        crate::sims::store_version(state, entry, vid, &label, &review, checked, description.as_deref())
             .await?;
     }
     if p.summary.is_some() {

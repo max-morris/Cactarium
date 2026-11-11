@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::audit::audit;
 use crate::auth::User;
 use crate::error::{AppError, AppResult};
-use crate::model::{self, Entry, number_sort_key};
+use crate::model::{self, Entry, semver_sort_key};
 use crate::publish::{self, NewEntry};
 use crate::state::AppState;
 use crate::tracker;
@@ -161,17 +161,20 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     Ok(Checked { sim, index })
 }
 
-/// Publishes a checked sim as the next version of `owner/name`: `owner` is the user or one of
-/// their organizations (default: the user), `name` defaults to the file's (creating the entry if
-/// new).
+/// Publishes a checked sim as a version of `owner/name`: `owner` is the user or one of their
+/// organizations (default: the user), `name` defaults to the file's (creating the entry if new).
+/// `version` is the semver version to publish (default: the next major, 1.0.0, 2.0.0, …), so
+/// `owner/name@1` means 1.x.x as for packages and stacks. Returns the entry, the version and
+/// whether it is approved or waits for review.
 pub async fn publish(
     state: &AppState,
     user: &User,
     owner: Option<&str>,
     name: Option<&str>,
+    version: Option<&str>,
     checked: Checked,
-) -> AppResult<(Entry, u32, &'static str)> {
-    let Checked { mut sim, index } = checked;
+) -> AppResult<(Entry, String, &'static str)> {
+    let Checked { sim, index } = checked;
     let owner = owner
         .map(str::trim)
         .filter(|o| !o.is_empty())
@@ -205,28 +208,78 @@ pub async fn publish(
             .await?
         }
     };
-    let next: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(version::bigint), 0) + 1 FROM versions WHERE entry_id = $1",
-    )
-    .bind(entry.id)
-    .fetch_one(&state.db)
-    .await?;
-    let n = u32::try_from(next).map_err(|_| AppError::bad("too many versions"))?;
-    sim.sim.cactarium = Some(format!("{}@{n}", entry.slug()).parse().map_err(AppError::bad)?);
-    let stored = sim.to_toml().map_err(AppError::bad)?;
-    let sha = hex::encode(Sha256::digest(stored.as_bytes()));
+    if tracker::repo_of(state, entry.id).await?.is_some() {
+        return Err(AppError::bad(format!(
+            "{} is released from its repo; push a version tag instead",
+            entry.slug()
+        )));
+    }
+    let v = match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => semver::Version::parse(v.strip_prefix('v').unwrap_or(v))
+            .map_err(|e| AppError::bad(format!("version '{v}' is not X.Y.Z: {e}")))?,
+        None => {
+            let existing: Vec<String> =
+                sqlx::query_scalar("SELECT version FROM versions WHERE entry_id = $1")
+                    .bind(entry.id)
+                    .fetch_all(&state.db)
+                    .await?;
+            let major = existing
+                .iter()
+                .filter_map(|v| semver::Version::parse(v).ok())
+                .map(|v| v.major)
+                .max();
+            semver::Version::new(major.map_or(1, |m| m + 1), 0, 0)
+        }
+    };
+    let label = v.to_string();
+    if model::any_version_by_label(state, entry.id, &label).await?.is_some() {
+        return Err(AppError::Conflict(format!(
+            "{}@{label} already exists; versions never change",
+            entry.slug()
+        )));
+    }
     let review = publish::release_review(state, &entry, Some(user)).await?;
-    let mut tx = state.db.begin().await?;
     let vid: i64 = sqlx::query_scalar(
         "INSERT INTO versions (entry_id, track, version, sort_key, published_by, review) VALUES ($1, '', $2, $3, $4, $5) RETURNING id",
     )
     .bind(entry.id)
-    .bind(n.to_string())
-    .bind(number_sort_key(n))
+    .bind(&label)
+    .bind(semver_sort_key(&v))
     .bind(user.id)
     .bind(review)
-    .fetch_one(&mut *tx)
+    .fetch_one(&state.db)
     .await?;
+    let sha = store_version(state, &entry, vid, &label, review, Checked { sim, index }, None).await?;
+    publish::submit_release(state, &entry, vid, review, Some(user)).await?;
+    audit(
+        state,
+        Some(user.id),
+        "sim.publish",
+        Some(&entry.slug()),
+        json!({ "version": label, "sha256": sha, "review": review }),
+        None,
+    )
+    .await?;
+    Ok((entry, label, review))
+}
+
+/// Stores a checked sim as version `vid` (`label`) of `entry`: stamps it with `owner/name@label`,
+/// keeps the file, its pins and the thorns it builds. For a sim published from its repo,
+/// `description` is the manifest's, which wins over the file's. Returns the stored file's sha256.
+pub async fn store_version(
+    state: &AppState,
+    entry: &Entry,
+    vid: i64,
+    label: &str,
+    review: &str,
+    checked: Checked,
+    description: Option<&str>,
+) -> AppResult<String> {
+    let Checked { mut sim, index } = checked;
+    sim.sim.cactarium = Some(format!("{}@{label}", entry.slug()).parse().map_err(AppError::bad)?);
+    let stored = sim.to_toml().map_err(AppError::bad)?;
+    let sha = hex::encode(Sha256::digest(stored.as_bytes()));
+    let mut tx = state.db.begin().await?;
     sqlx::query("INSERT INTO sim_files (version_id, sha256, content, index) VALUES ($1, $2, $3, $4)")
         .bind(vid)
         .bind(&sha)
@@ -239,24 +292,14 @@ pub async fn publish(
         sqlx::query("UPDATE entries SET summary = COALESCE($2, summary), description = COALESCE($3, description), updated_at = now() WHERE id = $1")
             .bind(entry.id)
             .bind(&sim.sim.summary)
-            .bind(&sim.sim.description)
+            .bind(description.map(str::to_owned).or(sim.sim.description.clone()))
             .execute(&mut *tx)
             .await?;
     }
     tx.commit().await?;
-    publish::submit_release(state, &entry, vid, review, Some(user)).await?;
     tracker::store_pins(state, vid, &sim.repos).await?;
     tracker::store_built_thorns(state, vid, &sim.thornlist.text).await?;
-    audit(
-        state,
-        Some(user.id),
-        "sim.publish",
-        Some(&entry.slug()),
-        json!({ "version": n, "sha256": sha, "review": review }),
-        None,
-    )
-    .await?;
-    Ok((entry, n, review))
+    Ok(sha)
 }
 
 #[cfg(test)]

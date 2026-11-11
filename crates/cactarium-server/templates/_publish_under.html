@@ -1,10 +1,10 @@
 {% if let Some(u) = ctx.user %}{% if ctx.has_namespaces() %}
-<label for="owner">Publish under</label>
+<label for="{{ owner_id }}">Publish under</label>
 {% if u.is_admin %}
-<input id="owner" name="owner" class="mono" list="owner-choices" value="{{ u.username }}">
-<datalist id="owner-choices"><option value="{{ u.username }}">{% for o in u.orgs %}<option value="{{ o }}">{% endfor %}</datalist>
+<input id="{{ owner_id }}" name="owner" class="mono" list="{{ owner_id }}-choices" value="{{ u.username }}">
+<datalist id="{{ owner_id }}-choices"><option value="{{ u.username }}">{% for o in u.orgs %}<option value="{{ o }}">{% endfor %}</datalist>
 <p class="small muted">Admins may also name a namespace that is no user's.</p>
 {% else %}
-<select id="owner" name="owner" class="mono"><option value="{{ u.username }}" selected>{{ u.username }}</option>{% for o in u.orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}</select>
+<select id="{{ owner_id }}" name="owner" class="mono"><option value="{{ u.username }}" selected>{{ u.username }}</option>{% for o in u.orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}</select>
 {% endif %}
 {% endif %}{% endif %}

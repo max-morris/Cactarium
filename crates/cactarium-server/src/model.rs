@@ -103,10 +103,6 @@ pub fn semver_sort_key(v: &semver::Version) -> String {
     format!("{:010}.{:010}.{:010}{pre}", v.major, v.minor, v.patch)
 }
 
-pub fn number_sort_key(n: u32) -> String {
-    format!("{n:010}")
-}
-
 pub fn tracked(v: &Version) -> Option<TrackedVersion> {
     v.label().parse().ok()
 }
