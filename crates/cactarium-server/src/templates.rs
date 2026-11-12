@@ -120,6 +120,8 @@ pub struct ClaimRow {
     pub needs: String,
     /// A dependency's thorns of this package, comma-separated; empty means every thorn.
     pub needed_by: String,
+    /// A dependency on a library: where its checkout goes, or empty.
+    pub into: String,
     pub note: String,
 }
 

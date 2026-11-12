@@ -612,6 +612,54 @@ check("a repo with only pattern tags registers", s == 303, f"{s} {text[text.find
 s, body, _ = anon.get("/api/v1/packages/et/patlib/versions")
 check("its pattern tag is its version", s == 200 and '"version":"2026.5.1"' in body and '"tag":"XT_2026_05_v1"' in body, body[:300])
 
+# A library package (FUKA's shape): no thorns; the package that builds against it says where it goes.
+dlib = os.path.join(work, "demolib")
+os.makedirs(os.path.join(dlib, "src"))
+open(os.path.join(dlib, "CMakeLists.txt"), "w").write("project(demolib)\n")
+open(os.path.join(dlib, "src", "lib.cc"), "w").write("int demolib() { return 0; }\n")
+open(os.path.join(dlib, "cactarium.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "demolib"\nowners = ["et"]\ndescription = "A library thorns build against"\nlibrary = true\n')
+sh("git", "init", "-q", "-b", "master", cwd=dlib)
+sh("git", "add", "-A", cwd=dlib); sh("git", *ident, "commit", "-q", "-m", "demolib", cwd=dlib); sh("git", "tag", "v1.0.0", cwd=dlib)
+dbare = ENV["DEMO_REPOS"] + "/demolib.git"
+subprocess.run(["rm", "-rf", dbare], check=True)
+sh("git", "clone", "-q", "--bare", dlib, dbare, cwd=work)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/demolib.git", "owner": "et"})
+check("a library package registers, though it has no thorns", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+s, body, _ = anon.get("/api/v1/packages/et/demolib/versions")
+check("it is served as a library with no thorns", s == 200 and '"library":true' in body and '"thorns":[]' in body, body[:300])
+kdem = os.path.join(work, "kadathdemo")
+os.makedirs(os.path.join(kdem, "KadathDemo", "src"))
+for f, t in [("interface.ccl", "IMPLEMENTS: KadathDemo\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(kdem, "KadathDemo", f), "w").write(t)
+open(os.path.join(kdem, "KadathDemo", "src", "make.code.defn"), "w").write("SRCS =\n")
+def kmanifest(dep):
+    open(os.path.join(kdem, "cactarium.toml"), "w").write(
+        'format = 1\n\n[package]\nname = "kadathdemo"\nowners = ["max"]\ndescription = "Builds demolib from src/demolib"\n'
+        'arrangement = "Fuka"\n\n[[dependency]]\ntarget = "et/demolib"\nneeded-by = ["KadathDemo"]\n' + dep)
+def ktag(msg, tag):
+    sh("git", "add", "-A", cwd=kdem); sh("git", *ident, "commit", "-q", "-m", msg, cwd=kdem); sh("git", "tag", tag, cwd=kdem)
+sh("git", "init", "-q", "-b", "master", cwd=kdem)
+kmanifest('into = "KadathDemo/src/demolib"\n'); ktag("kadathdemo", "v1.0.0")
+kmanifest(''); ktag("forget into", "v1.1.0")
+kmanifest('into = "KadathDemo/src"\n'); ktag("into a folder in use", "v1.2.0")
+kbare = ENV["DEMO_REPOS"] + "/kadathdemo.git"
+subprocess.run(["rm", "-rf", kbare], check=True)
+sh("git", "clone", "-q", "--bare", kdem, kbare, cwd=work)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/kadathdemo.git", "owner": "max"})
+check("a package depending on a library registers", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+s, body, _ = anon.get("/api/v1/packages/max/kadathdemo/versions")
+check("its dependency carries into, and no needs", s == 200 and '"into":"KadathDemo/src/demolib"' in body
+      and '"target":"et/demolib"' in body and '"needs"' not in body, body[:500])
+page(anon, "/max/kadathdemo", contains="checked out into")
+text = page(maxv, "/max/kadathdemo?tab=versions")
+check("a dependency on a library without into is refused, saying how to fix it",
+      "1.1.0" in text and "is a library: say where its checkout goes with into" in text, text[text.find("<table"):][:900])
+check("into a folder the repo already has is refused",
+      "1.2.0" in text and "which this commit already has" in text, text[text.find("<table"):][:900])
+
 # Moving a registered repo to a new URL: only one that holds the same tags at the same commits.
 moved = ENV["DEMO_REPOS"] + "/fakelib-moved.git"
 subprocess.run(["rm", "-rf", moved], check=True)
