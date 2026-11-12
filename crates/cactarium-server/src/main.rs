@@ -182,7 +182,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = Config::from_env()?;
     let db = connect(&cfg).await?;
-    let migrate = || sqlx::migrate!("./migrations").run(&db);
+    // A database a newer release migrated (after a rollback to this one) still serves: newer
+    // migrations keep older binaries working, and this one leaves those it doesn't know alone.
+    let migrate = || async {
+        let mut m = sqlx::migrate!("./migrations");
+        m.set_ignore_missing(true);
+        m.run(&db).await
+    };
     match cli.command {
         Command::Migrate => {
             migrate().await?;
