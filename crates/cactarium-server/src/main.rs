@@ -319,19 +319,45 @@ async fn main() -> anyhow::Result<()> {
                 .fetch_all(&state.db)
                 .await?,
             };
+            // A version can depend on a package whose own version only becomes valid later in the
+            // same run (packages go in name order), so the ones left are tried again, pass after
+            // pass, until a pass changes nothing.
             let mut failed = 0;
-            for e in &entries {
-                match tracker::reapply_curated(&state, &admin, e).await {
-                    Ok((done, left)) => {
-                        println!("{}: {done} re-read", e.slug());
-                        for l in &left {
-                            println!("  left as it was: {l}");
+            let mut pending: Vec<&model::Entry> = entries.iter().collect();
+            // Each package's notes from the last pass it was tried in.
+            let mut last: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+            for pass in 1.. {
+                let mut again: Vec<&model::Entry> = Vec::new();
+                let mut progress = false;
+                for e in &pending {
+                    match tracker::reapply_curated(&state, &admin, e).await {
+                        Ok((done, left)) => {
+                            // Progress: fewer versions left than in the pass before.
+                            let fewer = last.get(&e.slug()).is_some_and(|before| left.len() < before.len());
+                            if pass == 1 || fewer {
+                                println!("{}: {done} re-read{}", e.slug(), if pass > 1 { format!(" (pass {pass})") } else { String::new() });
+                            }
+                            progress |= fewer;
+                            // Versions below since are left on purpose; anything else may yet fit.
+                            if left.iter().any(|l| !l.contains("older than the manifest's since")) {
+                                again.push(e);
+                            }
+                            last.insert(e.slug(), left);
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            println!("{}: {err}", e.slug());
                         }
                     }
-                    Err(err) => {
-                        failed += 1;
-                        println!("{}: {err}", e.slug());
-                    }
+                }
+                if again.is_empty() || (pass > 1 && !progress) || pass >= 5 {
+                    break;
+                }
+                pending = again;
+            }
+            for (slug, left) in &last {
+                for l in left {
+                    println!("{slug}: left as it was: {l}");
                 }
             }
             anyhow::ensure!(failed == 0, "{failed} of {} failed", entries.len());

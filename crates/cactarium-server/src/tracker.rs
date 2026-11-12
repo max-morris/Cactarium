@@ -440,6 +440,10 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
     let (mut done, mut left) = (0, Vec::new());
     for v in model::all_versions(state, entry.id).await? {
         let label = v.label();
+        // A yanked version is out of circulation: nothing to re-read it for.
+        if v.yanked {
+            continue;
+        }
         if let (Some(since), Ok(tv)) = (&since, label.parse::<TrackedVersion>())
             && tv.version < *since
         {
