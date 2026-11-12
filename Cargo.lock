@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "cactup-ecosystem-common"
 version = "0.1.0"
-source = "git+https://github.com/max-morris/cactup-ecosystem-common?rev=7c8f7eedb85c25bc01296e4d42314ad6f2bf0406#7c8f7eedb85c25bc01296e4d42314ad6f2bf0406"
+source = "git+https://github.com/max-morris/cactup-ecosystem-common?rev=38b7cf5da70e8dc42bdb27f37eb63aaae43d2ea2#38b7cf5da70e8dc42bdb27f37eb63aaae43d2ea2"
 dependencies = [
  "anyhow",
  "indexmap",

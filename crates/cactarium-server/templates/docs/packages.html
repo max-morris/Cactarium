@@ -19,15 +19,20 @@ default-track = "mixed-precision"
 description = "CCTK_REAL4/REAL2 storage; needs a mixed-precision flesh"
 
 [[fork-of]]
-target = "et/carpetx"
+target = "et/carpetx@~2026.5"
 
 [[dependency]]
 target = "max-morris/cactus@mixed-precision:^1"
+needs = []    # a flesh: no thorns to name
 
 [[dependency]]
 target = "et/amrex@^2026.5"
 needs = ["AMReX"]
 needed-by = ["CarpetX", "Loop"]
+
+[[dependency]]
+target = "et/cactusbase@^2026.5"
+needs = ["Boundary", "CoordBase", "IOUtil", "SymBase"]
 
 [[works-with]]
 target = "max-morris/carpetx-mp@^1"
@@ -55,6 +60,7 @@ note = "needs _Float16 (GCC 12 or newer)"</pre>
     <tr><td><code>arrangement</code></td><td>The arrangement every thorn belongs to, whatever folder it sits in: needed for a repo whose thorns sit at its root, that is itself one thorn, or whose folders don't name the arrangement (see <a href="#layouts">repo layouts</a>). A repo laid out as <code>Arrangement/Thorn/</code> doesn't need it.</td></tr>
     <tr><td><code>root</code></td><td>Where the thorns are, relative to the repo root, when not at it: the folder holding the <code>Arrangement/Thorn/</code> (or <code>Thorn/</code>) directories, such as <code>"Auxiliary/Cactus"</code> for Kranc. Thorns elsewhere in the repo aren't published. Default: the repo root.</td></tr>
     <tr><td><code>flesh</code></td><td><code>true</code> when the package is the Cactus flesh rather than thorns: <code>et/cactus</code>, or a fork of it such as a mixed-precision flesh, which says <code>[[fork-of]] target = "et/cactus@…"</code>. The Cactarium checks that each version has <code>src/main/flesh.cc</code> and <code>lib/sbin/CST</code>; such a package has no thorns, so no <code>thorns</code>, <code>arrangement</code> or <code>root</code>. Default: <code>false</code>.</td></tr>
+    <tr><td><code>exclude-thorns</code></td><td>Thorns the repo has that can't build, and so aren't published, such as <code>["CarpetIOF5"]</code> (it needs an F5 library nothing provides). Not with <code>thorns</code>. A name the commit doesn't have is refused.</td></tr>
     <tr><td><code>thorns</code></td><td>The thorns to publish, by directory name, such as <code>["CarpetX", "Loop"]</code>. Thorns found but not listed are left out. A repo that is itself one thorn names that thorn here. Default: every directory with an <code>interface.ccl</code>.</td></tr>
     <tr><td><code>default-track</code></td><td>The track the package page shows first: a track name, or <code>"default"</code> for the unprefixed tags. Only the page uses it: a reference without a track always means the unprefixed track. Default: the unprefixed track.</td></tr>
     <tr><td><code>tag-pattern</code></td><td>How release tags become versions when they aren't <code>vX.Y.Z</code>, such as <code>"ET_{major}_{minor}_v{patch}"</code>. With a pattern, only the tags it matches are versions, all on the default track. See <a href="/docs/versions#tag-pattern">tag patterns</a>. Default: <code>vX.Y.Z</code> and <code>track/vX.Y.Z</code>.</td></tr>
@@ -73,16 +79,20 @@ note = "needs _Float16 (GCC 12 or newer)"</pre>
 </table></div>
 
 <h2 id="dependencies">[[dependency]]</h2>
-<p>A thorn's CCL already says <em>what</em> it needs: the implementations it inherits from or is friends with, the capabilities and thorns it requires, the functions it requires. A dependency says <em>where that comes from</em>: which package, at which versions or commit. It never repeats the CCL.</p>
+<p>A thorn's CCL says <em>what</em> it needs: the implementations it inherits from or is friends with, the capabilities and thorns it requires, the functions it requires. A dependency says <em>which thorns of which package</em> supply that, at which versions. It never repeats the CCL, and the Cactarium checks that the two agree (see <a href="#check">the check at publish</a>).</p>
 <div class="table-box"><table>
   <thead><tr><th scope="col">Field</th><th scope="col">What it does</th></tr></thead>
   <tbody>
-    <tr><td><code>target</code><br><span class="small muted">required</span></td><td>The package (or stack) depended on: <code>owner/name</code> for any version on its default track, <code>owner/name@RANGE</code> for a <a href="/docs/versions">range</a> such as <code>^2026.5</code> or <code>mixed-precision:^1</code>, or <code>owner/name#SHA</code> for one commit, full or abbreviated. Name thorns in <code>needs</code>, not here.</td></tr>
-    <tr><td><code>needs</code></td><td>Thorns of the target that are needed whatever the CCL says, such as <code>["CarpetX"]</code>: to choose among packages that provide the same implementation (both Carpet and CarpetX implement <code>Driver</code>), or for a need the CCL can't express, such as including a header by path. Default: whichever of the target's thorns the CCL requirements resolve to.</td></tr>
-    <tr><td><code>needed-by</code></td><td>Thorns of this package the dependency is for, such as <code>["CarpetPETSc"]</code>; a version whose manifest names a thorn it doesn't publish is invalid. Default: every thorn. Only a package has thorns, so a stack's dependencies can't use it.</td></tr>
+    <tr><td><code>target</code></td><td>The package depended on: <code>owner/name</code> for any version on its default track, <code>owner/name@RANGE</code> for a <a href="/docs/versions">range</a> such as <code>^2026.5</code> or <code>mixed-precision:^1</code>, or <code>owner/name#SHA</code> for one commit, full or abbreviated. A package depends on packages; name a stack with <code>[[works-with]]</code>. Give <code>target</code> or <code>any-of</code>.</td></tr>
+    <tr><td><code>needs</code><br><span class="small muted">required in a package</span></td><td>The thorns of the target this package uses, such as <code>["CarpetSlab", "CarpetLib"]</code>, including any the CCL can't express (a header included by path). <code>needs = []</code> only for a target with no thorns, a flesh.</td></tr>
+    <tr><td><code>any-of</code></td><td>Interchangeable packages instead of one target, each with its own needs, in your order of preference: <code>any-of = [{ target = "et/carpet", needs = ["CarpetSlab"] }, { target = "et/cactuspugh", needs = ["PUGHSlab"] }]</code>. CactUp takes one already installed, else one the rest of the install brings in, else the first that conflicts with nothing.</td></tr>
+    <tr><td><code>needed-by</code></td><td>Thorns of this package the dependency is for, such as <code>["CarpetPETSc"]</code>. Default: every thorn. Only a package has thorns, so a stack's dependencies can't use it.</td></tr>
     <tr><td><code>note</code></td><td>Free text shown with the dependency.</td></tr>
   </tbody>
 </table></div>
+<h3 id="check">The check at publish</h3>
+<p>The Cactarium hosts only what works as delivered. A version is refused unless every dependency's target has a version here in range (or at the commit) with the thorns its <code>needs</code> names, and <strong>every hard CCL requirement of every published thorn</strong> is met by the package's own thorns or by the <code>needs</code> of a dependency that applies to that thorn (for an <code>any-of</code>, by every alternative). The refusal lists each problem and, where it can, the line that fixes it. A thorn that can't build at all goes in <code>exclude-thorns</code>, and isn't published.</p>
+<p>Some things don't block but are shown to reviewers: a <code>needs</code> thorn no CCL requirement explains, an include that climbs out of a thorn's own directory by path into another thorn's sources, a generic <code>inherits: Driver</code> next to such an include, and excluded thorns.</p>
 <p>The package page lists dependencies under <em>Compatibility</em>, and the API returns them with the claims (kind <code>dependency</code>).</p>
 
 <h2 id="claims">Claims</h2>
