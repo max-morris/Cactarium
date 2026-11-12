@@ -67,6 +67,7 @@ fn meets(name: &str, facts: &ThornFacts, need: &Need) -> bool {
 struct TargetVersion {
     label: String,
     flesh: bool,
+    library: bool,
     thorns: Vec<(String, ThornFacts)>,
 }
 
@@ -106,11 +107,22 @@ async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetV
     Ok(Some(TargetVersion {
         label: if track.is_empty() { version } else { format!("{track}:{version}") },
         flesh: manifest.as_ref().and_then(|m| m["package"]["flesh"].as_bool()).unwrap_or(false),
+        library: manifest.as_ref().and_then(|m| m["package"]["library"].as_bool()).unwrap_or(false),
         thorns: thorns
             .into_iter()
             .map(|(n, f)| (n, serde_json::from_value(f).unwrap_or_default()))
             .collect(),
     }))
+}
+
+/// Whether a library's checkout can't go at `path`: something is there already (a file, or a
+/// folder with anything in it).
+fn occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Err(_) => false,
+        Ok(m) if m.is_dir() => std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some()),
+        Ok(_) => true,
+    }
 }
 
 /// Checks a package version's dependencies against its thorns' CCL. `own` is what will be
@@ -150,15 +162,40 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                     });
                 }
                 Some(tv) => {
-                    if alt.needs.is_empty() && !tv.flesh {
+                    let at = format!("{}@{}", alt.target(), tv.label);
+                    // needs exactly when the target has thorns; into exactly when it is a library.
+                    match (tv.library, tv.flesh, &c.into) {
+                        (true, _, _) if !c.alternatives.is_empty() => problems.push(format!(
+                            "{at} is a library, which can't be an alternative in an any-of: depend on it with target and into"
+                        )),
+                        (true, _, None) => problems.push(format!(
+                            "{at} is a library: say where its checkout goes with into = \"<folder in this repo>\" on the dependency{}",
+                            if alt.needs.is_empty() { "" } else { ", and drop needs (a library has no thorns)" }
+                        )),
+                        (false, _, Some(into)) => problems.push(format!(
+                            "the dependency on {} gives into = \"{into}\", but {at} isn't a library (library = true): drop into",
+                            alt.target()
+                        )),
+                        (false, true, _) if !alt.needs.is_empty() => problems.push(format!(
+                            "{at} is a flesh, which has no thorns: drop the needs of the dependency on {}",
+                            alt.target()
+                        )),
+                        (false, false, _) if alt.needs.is_empty() => problems.push(format!(
+                            "the dependency on {} has no needs, but {at} has thorns: name the ones this package uses",
+                            alt.target()
+                        )),
+                        _ => {}
+                    }
+                    if let Some(into) = &c.into
+                        && tv.library
+                        && occupied(&repo.join(into))
+                    {
                         problems.push(format!(
-                            "the dependency on {} has needs = [], but {}@{} has thorns: name the ones this package uses",
-                            alt.target(),
-                            alt.target(),
-                            tv.label
+                            "the dependency on {} puts its checkout into {into}, which this commit already has: choose a folder the repo doesn't use",
+                            alt.target()
                         ));
                     }
-                    for n in &alt.needs {
+                    for n in alt.needs.iter().filter(|_| !tv.flesh && !tv.library) {
                         if !tv.thorns.iter().any(|(t, _)| t == n) {
                             problems.push(format!(
                                 "the dependency on {} needs {n}, which {}@{} doesn't have",

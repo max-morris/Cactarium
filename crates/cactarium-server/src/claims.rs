@@ -22,6 +22,8 @@ pub struct ClaimRec {
     pub needs: Vec<String>,
     /// A dependency's thorns of this package; empty means every thorn.
     pub needed_by: Vec<String>,
+    /// A dependency on a library: where its checkout goes in this package's repo.
+    pub into: Option<String>,
     /// An any-of dependency's alternatives, in the author's order (the fields above repeat the
     /// first). Empty for every other claim.
     pub alternatives: Vec<Alt>,
@@ -54,7 +56,7 @@ impl Alt {
     }
 }
 
-const COLS: &str = "kind, target_owner, target_name, range, sha, needs, needed_by, alternatives, note";
+const COLS: &str = "kind, target_owner, target_name, range, sha, needs, needed_by, alternatives, note, into_path";
 
 type Row = (
     String,
@@ -65,6 +67,7 @@ type Row = (
     Vec<String>,
     Vec<String>,
     Option<serde_json::Value>,
+    Option<String>,
     Option<String>,
 );
 
@@ -78,6 +81,7 @@ impl ClaimRec {
             sha: target.sha.clone(),
             needs: vec![],
             needed_by: vec![],
+            into: None,
             alternatives: vec![],
             note: note.clone(),
         }
@@ -107,6 +111,7 @@ impl ClaimRec {
             out.push(ClaimRec {
                 needs: first_needs.unwrap_or_default().to_vec(),
                 needed_by: d.needed_by.clone(),
+                into: d.into.clone(),
                 alternatives: if d.target.is_some() {
                     vec![]
                 } else {
@@ -132,7 +137,7 @@ impl ClaimRec {
 
     pub async fn insert(&self, db: &mut sqlx::PgConnection, version_id: i64) -> AppResult<()> {
         sqlx::query(&format!(
-            "INSERT INTO claims (version_id, {COLS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+            "INSERT INTO claims (version_id, {COLS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
         ))
         .bind(version_id)
         .bind(&self.kind)
@@ -144,6 +149,7 @@ impl ClaimRec {
         .bind(&self.needed_by)
         .bind((!self.alternatives.is_empty()).then(|| serde_json::to_value(&self.alternatives).unwrap_or_default()))
         .bind(&self.note)
+        .bind(&self.into)
         .execute(db)
         .await?;
         Ok(())
@@ -160,7 +166,7 @@ impl ClaimRec {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(kind, owner, name, range, sha, needs, needed_by, alternatives, note)| ClaimRec {
+            .map(|(kind, owner, name, range, sha, needs, needed_by, alternatives, note, into)| ClaimRec {
                 kind,
                 owner,
                 name,
@@ -168,6 +174,7 @@ impl ClaimRec {
                 sha,
                 needs,
                 needed_by,
+                into,
                 alternatives: alternatives.and_then(|a| serde_json::from_value(a).ok()).unwrap_or_default(),
                 note,
             })
@@ -181,6 +188,7 @@ impl ClaimRec {
             range: self.range.clone(),
             sha: self.sha.clone(),
             needs: self.needs.clone(),
+            into: self.into.clone(),
             needed_by: self.needed_by.clone(),
             alternatives: self
                 .alternatives
@@ -255,6 +263,7 @@ impl ClaimRec {
                 target_url: format!("/{}/{}", self.owner, self.name),
                 range: String::new(),
                 needs: String::new(),
+                into: String::new(),
                 needed_by: self.needed_by.join(", "),
                 note: self.note.clone().unwrap_or_default(),
             };
@@ -268,6 +277,7 @@ impl ClaimRec {
             target_url: format!("/{}/{}", self.owner, self.name),
             range: at,
             needs: self.needs.join(", "),
+            into: self.into.clone().unwrap_or_default(),
             needed_by: self.needed_by.join(", "),
             note: self.note.clone().unwrap_or_default(),
         }

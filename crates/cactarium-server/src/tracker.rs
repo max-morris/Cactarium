@@ -926,6 +926,8 @@ pub struct PackageTip {
     pub tree: String,
     /// A Cactus flesh (no thorns), per its manifest.
     pub flesh: bool,
+    /// A library thorns build against (no thorns), per its manifest.
+    pub library: bool,
     pub thorns: Vec<(String, String, String, ccl::ThornFacts)>,
     pub claims: Vec<ClaimRec>,
 }
@@ -956,10 +958,12 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppRe
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
     let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);
+    let library = p.manifest_json["package"]["library"].as_bool().unwrap_or(false);
     Ok(PackageTip {
         commit: commit.to_owned(),
         tree: co.tree.clone(),
         flesh,
+        library,
         thorns: p.thorns,
         claims: p.claims,
     })
@@ -1042,7 +1046,8 @@ async fn prepare(
         // The crate checked it is a plain relative path; a folder that isn't there finds no thorns.
         let sub = pkg.root.clone().unwrap_or_default();
         let root = co.path.join(&sub);
-        let scanned = if pkg.flesh {
+        // A flesh or a library has no thorns to scan.
+        let scanned = if pkg.flesh || pkg.library {
             Vec::new()
         } else {
             tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?
@@ -1086,7 +1091,7 @@ async fn prepare(
             };
             p.thorns.push((arrangement, name, dir, t.facts));
         }
-        if p.thorns.is_empty() && !pkg.flesh {
+        if p.thorns.is_empty() && !pkg.flesh && !pkg.library {
             return Err(AppError::bad("no thorns found (directories with an interface.ccl)"));
         }
         for c in &p.claims {

@@ -132,11 +132,12 @@ async fn version_body(state: &AppState, v: &Version, url: &str) -> ApiResult<Pac
             .await
             .map_err(AppError::from)?;
     let claims = ClaimRec::of_version(&state.db, v.id).await?;
-    let flesh = v.manifest.as_ref().and_then(|m| m["package"]["flesh"].as_bool()).unwrap_or(false);
+    let kind_flag = |k: &str| v.manifest.as_ref().and_then(|m| m["package"][k].as_bool()).unwrap_or(false);
     Ok(PackageVersion {
         version: version_info(v),
         url: url.to_owned(),
-        flesh,
+        flesh: kind_flag("flesh"),
+        library: kind_flag("library"),
         thorns: thorns
             .into_iter()
             .map(|(arrangement, thorn, dir, facts)| ThornInfo {
@@ -332,6 +333,7 @@ pub async fn package_tip(
         version: tip_version_info(&e, &label, &t),
         url,
         flesh: t.flesh,
+        library: t.library,
         thorns: t
             .thorns
             .iter()
