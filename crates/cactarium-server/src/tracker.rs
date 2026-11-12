@@ -426,10 +426,21 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
     if !entry.curated || repo.overlay_manifest.is_none() {
         return Err(AppError::bad(format!("{} isn't curated: its versions read the repo's own manifest", entry.slug())));
     }
+    // The overlay's since bounds what it curates: an older version stays as it was (yank it if no
+    // range should choose it any more).
+    let since = Manifest::from_repo_file(PACKAGE_FILE, repo.overlay_manifest.as_deref().unwrap_or_default())
+        .ok()
+        .and_then(|m| m.package.and_then(|p| p.since));
     let (mut done, mut left) = (0, Vec::new());
     for v in model::all_versions(state, entry.id).await? {
         let label = v.label();
         if v.state == "invalid" {
+            continue;
+        }
+        if let (Some(since), Ok(tv)) = (&since, label.parse::<TrackedVersion>())
+            && tv.version < *since
+        {
+            left.push(format!("{label}: older than the manifest's since ({since}), so not curated; yank it if no range should choose it"));
             continue;
         }
         let Some(commit) = v.commit.clone() else {
