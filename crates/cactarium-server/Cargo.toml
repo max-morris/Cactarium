@@ -10,7 +10,7 @@ name = "cactarium"
 path = "src/main.rs"
 
 [dependencies]
-cactup-ecosystem-common = { git = "https://github.com/max-morris/cactup-ecosystem-common", rev = "888739048b7f1a9e3f8b2e63de708d86e4184d1c" }
+cactup-ecosystem-common = { git = "https://github.com/max-morris/cactup-ecosystem-common", rev = "aaee889c230abca9ff4d6e65983187e739c56459" }
 ammonia = "4.2"
 anyhow = "1.0.102"
 askama = "0.16"
