@@ -486,6 +486,16 @@ if tok:
     s, body, hdrs = anon.get("/api/v1/packages/alice/spacetimex/versions", headers={**REV, "Authorization": f"Bearer {tok.group(1)}"})
     check("and in the version list", s == 200 and '"version":"0.2.0"' in body and hdrs.get("x-cactarium-unreviewed") == "true", f"{s} {body[:160]}")
 page(maxv, f"/admin?s={queue_id('alice/spacetimex@0.2.0')}", contains="cactup add alice/spacetimex@0.2.0 --risky-allow-untrusted-artifacts")
+# When the site serves unreviewed code, anyone who asks gets a release awaiting review, marked.
+maxv.get("/admin/site")
+maxv.post("/admin/site", {"untrusted_tips": "allow"})
+s, body, hdrs = anon.get(pending_req, headers=REV)
+check("with untrusted-tips allowed, anyone who asks gets a release awaiting review, marked",
+      s == 200 and hdrs.get("x-cactarium-unreviewed") == "true", f"{s} {body[:160]}")
+s, _, _ = anon.get(pending_req)
+check("but still not without asking", s in (400, 404), s)
+maxv.get("/admin/site")
+maxv.post("/admin/site", {"untrusted_tips": "refuse"})
 page(maxv, "/admin", contains="alice (pushed a tag)")
 check("approve the pushed tag", decide("alice/spacetimex@0.2.0", "approve") == 303)
 page(anon, "/alice/spacetimex/0.2.0")

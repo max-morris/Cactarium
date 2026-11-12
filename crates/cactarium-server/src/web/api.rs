@@ -61,16 +61,22 @@ impl FromRequestParts<AppState> for TokenUser {
     }
 }
 
-/// The request header with which an admin asks for versions awaiting review too (CactUp sends it
-/// for `--risky-allow-untrusted-artifacts`); without an admin token it is ignored.
+/// The request header asking for what awaits review too (CactUp sends it for
+/// `--risky-allow-untrusted-artifacts`): see [`Reviewer`] for who gets what.
 pub const INCLUDE_UNREVIEWED_HEADER: &str = "x-cactarium-include-unreviewed";
-/// On an answer that serves something awaiting review (only ever to an admin who asked).
+/// On an answer that serves something awaiting review (only ever to a request that asked).
 pub const UNREVIEWED_HEADER: &str = "x-cactarium-unreviewed";
 
-/// Whether this request may see what awaits review: it says `x-cactarium-include-unreviewed:
-/// true` and carries a valid token of an admin. Anything else (no header, no token, not an admin)
-/// is an ordinary request, answered as one.
-pub struct Reviewer(pub bool);
+/// What awaits review this request may see. It must say `x-cactarium-include-unreviewed: true`.
+/// Then an admin's token reaches releases awaiting review and entries awaiting their first review;
+/// anyone else reaches releases awaiting review of public entries when the site serves unreviewed
+/// code (the `untrusted-tips` setting is `allow`). Otherwise it is an ordinary request.
+pub struct Reviewer {
+    /// Releases awaiting review of public entries.
+    releases: bool,
+    /// Entries awaiting their first review (admins only).
+    entries: bool,
+}
 
 impl FromRequestParts<AppState> for Reviewer {
     type Rejection = ApiError;
@@ -81,19 +87,18 @@ impl FromRequestParts<AppState> for Reviewer {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         if !asked {
-            return Ok(Reviewer(false));
+            return Ok(Reviewer { releases: false, entries: false });
         }
-        Ok(Reviewer(match TokenUser::from_request_parts(parts, state).await {
-            Ok(TokenUser(u)) => u.is_admin(),
-            Err(_) => false,
-        }))
+        let admin = matches!(TokenUser::from_request_parts(parts, state).await, Ok(TokenUser(u)) if u.is_admin());
+        let open = admin || crate::site::untrusted_tips_allowed(state).await?;
+        Ok(Reviewer { releases: open, entries: admin })
     }
 }
 
 /// A version this request may be served: a reviewed one, or for a reviewer one awaiting review.
 /// Rejected versions never.
 fn servable(v: &Version, reviewer: &Reviewer) -> bool {
-    v.approved() || (reviewer.0 && v.review == "pending")
+    v.approved() || (reviewer.releases && v.review == "pending")
 }
 
 /// The answer's header saying what it serves awaits review, when it does.
@@ -105,7 +110,7 @@ fn unreviewed_header(e: &Entry, v: Option<&Version>) -> Option<(header::HeaderNa
 /// An entry the request may see: public, or for a reviewer one awaiting its first review too.
 async fn entry_for(state: &AppState, owner: &str, name: &str, kind: Option<&str>, reviewer: &Reviewer) -> ApiResult<Entry> {
     match model::find_entry(state, owner, name).await? {
-        Some(e) if reviewer.0 && e.visibility == "pending" && kind.is_none_or(|k| k == e.kind) => Ok(e),
+        Some(e) if reviewer.entries && e.visibility == "pending" && kind.is_none_or(|k| k == e.kind) => Ok(e),
         _ => public_entry(state, owner, name, kind).await,
     }
 }
