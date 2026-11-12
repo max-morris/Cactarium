@@ -169,6 +169,14 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
         Some(v) => ClaimRec::of_version(&state.db, v.id).await?,
         None => vec![],
     };
+    // What the dependency check noticed at publish (deps.rs), for the reviewer to look at.
+    if let Some(v) = latest {
+        let smells: Vec<String> = sqlx::query_scalar("SELECT unnest(smells) FROM versions WHERE id = $1")
+            .bind(v.id)
+            .fetch_all(&state.db)
+            .await?;
+        warnings.extend(smells.into_iter().map(|s| format!("worth a look: {s}")));
+    }
     // A fork-of is a promise of a drop-in replacement: say so when the fork lacks upstream thorns.
     if let Some(v) = latest.filter(|_| claims.iter().any(|c| c.kind == "fork-of")) {
         let own: Vec<String> = sqlx::query_scalar("SELECT name FROM thorns WHERE version_id = $1")

@@ -8,6 +8,7 @@ mod auth;
 mod claims;
 mod config;
 mod curate;
+mod deps;
 mod error;
 mod flights;
 mod git;

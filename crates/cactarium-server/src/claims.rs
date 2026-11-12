@@ -1,7 +1,7 @@
 //! A version's dependencies and claims, as the `claims` table stores them: one row per
 //! `[[dependency]]`, `[[fork-of]]`, `[[works-with]]` and `[[incompatible-with]]` in its manifest.
 
-use cactup_ecosystem_common::api::ClaimInfo;
+use cactup_ecosystem_common::api::{AlternativeInfo, ClaimInfo};
 use cactup_ecosystem_common::manifest::Manifest;
 use cactup_ecosystem_common::slug::Slug;
 
@@ -22,12 +22,51 @@ pub struct ClaimRec {
     pub needs: Vec<String>,
     /// A dependency's thorns of this package; empty means every thorn.
     pub needed_by: Vec<String>,
+    /// An any-of dependency's alternatives, in the author's order (the fields above repeat the
+    /// first). Empty for every other claim.
+    pub alternatives: Vec<Alt>,
     pub note: Option<String>,
 }
 
-const COLS: &str = "kind, target_owner, target_name, range, sha, needs, needed_by, note";
+/// One alternative of an any-of dependency, as the `claims.alternatives` JSON stores it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Alt {
+    pub owner: String,
+    pub name: String,
+    pub range: Option<String>,
+    pub sha: Option<String>,
+    pub needs: Vec<String>,
+}
 
-type Row = (String, String, String, Option<String>, Option<String>, Vec<String>, Vec<String>, Option<String>);
+impl Alt {
+    fn of(target: &Slug, needs: Option<&[String]>) -> Alt {
+        Alt {
+            owner: target.owner.as_str().to_owned(),
+            name: target.name.as_str().to_owned(),
+            range: target.at.clone(),
+            sha: target.sha.clone(),
+            needs: needs.unwrap_or_default().to_vec(),
+        }
+    }
+
+    pub fn target(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
+const COLS: &str = "kind, target_owner, target_name, range, sha, needs, needed_by, alternatives, note";
+
+type Row = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<serde_json::Value>,
+    Option<String>,
+);
 
 impl ClaimRec {
     fn new(kind: &str, target: &Slug, note: &Option<String>) -> ClaimRec {
@@ -39,7 +78,23 @@ impl ClaimRec {
             sha: target.sha.clone(),
             needs: vec![],
             needed_by: vec![],
+            alternatives: vec![],
             note: note.clone(),
+        }
+    }
+
+    /// The packages a dependency may be met by, with their needs: itself, or its alternatives.
+    pub fn options(&self) -> Vec<Alt> {
+        if self.alternatives.is_empty() {
+            vec![Alt {
+                owner: self.owner.clone(),
+                name: self.name.clone(),
+                range: self.range.clone(),
+                sha: self.sha.clone(),
+                needs: self.needs.clone(),
+            }]
+        } else {
+            self.alternatives.clone()
         }
     }
 
@@ -47,10 +102,17 @@ impl ClaimRec {
     pub fn of_manifest(m: &Manifest) -> Vec<ClaimRec> {
         let mut out = Vec::new();
         for d in &m.dependencies {
+            let options = d.options();
+            let Some((first, first_needs)) = options.first() else { continue };
             out.push(ClaimRec {
-                needs: d.needs.clone(),
+                needs: first_needs.unwrap_or_default().to_vec(),
                 needed_by: d.needed_by.clone(),
-                ..ClaimRec::new("dependency", &d.target, &d.note)
+                alternatives: if d.target.is_some() {
+                    vec![]
+                } else {
+                    options.iter().map(|(t, n)| Alt::of(t, *n)).collect()
+                },
+                ..ClaimRec::new("dependency", first, &d.note)
             });
         }
         for f in &m.fork_of {
@@ -70,7 +132,7 @@ impl ClaimRec {
 
     pub async fn insert(&self, db: &mut sqlx::PgConnection, version_id: i64) -> AppResult<()> {
         sqlx::query(&format!(
-            "INSERT INTO claims (version_id, {COLS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            "INSERT INTO claims (version_id, {COLS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
         ))
         .bind(version_id)
         .bind(&self.kind)
@@ -80,6 +142,7 @@ impl ClaimRec {
         .bind(&self.sha)
         .bind(&self.needs)
         .bind(&self.needed_by)
+        .bind((!self.alternatives.is_empty()).then(|| serde_json::to_value(&self.alternatives).unwrap_or_default()))
         .bind(&self.note)
         .execute(db)
         .await?;
@@ -97,7 +160,7 @@ impl ClaimRec {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(kind, owner, name, range, sha, needs, needed_by, note)| ClaimRec {
+            .map(|(kind, owner, name, range, sha, needs, needed_by, alternatives, note)| ClaimRec {
                 kind,
                 owner,
                 name,
@@ -105,6 +168,7 @@ impl ClaimRec {
                 sha,
                 needs,
                 needed_by,
+                alternatives: alternatives.and_then(|a| serde_json::from_value(a).ok()).unwrap_or_default(),
                 note,
             })
             .collect())
@@ -118,6 +182,11 @@ impl ClaimRec {
             sha: self.sha.clone(),
             needs: self.needs.clone(),
             needed_by: self.needed_by.clone(),
+            alternatives: self
+                .alternatives
+                .iter()
+                .map(|a| AlternativeInfo { target: a.target(), range: a.range.clone(), sha: a.sha.clone(), needs: a.needs.clone() })
+                .collect(),
             note: self.note.clone(),
         }
     }
@@ -170,6 +239,26 @@ impl ClaimRec {
             (None, Some(h)) => format!("#{h}"),
             (None, None) => String::new(),
         };
+        if !self.alternatives.is_empty() {
+            // Any of: each alternative with its version and thorns, in the author's order.
+            let alt = |a: &Alt| {
+                let at = match (&a.range, &a.sha) {
+                    (Some(r), _) => format!("@{r}"),
+                    (None, Some(h)) => format!("#{h}"),
+                    (None, None) => String::new(),
+                };
+                format!("{}{at} ({})", a.target(), a.needs.join(", "))
+            };
+            return ClaimRow {
+                kind: "depends on any of".to_owned(),
+                target: self.alternatives.iter().map(alt).collect::<Vec<_>>().join(" or "),
+                target_url: format!("/{}/{}", self.owner, self.name),
+                range: String::new(),
+                needs: String::new(),
+                needed_by: self.needed_by.join(", "),
+                note: self.note.clone().unwrap_or_default(),
+            };
+        }
         ClaimRow {
             kind: match self.kind.as_str() {
                 "dependency" => "depends on".to_owned(),

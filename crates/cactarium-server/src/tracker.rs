@@ -975,6 +975,8 @@ struct Prepared {
     /// A sim published from its repo: the `.sim` the manifest names, checked as an upload is,
     /// and the manifest's own description.
     sim: Option<(crate::sims::Checked, Option<String>)>,
+    /// What reviewers should look at (deps.rs): stored with the version.
+    smells: Vec<String>,
 }
 
 async fn prepare(
@@ -1012,6 +1014,7 @@ async fn prepare(
         claims,
         frozen: None,
         sim: None,
+        smells: Vec::new(),
     };
 
     if let Some(pkg) = &m.package {
@@ -1066,6 +1069,10 @@ async fn prepare(
             if t.name.is_some() && allow.is_some_and(|a| !a.contains(&name)) {
                 continue;
             }
+            // exclude-thorns: thorns that can't build aren't published.
+            if pkg.exclude_thorns.contains(&name) {
+                continue;
+            }
             // The manifest's arrangement, when given, wins over the folder the thorn sits in:
             // GRHayL keeps GRHayLib under implementations/, which is no arrangement.
             let arrangement = match (&pkg.arrangement, &t.arrangement) {
@@ -1090,6 +1097,16 @@ async fn prepare(
                 )));
             }
         }
+        // exclude-thorns names thorns the repo has: a name it doesn't is a typo.
+        if !pkg.exclude_thorns.is_empty() {
+            let root = co.path.join(pkg.root.clone().unwrap_or_default());
+            let all = tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?;
+            if let Some(x) = pkg.exclude_thorns.iter().find(|x| !all.iter().any(|t| t.name.as_deref() == Some(x.as_str()))) {
+                return Err(AppError::bad(format!("exclude-thorns names '{x}', which this commit doesn't have")));
+            }
+        }
+        // The CCL and the dependencies must agree; what reviewers should see comes back as smells.
+        p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path).await?;
     }
     if let Some(stack) = &m.stack {
         let own = match &stack.thornlist {
@@ -1145,6 +1162,11 @@ async fn store_prepared(
     track: &str,
     p: Prepared,
 ) -> AppResult<()> {
+    sqlx::query("UPDATE versions SET smells = $2 WHERE id = $1")
+        .bind(vid)
+        .bind(&p.smells)
+        .execute(&mut *db)
+        .await?;
     for (arr, name, dir, facts) in &p.thorns {
         sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(vid)
