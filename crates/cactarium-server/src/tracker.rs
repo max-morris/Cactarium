@@ -267,7 +267,12 @@ pub async fn register(
     }
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
     for e in &entries {
-        sync_as(state, e, Some(user)).await?;
+        // A tag whose commit can't be fetched right now stays unread (kept as the repo's poll
+        // error); the poller tries it again.
+        match sync_as(state, e, Some(user)).await {
+            Ok(_) | Err(AppError::Upstream(_)) => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(entries)
 }
@@ -749,6 +754,8 @@ async fn sync_inner(
     }
 
     let mut added = 0;
+    // Tags whose commits couldn't be fetched this time: left unread, so the next sync tries again.
+    let mut unfetched: Vec<String> = Vec::new();
     for (r, tv) in version_tags(refs, &TagRule::of(repo)?) {
         if by_tag.contains_key(r.name.as_str()) {
             continue;
@@ -756,8 +763,11 @@ async fn sync_inner(
         if added == MAX_NEW_PER_SYNC {
             break;
         }
-        ingest(state, entry, repo, &r, &tv, actor).await?;
-        added += 1;
+        match ingest(state, entry, repo, &r, &tv, actor).await {
+            Ok(()) => added += 1,
+            Err(AppError::Upstream(why)) => unfetched.push(why),
+            Err(e) => return Err(e),
+        }
     }
     if added > 0 {
         publish::touch(state, entry.id).await?;
@@ -773,6 +783,15 @@ async fn sync_inner(
         if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
             store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
         }
+    }
+    // What couldn't be fetched is reported (it becomes the repo's poll error) and tried again.
+    if !unfetched.is_empty() {
+        return Err(AppError::Upstream(format!(
+            "{} new version(s) read; {} tag(s) will be tried again at the next sync: {}",
+            added,
+            unfetched.len(),
+            unfetched.join("; ")
+        )));
     }
     Ok(added)
 }
@@ -828,9 +847,15 @@ async fn ingest(
     let base = |reason: Option<String>, tree: Option<String>| (reason, tree);
     let co = git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await;
     let (invalid, tree, prepared) = match co {
-        Err(e) => {
-            let (reason, tree) = base(Some(format!("cannot fetch the tagged commit: {e:#}")), None);
+        // Too large is a fact about the commit: the version is stored invalid, as for a bad manifest.
+        Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
+            let (reason, tree) = base(Some(format!("cannot index the tagged commit: {e:#}")), None);
             (reason, tree, None)
+        }
+        // Any other fetch failure (the network, the host) is worth trying again: nothing is
+        // stored, so the tag is read again at the next sync.
+        Err(e) => {
+            return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, &r.commit[..10.min(r.commit.len())])));
         }
         Ok(co) => match prepare(state, entry, repo, &co, r, tv).await {
             Ok(p) => (None, Some(co.tree.clone()), Some(p)),
@@ -888,6 +913,8 @@ async fn ingest(
 pub struct PackageTip {
     pub commit: String,
     pub tree: String,
+    /// A Cactus flesh (no thorns), per its manifest.
+    pub flesh: bool,
     pub thorns: Vec<(String, String, String, ccl::ThornFacts)>,
     pub claims: Vec<ClaimRec>,
 }
@@ -917,9 +944,11 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppRe
     let p = prepare(state, entry, &repo, &co, &r, &tv)
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
+    let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);
     Ok(PackageTip {
         commit: commit.to_owned(),
         tree: co.tree.clone(),
+        flesh,
         thorns: p.thorns,
         claims: p.claims,
     })
@@ -984,14 +1013,26 @@ async fn prepare(
                     .map_err(anyhow::Error::from)?,
             );
         }
+        // A flesh package is the Cactus flesh itself: checked by its files, and no thorns.
+        if pkg.flesh {
+            for marker in ["src/main/flesh.cc", "lib/sbin/CST"] {
+                if !co.path.join(marker).is_file() {
+                    return Err(AppError::bad(format!(
+                        "[package] flesh = true, but this commit has no {marker}: it isn't a Cactus flesh"
+                    )));
+                }
+            }
+        }
         let allow = pkg.thorns.as_ref();
         // [package] root: where the thorns are, when not at the repo root (Kranc: Auxiliary/Cactus).
         // The crate checked it is a plain relative path; a folder that isn't there finds no thorns.
         let sub = pkg.root.clone().unwrap_or_default();
         let root = co.path.join(&sub);
-        let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root))
-            .await
-            .map_err(anyhow::Error::from)?;
+        let scanned = if pkg.flesh {
+            Vec::new()
+        } else {
+            tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?
+        };
         for t in scanned {
             // A repo that is one thorn (the Einstein Toolkit's ExternalLibraries-* repos) names it,
             // and its arrangement, in the manifest.
@@ -1027,7 +1068,7 @@ async fn prepare(
             };
             p.thorns.push((arrangement, name, dir, t.facts));
         }
-        if p.thorns.is_empty() {
+        if p.thorns.is_empty() && !pkg.flesh {
             return Err(AppError::bad("no thorns found (directories with an interface.ccl)"));
         }
         for c in &p.claims {
