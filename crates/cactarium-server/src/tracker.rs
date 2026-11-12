@@ -775,7 +775,9 @@ async fn sync_inner(
     for k in &known {
         let (Some(tag), Some(frozen)) = (&k.tag, &k.commit) else { continue };
         match remote.get(tag) {
-            Some(now) if now != frozen && k.state != "tag-moved" => {
+            // An invalid version is never served: a tag moving off it changes nothing (it stays
+            // invalid, never "tag-moved", which would make it look like a usable version).
+            Some(now) if now != frozen && k.state != "tag-moved" && k.state != "invalid" => {
                 mark(state, entry, k.id, "tag-moved", tag, frozen, Some(now)).await?;
             }
             None if k.state != "upstream-missing" && k.state != "invalid" => {
@@ -791,11 +793,28 @@ async fn sync_inner(
         }
     }
 
+    // Tags a later release recorded as not this entry's (its foreign_tags table, present after a
+    // rollback from it): left alone while they name the commit they were judged at, as it would.
+    let has_foreign: bool = sqlx::query_scalar("SELECT to_regclass('foreign_tags') IS NOT NULL")
+        .fetch_one(&state.db)
+        .await?;
+    let foreign: BTreeMap<String, String> = if has_foreign {
+        sqlx::query_as::<_, (String, String)>("SELECT tag, commit FROM foreign_tags WHERE entry_id = $1")
+            .bind(entry.id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+
     let mut added = 0;
     // Tags whose commits couldn't be fetched this time: left unread, so the next sync tries again.
+    // They don't count toward MAX_NEW_PER_SYNC, so tags waiting can't hold up newer ones.
     let mut unfetched: Vec<String> = Vec::new();
     for (r, tv) in version_tags(refs, &TagRule::of(repo)?) {
-        if by_tag.contains_key(r.name.as_str()) {
+        if by_tag.contains_key(r.name.as_str()) || foreign.get(&r.name) == Some(&r.commit) {
             continue;
         }
         if added == MAX_NEW_PER_SYNC {

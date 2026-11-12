@@ -48,7 +48,7 @@ since = "2026.5.0"</pre>
 <h2 id="frozen">Frozen commits</h2>
 <p>The first time the Cactarium sees a version tag, it records the commit and tree the tag names, and from then on that version means that commit. Moving a tag afterward changes nothing here:</p>
 <ul>
-  <li>If a tag <strong>moves</strong>, the Cactarium doesn't follow it. The version is marked "tag moved upstream; the frozen commit is still served", and an alert appears on the owner's dashboard and in the admins' <em>Tag alerts</em>.</li>
+  <li>If a tag <strong>moves</strong>, the Cactarium doesn't follow it. The version is marked "tag moved upstream; the frozen commit is still served", and an alert appears on the owner's dashboard and in the admins' <em>Tag alerts</em>. An invalid version stays invalid, and unserved, whatever its tag does.</li>
   <li>If a tag is <strong>deleted</strong>, the version is marked "tag deleted upstream" and keeps its frozen commit. If the tag comes back at the same commit, the mark goes away.</li>
 </ul>
 <p>So don't move or reuse tags: publish a new version instead. Stack releases and sims are frozen the same way when they are published: their content never changes.</p>

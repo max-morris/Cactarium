@@ -48,6 +48,13 @@ Server-side commands run in the app container with `just cli ...`:
 [--owner]`, `org list`, `register`, `publish-sim`, `sync`, `token`. Create the `et` organization
 with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
+Rollback to this release from a later one is safe: it starts on a database the later release
+migrated, leaves unread (never freezes) the tags it can't read (a newer manifest or `.sim` format,
+a tag without an entry's manifest on a repo with several entries), skips the tags the later release
+recorded as not an entry's (`foreign_tags`), and serves a sim download's file and sha256 from one
+row. Hide multi-sim entries (Admin, Entries, Hide) for the duration: this release can't render
+their stored sims (format 4) and doesn't know `[sim.files]`.
+
 ### First deploy
 
 The whole sequence, rehearsed end to end against the real repos (curating takes about a minute):

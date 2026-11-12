@@ -335,13 +335,26 @@ pub async fn resolve_ref(policy: GitPolicy, url: &str, git_ref: Option<&str>) ->
             return Ok(line.split('\t').next().unwrap_or_default().to_owned());
         }
     }
-    bail!(
+    Err(Missing(format!(
         "{url} has no {}",
         git_ref
             .map(|r| format!("branch or tag '{r}'"))
             .unwrap_or_else(|| "default branch".into())
-    )
+    ))
+    .into())
 }
+
+/// A ref the repo answered it doesn't have: a fact about the repo now, unlike a failure to reach it.
+#[derive(Debug)]
+pub struct Missing(pub String);
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Missing {}
 
 /// The commit a tag names (peeled, for an annotated tag), or None when the repo has no such tag.
 pub async fn resolve_tag(policy: GitPolicy, url: &str, tag: &str) -> anyhow::Result<Option<String>> {

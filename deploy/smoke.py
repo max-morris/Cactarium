@@ -907,6 +907,73 @@ check("a tag without the sim's manifest, on a repo with other entries, is left u
 ok, out = cli_sync("max/sibrepo")
 check("and is the package's release", ok and has_version(maxv, "max/sibrepo", "1.1.0"), out[-400:])
 
+def versions_page(v, slug):
+    return v.get(f"/{slug}?tab=versions")[1]
+def resolve_q(req):
+    s, body, hdrs = anon.get("/api/v1/resolve?req=" + urllib.parse.quote(req))
+    try:
+        return s, json.loads(body), hdrs
+    except ValueError:
+        return s, {"raw": body}, hdrs
+# A stack tag read while one of its source repos can't be reached waits; it isn't frozen invalid.
+dep = os.path.join(work, "depsrc")
+os.makedirs(os.path.join(dep, "DepArr", "DepThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: DepThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(dep, "DepArr", "DepThorn", f), "w").write(t)
+sh("git", "init", "-q", "-b", "master", cwd=dep)
+sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "dep", cwd=dep)
+depbare = ENV["DEMO_REPOS"] + "/depsrc.git"
+subprocess.run(["rm", "-rf", depbare], check=True)
+sh("git", "clone", "-q", "--bare", dep, depbare, cwd=work)
+stk = os.path.join(work, "flakystack")
+os.makedirs(stk)
+open(os.path.join(stk, "s.th"), "w").write(
+    f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {REPOS}/depsrc.git\n!REPO_PATH = $1/$2\n!CHECKOUT =\nDepArr/DepThorn\n")
+open(os.path.join(stk, "cactarium-stack.toml"), "w").write('format = 1\n\n[stack]\nname = "flakystack"\nowners = ["max"]\nthornlist = "s.th"\n')
+sh("git", "init", "-q", "-b", "master", cwd=stk)
+sh("git", "add", "-A", cwd=stk); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=stk); sh("git", "tag", "v1.0.0", cwd=stk)
+stkbare = ENV["DEMO_REPOS"] + "/flakystack.git"
+subprocess.run(["rm", "-rf", stkbare], check=True)
+sh("git", "clone", "-q", "--bare", stk, stkbare, cwd=work)
+run = subprocess.run(["just", "cli", "register", "max", REPOS + "/flakystack.git"], capture_output=True, text=True)
+check("register a stack built from another repo", run.returncode == 0 and has_version(anon, "max/flakystack", "1.0.0"), run.stdout + run.stderr[-300:])
+os.rename(depbare, depbare + ".away")
+retag(stk, stkbare, "v1.1.0")
+ok, out = cli_sync("max/flakystack")
+check("a stack tag whose source repo can't be reached is left unread, not frozen invalid",
+      not ok and "tried again" in out and not has_version(maxv, "max/flakystack", "1.1.0"), out[-400:])
+os.rename(depbare + ".away", depbare)
+ok, out = cli_sync("max/flakystack")
+check("once the source answers, the stack tag becomes a valid release",
+      ok and has_version(anon, "max/flakystack", "1.1.0") and "invalid" not in versions_page(maxv, "max/flakystack"), out[-400:])
+
+# An invalid version whose tag moves stays invalid, and is never served.
+ib = os.path.join(work, "invmove")
+os.makedirs(os.path.join(ib, "InvArr", "InvThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: InvThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(ib, "InvArr", "InvThorn", f), "w").write(t)
+inv_toml = lambda name: f'format = 1\n\n[package]\nname = "{name}"\nowners = ["max"]\ndescription = "x"\n'
+open(os.path.join(ib, "cactarium.toml"), "w").write(inv_toml("invmove"))
+sh("git", "init", "-q", "-b", "master", cwd=ib)
+sh("git", "add", "-A", cwd=ib); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=ib); sh("git", "tag", "v1.0.0", cwd=ib)
+ibare = ENV["DEMO_REPOS"] + "/invmove.git"
+subprocess.run(["rm", "-rf", ibare], check=True)
+sh("git", "clone", "-q", "--bare", ib, ibare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/invmove.git"], capture_output=True, text=True)
+open(os.path.join(ib, "cactarium.toml"), "w").write(inv_toml("wrongname"))
+retag(ib, ibare, "v1.1.0")
+cli_sync("max/invmove")
+check("a tag naming another entry is an invalid version", "the manifest names" in versions_page(maxv, "max/invmove"))
+open(os.path.join(ib, "cactarium.toml"), "w").write(inv_toml("invmove"))
+retag(ib, ibare, "v1.1.0")  # the tag moves onto a fixed commit
+cli_sync("max/invmove")
+text = versions_page(maxv, "max/invmove")
+check("an invalid version whose tag moves stays invalid (not tag-moved)", "the manifest names" in text and "tag moved upstream" not in text, text[text.find("<table"):][:600])
+s, r, _ = resolve_q("max/invmove@1.1.0")
+check("and is never served, even asked for exactly", s == 400, r)
+s, r, _ = resolve_q("max/invmove@^1")
+check("ranges skip it", s == 200 and r.get("slug") == "max/invmove@1.0.0", r)
+
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
 head = git("carpetx", "rev-parse", "master")

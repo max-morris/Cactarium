@@ -26,7 +26,6 @@ use crate::git::{self, GitPolicy};
 use crate::model::{self, Entry, Version};
 use crate::security::ClientIp;
 use crate::state::AppState;
-use crate::web::public::sim_file;
 use crate::{sims, stacks, tracker};
 
 pub fn generation() -> String {
@@ -98,7 +97,7 @@ impl FromRequestParts<AppState> for Reviewer {
 /// A version this request may be served: a reviewed one, or for a reviewer one awaiting review.
 /// Rejected versions never.
 fn servable(v: &Version, reviewer: &Reviewer) -> bool {
-    v.approved() || (reviewer.releases && v.review == "pending")
+    v.valid() && (v.approved() || (reviewer.releases && v.review == "pending"))
 }
 
 /// The answer's header saying what it serves awaits review, when it does.
@@ -219,7 +218,7 @@ async fn version_at_commit(state: &AppState, e: &Entry, commit: &str) -> ApiResu
     Ok(model::versions(state, e.id)
         .await?
         .into_iter()
-        .filter(|v| v.commit.as_deref() == Some(commit) && v.state != "invalid")
+        .filter(|v| v.commit.as_deref() == Some(commit) && v.valid())
         .max_by(|a, b| a.sort_key.cmp(&b.sort_key)))
 }
 
@@ -274,7 +273,7 @@ pub async fn resolve(
             let exact = req.is_exact();
             versions
                 .iter()
-                .filter(|v| v.state != "invalid" && (!v.yanked || exact))
+                .filter(|v| v.valid() && (!v.yanked || exact))
                 .filter_map(|v| model::tracked(v).map(|t| (t, v)))
                 .filter(|(t, _)| req.matches(t))
                 .max_by(|a, b| a.0.version.cmp(&b.0.version))
@@ -655,12 +654,15 @@ pub async fn sim_download(
         .filter(|v| servable(v, &reviewer))
         .ok_or(AppError::NotFound)?;
     let marked = unreviewed_header(&e, Some(&v));
-    let (content, _) = sim_file(&state, v.id).await?;
-    let sha: String = sqlx::query_scalar("SELECT sha256 FROM sim_files WHERE version_id = $1")
-        .bind(v.id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(AppError::from)?;
+    // The file and its sha256 from one row: they always belong together (a later release can
+    // store several sims per version).
+    let (content, sha): (String, String) =
+        sqlx::query_as("SELECT content, sha256 FROM sim_files WHERE version_id = $1 LIMIT 1")
+            .bind(v.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
     Ok((
         axum::response::AppendHeaders(marked),
         [

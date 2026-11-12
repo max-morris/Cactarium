@@ -373,7 +373,8 @@ pub async fn new_stack(
         .await
     {
         Ok((e, _)) => Ok(Redirect::to(&e.url()).into_response()),
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+        // On a form, something not available yet is simply what stops this release now.
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
             Ok(page(&NewStackPage {
                 ctx: PageCtx::new(&state, Some(&s.session)),
                 error: Some(m),
