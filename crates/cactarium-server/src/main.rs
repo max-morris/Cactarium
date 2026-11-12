@@ -332,10 +332,12 @@ async fn main() -> anyhow::Result<()> {
                 for e in &pending {
                     match tracker::reapply_curated(&state, &admin, e).await {
                         Ok((done, left)) => {
-                            if pass == 1 || done > 0 {
+                            // Progress: fewer versions left than in the pass before.
+                            let fewer = last.get(&e.slug()).is_some_and(|before| left.len() < before.len());
+                            if pass == 1 || fewer {
                                 println!("{}: {done} re-read{}", e.slug(), if pass > 1 { format!(" (pass {pass})") } else { String::new() });
                             }
-                            progress |= pass > 1 && done > 0;
+                            progress |= fewer;
                             // Versions below since are left on purpose; anything else may yet fit.
                             if left.iter().any(|l| !l.contains("older than the manifest's since")) {
                                 again.push(e);
