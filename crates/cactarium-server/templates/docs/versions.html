@@ -39,10 +39,10 @@
 <p>An alternative never crosses tracks: one without a track only ever matches the default track. A range chooses the highest matching version that is published (approved in review), not yanked and not invalid.</p>
 
 <h2 id="tag-pattern">Release tags that aren't vX.Y.Z: tag-pattern and since</h2>
-<p>Some projects tag releases their own way. A manifest's <code>tag-pattern</code> says how: literal text around <code>{major}</code>, <code>{minor}</code> and <code>{patch}</code>, each exactly once, with no spaces. The Einstein Toolkit's pattern is</p>
+<p>Some projects tag releases their own way. A manifest's <code>tag-pattern</code> says how: literal text around <code>{major}</code> and, optionally, <code>{minor}</code> and <code>{patch}</code>, each at most once, with no spaces; a part left out reads as 0. The Einstein Toolkit's pattern is</p>
 <pre class="code">tag-pattern = "ET_{major}_{minor}_v{patch}"
 since = "2026.5.0"</pre>
-<p>which reads the tag <code>ET_2026_05_v0</code> as version 2026.5.0 and <code>ET_2025_11_v1</code> as 2025.11.1. With a pattern, only the tags it matches are versions, all on the default track. <code>since</code> leaves out every release tag below the version it names, for example releases from before the repo carried a manifest.</p>
+<p>which reads the tag <code>ET_2026_05_v0</code> as version 2026.5.0 and <code>ET_2025_11_v1</code> as 2025.11.1. A project tagging <code>v1.0</code>, <code>v1.1</code> uses <code>tag-pattern = "v{major}.{minor}"</code>: <code>v1.0</code> is 1.0.0. With a pattern, only the tags it matches are versions, all on the default track. <code>since</code> leaves out every release tag below the version it names, for example releases from before the repo carried a manifest.</p>
 <p>Both fields exist in all three manifests (<code>[package]</code>, <code>[stack]</code>, <code>[sim]</code>) and in the overlay manifest of a <a href="/docs/curated">curated package</a>. The Cactarium reads them from the manifest on the default branch when the repo is registered, and afterward from the newest version's manifest.</p>
 
 <h2 id="frozen">Frozen commits</h2>
