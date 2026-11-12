@@ -470,6 +470,38 @@ r = json.loads(body) if s == 200 else {}
 check("an API refresh counts the tag as new and awaiting review",
       r.get("new-versions") == 1 and r.get("awaiting-review") == 1, f"{s} {body[:200]}")
 page(anon, "/alice/spacetimex/0.2.0", expect=404)
+# An admin reviewing can fetch what awaits review (CactUp's --risky-allow-untrusted-artifacts sends
+# the header); nobody else can, header or not.
+REV = {"x-cactarium-include-unreviewed": "true"}
+pending_req = "/api/v1/resolve?req=alice/spacetimex@0.2.0"
+s, _, _ = anon.get(pending_req)
+check("a release awaiting review isn't served", s in (400, 404), s)
+s, _, _ = anon.get(pending_req, headers=REV)
+check("asking for unreviewed versions without a token changes nothing", s in (400, 404), s)
+alice.get("/settings")
+_, atext, _ = alice.post("/settings/tokens", {"name": "smoke-alice", "days": "30"})
+atok = re.search(r"(cactarium_[A-Za-z0-9_-]+)", atext)
+if atok:
+    s, _, _ = anon.get(pending_req, headers={**REV, "Authorization": f"Bearer {atok.group(1)}"})
+    check("nor with a token that isn't an admin's", s in (400, 404), s)
+if tok:
+    s, body, hdrs = anon.get(pending_req, headers={**REV, "Authorization": f"Bearer {tok.group(1)}"})
+    check("an admin who asks gets it, marked unreviewed",
+          s == 200 and json.loads(body)["slug"] == "alice/spacetimex@0.2.0" and hdrs.get("x-cactarium-unreviewed") == "true",
+          f"{s} {body[:160]} {hdrs.get('x-cactarium-unreviewed')}")
+    s, body, hdrs = anon.get("/api/v1/packages/alice/spacetimex/versions", headers={**REV, "Authorization": f"Bearer {tok.group(1)}"})
+    check("and in the version list", s == 200 and '"version":"0.2.0"' in body and hdrs.get("x-cactarium-unreviewed") == "true", f"{s} {body[:160]}")
+page(maxv, f"/admin?s={queue_id('alice/spacetimex@0.2.0')}", contains="cactup add alice/spacetimex@0.2.0 --risky-allow-untrusted-artifacts")
+# When the site serves unreviewed code, anyone who asks gets a release awaiting review, marked.
+maxv.get("/admin/site")
+maxv.post("/admin/site", {"untrusted_tips": "allow"})
+s, body, hdrs = anon.get(pending_req, headers=REV)
+check("with untrusted-tips allowed, anyone who asks gets a release awaiting review, marked",
+      s == 200 and hdrs.get("x-cactarium-unreviewed") == "true", f"{s} {body[:160]}")
+s, _, _ = anon.get(pending_req)
+check("but still not without asking", s in (400, 404), s)
+maxv.get("/admin/site")
+maxv.post("/admin/site", {"untrusted_tips": "refuse"})
 page(maxv, "/admin", contains="alice (pushed a tag)")
 check("approve the pushed tag", decide("alice/spacetimex@0.2.0", "approve") == 303)
 page(anon, "/alice/spacetimex/0.2.0")

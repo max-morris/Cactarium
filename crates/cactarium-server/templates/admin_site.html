@@ -16,7 +16,7 @@
   </section>
   <section class="card stack-sm">
     <h2 class="h-small">Unreviewed code of untrusted packages and stacks</h2>
-    <p class="muted small">Some references name code nobody reviewed: <span class="mono">@head</span> and <span class="mono">@master</span> of a stack or package (whatever its branches hold now), and a package at a commit no published version froze (<span class="mono">owner/pkg@&lt;commit&gt;</span>). A trusted entry (the entry or its owner) always serves them, and a commit a version froze is simply that version. For the rest:</p>
+    <p class="muted small">Some references name code nobody reviewed: <span class="mono">@head</span> and <span class="mono">@master</span> of a stack or package (whatever its branches hold now), and a package at a commit no published version froze (<span class="mono">owner/pkg@&lt;commit&gt;</span>). A trusted entry (the entry or its owner) always serves them, and a commit a version froze is simply that version. The same setting covers a release awaiting review, which <span class="mono">--risky-allow-untrusted-artifacts</span> asks for: admins always get it (to review it), others only if this allows. Entries awaiting their first review stay admins-only either way. For the rest:</p>
     <form method="post" action="/admin/site" class="stack-sm">
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
       <label class="row-wrap"><input type="radio" name="untrusted_tips" value="refuse" {% if untrusted_tips != "allow" %}checked{% endif %}> Refuse: don't serve them at all</label>

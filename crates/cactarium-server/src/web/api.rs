@@ -61,6 +61,65 @@ impl FromRequestParts<AppState> for TokenUser {
     }
 }
 
+/// The request header asking for what awaits review too (CactUp sends it for
+/// `--risky-allow-untrusted-artifacts`): see [`Reviewer`] for who gets what.
+pub const INCLUDE_UNREVIEWED_HEADER: &str = "x-cactarium-include-unreviewed";
+/// On an answer that serves something awaiting review (only ever to a request that asked).
+pub const UNREVIEWED_HEADER: &str = "x-cactarium-unreviewed";
+
+/// What awaits review this request may see. It must say `x-cactarium-include-unreviewed: true`.
+/// Then an admin's token reaches releases awaiting review and entries awaiting their first review;
+/// anyone else reaches releases awaiting review of public entries when the site serves unreviewed
+/// code (the `untrusted-tips` setting is `allow`). Otherwise it is an ordinary request.
+pub struct Reviewer {
+    /// Releases awaiting review of public entries.
+    releases: bool,
+    /// Entries awaiting their first review (admins only).
+    entries: bool,
+}
+
+impl FromRequestParts<AppState> for Reviewer {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> ApiResult<Self> {
+        let asked = parts
+            .headers
+            .get(INCLUDE_UNREVIEWED_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        if !asked {
+            return Ok(Reviewer { releases: false, entries: false });
+        }
+        let admin = matches!(TokenUser::from_request_parts(parts, state).await, Ok(TokenUser(u)) if u.is_admin());
+        let open = admin || crate::site::untrusted_tips_allowed(state).await?;
+        Ok(Reviewer { releases: open, entries: admin })
+    }
+}
+
+/// A version this request may be served: a reviewed one, or for a reviewer one awaiting review.
+/// Rejected versions never.
+fn servable(v: &Version, reviewer: &Reviewer) -> bool {
+    v.approved() || (reviewer.releases && v.review == "pending")
+}
+
+/// The answer's header saying what it serves awaits review, when it does.
+fn unreviewed_header(e: &Entry, v: Option<&Version>) -> Option<(header::HeaderName, header::HeaderValue)> {
+    let unreviewed = e.visibility != "public" || v.is_some_and(|v| !v.approved());
+    unreviewed.then(|| (header::HeaderName::from_static(UNREVIEWED_HEADER), header::HeaderValue::from_static("true")))
+}
+
+/// An entry the request may see: public, or for a reviewer one awaiting its first review too.
+async fn entry_for(state: &AppState, owner: &str, name: &str, kind: Option<&str>, reviewer: &Reviewer) -> ApiResult<Entry> {
+    match model::find_entry(state, owner, name).await? {
+        Some(e) if reviewer.entries && e.visibility == "pending" && kind.is_none_or(|k| k == e.kind) => Ok(e),
+        _ => public_entry(state, owner, name, kind).await,
+    }
+}
+
+/// The versions the request may be served, newest first within each track.
+async fn servable_versions(state: &AppState, e: &Entry, reviewer: &Reviewer) -> ApiResult<Vec<Version>> {
+    Ok(model::all_versions(state, e.id).await?.into_iter().filter(|v| servable(v, reviewer)).collect())
+}
+
 /// Public entries only: the API never reveals pending or hidden ones.
 async fn public_entry(
     state: &AppState,
@@ -112,15 +171,18 @@ pub async fn entry(
 
 pub async fn package_versions(
     State(state): State<AppState>,
+    reviewer: Reviewer,
     Path((owner, name)): Path<(String, String)>,
-) -> ApiResult<Json<PackageVersions>> {
-    let e = public_entry(&state, &owner, &name, Some("package")).await?;
+) -> ApiResult<Response> {
+    let e = entry_for(&state, &owner, &name, Some("package"), &reviewer).await?;
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
     let mut versions = Vec::new();
-    for v in model::versions(&state, e.id).await? {
-        versions.push(version_body(&state, &v, &url).await?);
+    let servable = servable_versions(&state, &e, &reviewer).await?;
+    for v in &servable {
+        versions.push(version_body(&state, v, &url).await?);
     }
-    Ok(Json(PackageVersions { slug: e.slug(), versions }))
+    let marked = unreviewed_header(&e, servable.iter().find(|v| !v.approved()));
+    Ok((axum::response::AppendHeaders(marked), Json(PackageVersions { slug: e.slug(), versions })).into_response())
 }
 
 /// One published package version, with its thorns and claims.
@@ -170,10 +232,11 @@ pub struct ResolveQ {
 pub async fn resolve(
     State(state): State<AppState>,
     ip: ClientIp,
+    reviewer: Reviewer,
     Query(q): Query<ResolveQ>,
 ) -> ApiResult<Response> {
     let slug: Slug = q.req.parse().map_err(AppError::bad)?;
-    let e = public_entry(&state, slug.owner.as_str(), slug.name.as_str(), None).await?;
+    let e = entry_for(&state, slug.owner.as_str(), slug.name.as_str(), None, &reviewer).await?;
     if let Some(tip) = slug.tip() {
         if e.kind != "package" {
             return Err(AppError::bad(
@@ -199,7 +262,7 @@ pub async fn resolve(
     if let Some(prefix) = slug.sha() {
         return commit_answer(&state, &e, ip, prefix).await;
     }
-    let versions = model::versions(&state, e.id).await?;
+    let versions = servable_versions(&state, &e, &reviewer).await?;
     // Packages, stacks and sims alike: a semver range (`@1` is 1.x.x), or an exact version. Every
     // reading of `@<x>` other than a commit wins; a package tries `<x>` as a commit only when it
     // matches nothing (or isn't a version or range at all) and looks like one.
@@ -211,7 +274,7 @@ pub async fn resolve(
             let exact = req.is_exact();
             versions
                 .iter()
-                .filter(|v| v.usable() || (exact && v.yanked && v.approved() && v.state != "invalid"))
+                .filter(|v| v.state != "invalid" && (!v.yanked || exact))
                 .filter_map(|v| model::tracked(v).map(|t| (t, v)))
                 .filter(|(t, _)| req.matches(t))
                 .max_by(|a, b| a.0.version.cmp(&b.0.version))
@@ -232,13 +295,17 @@ pub async fn resolve(
         _ => model::manifest_contact(best.manifest.as_ref())
             .or_else(|| url.as_deref().map(model::repo_page)),
     };
-    Ok(Json(Resolved {
-        slug: format!("{}@{}", e.slug(), best.label()),
-        kind: e.kind.clone(),
-        url,
-        contact,
-        version: version_info(best),
-    })
+    let marked = unreviewed_header(&e, Some(best));
+    Ok((
+        axum::response::AppendHeaders(marked),
+        Json(Resolved {
+            slug: format!("{}@{}", e.slug(), best.label()),
+            kind: e.kind.clone(),
+            url,
+            contact,
+            version: version_info(best),
+        }),
+    )
     .into_response())
 }
 
@@ -479,10 +546,11 @@ fn tip_version_info(e: &Entry, label: &str, t: &tracker::PackageTip) -> VersionI
 
 pub async fn stack_releases(
     State(state): State<AppState>,
+    reviewer: Reviewer,
     Path((owner, name)): Path<(String, String)>,
 ) -> ApiResult<Json<StackReleases>> {
-    let e = public_entry(&state, &owner, &name, Some("stack")).await?;
-    let versions = model::versions(&state, e.id).await?;
+    let e = entry_for(&state, &owner, &name, Some("stack"), &reviewer).await?;
+    let versions = servable_versions(&state, &e, &reviewer).await?;
     Ok(Json(StackReleases { slug: e.slug(), releases: versions.iter().map(version_info).collect() }))
 }
 
@@ -490,9 +558,10 @@ pub async fn stack_releases(
 pub async fn stack_release(
     State(state): State<AppState>,
     ip: ClientIp,
+    reviewer: Reviewer,
     Path((owner, name, version)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
-    let e = public_entry(&state, &owner, &name, Some("stack")).await?;
+    let e = entry_for(&state, &owner, &name, Some("stack"), &reviewer).await?;
     let tip = match version.as_str() {
         "head" => Some(Tip::Head),
         "master" => Some(Tip::Master),
@@ -504,10 +573,13 @@ pub async fn stack_release(
         header::HeaderValue::from_str(&contact).unwrap_or(header::HeaderValue::from_static(""));
     let contact_header = (header::HeaderName::from_static(CONTACT_HEADER), contact);
     let Some(tip) = tip else {
-        let v = model::version_by_label(&state, e.id, &version)
+        let v = model::any_version_by_label(&state, e.id, &version)
             .await?
+            .filter(|v| servable(v, &reviewer))
             .ok_or(AppError::NotFound)?;
-        return Ok(([contact_header], Json(stacks::frozen_of(&state, &v).await?)).into_response());
+        let marked = unreviewed_header(&e, Some(&v));
+        return Ok((axum::response::AppendHeaders(marked), [contact_header], Json(stacks::frozen_of(&state, &v).await?))
+            .into_response());
     };
     // A tip is whatever the branches hold now and never passes review: only a trusted stack's is
     // served freely. Otherwise the site setting refuses it, or serves it marked untrusted.
@@ -574,12 +646,15 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
 
 pub async fn sim_download(
     State(state): State<AppState>,
+    reviewer: Reviewer,
     Path((owner, name, version)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
-    let e = public_entry(&state, &owner, &name, Some("sim")).await?;
-    let v = model::version_by_label(&state, e.id, &version)
+    let e = entry_for(&state, &owner, &name, Some("sim"), &reviewer).await?;
+    let v = model::any_version_by_label(&state, e.id, &version)
         .await?
+        .filter(|v| servable(v, &reviewer))
         .ok_or(AppError::NotFound)?;
+    let marked = unreviewed_header(&e, Some(&v));
     let (content, _) = sim_file(&state, v.id).await?;
     let sha: String = sqlx::query_scalar("SELECT sha256 FROM sim_files WHERE version_id = $1")
         .bind(v.id)
@@ -587,6 +662,7 @@ pub async fn sim_download(
         .await
         .map_err(AppError::from)?;
     Ok((
+        axum::response::AppendHeaders(marked),
         [
             (header::CONTENT_TYPE, "application/toml".to_owned()),
             (header::HeaderName::from_static(SHA256_HEADER), sha),
