@@ -318,6 +318,17 @@ pub struct SimPage {
     pub license: String,
     /// For the entry's managers when it is published from a repo: the repo's controls.
     pub repo: Option<RepoManage>,
+    /// A multi-sim entry: the sims of this version, the one shown selected. Empty otherwise.
+    pub sims: Vec<SimChoice>,
+    /// Why the sim shown isn't the one asked for, if it isn't.
+    pub sim_note: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SimChoice {
+    pub name: String,
+    pub url: String,
+    pub selected: bool,
 }
 
 /// A repo-backed entry's controls for its managers: check for tags now, the last check's error,
@@ -326,6 +337,14 @@ pub struct SimPage {
 pub struct RepoManage {
     pub entry_url: String,
     pub poll_error: String,
+    /// How its tags become versions, described.
+    pub tag_rule: String,
+    /// The other entries on the same repo (`owner/name`).
+    pub siblings: Vec<String>,
+    /// Re-reading the tag rule applies (not a curated entry, whose rule is its overlay's).
+    pub can_reread: bool,
+    /// Tags its rule picks that turned out not to be its own: (tag, why), newest first.
+    pub foreign: Vec<(String, String)>,
     /// `<base>/hooks`, to which the template appends `/<forge>/<entry id>`.
     pub webhook_base: String,
     pub entry_id: i64,
@@ -375,6 +394,7 @@ pub struct DashboardPage {
 pub struct NewRepoPage {
     pub ctx: PageCtx,
     pub url: String,
+    pub tag: String,
     pub error: Option<String>,
 }
 

@@ -95,6 +95,7 @@ pub async fn new_repo_page(State(state): State<AppState>, s: SignedIn) -> AppRes
     Ok(page(&NewRepoPage {
         ctx: PageCtx::new(&state, Some(&s.session)),
         url: String::new(),
+        tag: String::new(),
         error: None,
     })?
     .into_response())
@@ -106,6 +107,9 @@ pub struct RepoForm {
     /// Admins only: the namespace to publish under, if not their own.
     #[serde(default)]
     owner: Option<String>,
+    /// Read the manifests at exactly this tag, instead of each kind's newest.
+    #[serde(default)]
+    tag: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -118,15 +122,16 @@ pub async fn new_repo(
 ) -> AppResult<Response> {
     s.session.check_csrf(&f.csrf)?;
     state.limiter.check("register", ip.0, 10)?;
-    match tracker::register(&state, &s.user, &f.url, f.owner.as_deref()).await {
-        Ok(entries) => {
-            Ok(Redirect::to(&entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into()))
+    match tracker::register(&state, &s.user, &f.url, f.owner.as_deref(), f.tag.as_deref()).await {
+        Ok(done) => {
+            Ok(Redirect::to(&done.entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into()))
                 .into_response())
         }
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
             Ok(page(&NewRepoPage {
                 ctx: PageCtx::new(&state, Some(&s.session)),
                 url: f.url,
+                tag: f.tag.unwrap_or_default(),
                 error: Some(m),
             })?
             .into_response())
@@ -415,6 +420,31 @@ pub async fn refresh(
     state.limiter.check("refresh", ip.0, 10)?;
     let e = managed(&state, &s, &owner, &name).await?;
     let _ = tracker::sync(&state, &e).await;
+    Ok(Redirect::to(&e.url()).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct RuleForm {
+    /// Read the manifest at this tag instead of on the default branch.
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(rename = "_csrf")]
+    csrf: String,
+}
+
+/// "Re-read tag rule": the entry follows the tag rule its manifest gives on the default branch (or
+/// at a named tag) from now on. How an entry switches tag schemes.
+pub async fn reread_rule(
+    State(state): State<AppState>,
+    s: SignedIn,
+    ip: ClientIp,
+    Path((owner, name)): Path<(String, String)>,
+    Form(f): Form<RuleForm>,
+) -> AppResult<Response> {
+    s.session.check_csrf(&f.csrf)?;
+    state.limiter.check("refresh", ip.0, 10)?;
+    let e = managed(&state, &s, &owner, &name).await?;
+    tracker::reread_rule(&state, &s.user, &e, f.tag.as_deref()).await?;
     Ok(Redirect::to(&e.url()).into_response())
 }
 

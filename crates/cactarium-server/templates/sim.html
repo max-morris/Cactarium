@@ -7,6 +7,13 @@
 <div class="split">
   <div class="split-main stack">
     {% if !e.description_html.is_empty() %}<article class="card prose">{{ e.description_html|safe }}</article>{% endif %}
+    {% if !sims.is_empty() %}
+    <nav class="pills" aria-label="Sims in this version">
+      <span class="muted small">Sims in this version:</span>
+      {% for c in sims %}<a class="pill mono{% if c.selected %} selected{% endif %}" href="{{ c.url }}">{{ c.name }}</a>{% endfor %}
+    </nav>
+    {% if !sim_note.is_empty() %}<p class="alert warn small">{{ sim_note }}</p>{% endif %}
+    {% endif %}
     {% include "_tabs.html" %}
     {% if tab == "parfile" %}
       <p class="small muted mono">{{ parfile_name }}</p><pre class="code">{{ parfile }}</pre>

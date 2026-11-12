@@ -231,12 +231,33 @@ pub fn manifest_contact(manifest: Option<&serde_json::Value>) -> Option<String> 
         .find_map(|k| m[k]["contact"].as_str().map(str::to_owned))
 }
 
+/// The sims a version of a sim entry holds, by name: `[""]` for an entry's only sim (a `file`
+/// manifest, or an upload), else each `[sim.files]` name.
+pub async fn sim_names(state: &AppState, version_id: i64) -> AppResult<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT name FROM sim_files WHERE version_id = $1 ORDER BY name")
+        .bind(version_id)
+        .fetch_all(&state.db)
+        .await?)
+}
+
+/// Whether a sim entry publishes named sims (`[sim.files]`): then every sim is addressed
+/// `owner/name/sim`, whatever the count. The form is fixed per entry (a version can't switch it).
+pub async fn multi_sim(state: &AppState, entry_id: i64) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND s.name <> '')",
+    )
+    .bind(entry_id)
+    .fetch_one(&state.db)
+    .await?)
+}
+
 /// Where to go for help with an entry: the newest usable version's declared contact (for a sim,
-/// the one in its file), else its repo.
+/// the one in its file: `sim`'s, for one sim of a multi-sim entry), else its repo.
 pub async fn entry_contact(
     state: &AppState,
     e: &Entry,
     repo_url: Option<&str>,
+    sim: Option<&str>,
 ) -> AppResult<Option<String>> {
     // A sim published from its repo: its cactarium-sim.toml's contact wins over the file's.
     let from_manifest = if e.kind == "sim" {
@@ -254,10 +275,15 @@ pub async fn entry_contact(
     let declared = if let Some(c) = from_manifest {
         Some(c)
     } else if e.kind == "sim" {
+        // That sim's file in the newest version holding it; with no sim named, the newest version's
+        // first sim (its only one, unless the entry is multi-sim).
         let content: Option<String> = sqlx::query_scalar(
-            "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND v.review = 'approved' ORDER BY v.sort_key DESC LIMIT 1",
+            "SELECT s.content FROM sim_files s JOIN versions v ON v.id = s.version_id
+             WHERE v.entry_id = $1 AND v.review = 'approved' AND ($2::text IS NULL OR s.name = $2)
+             ORDER BY v.sort_key DESC, s.name LIMIT 1",
         )
         .bind(e.id)
+        .bind(sim)
         .fetch_optional(&state.db)
         .await?;
         content

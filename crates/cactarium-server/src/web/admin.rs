@@ -159,9 +159,18 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
                 }
             }
             _ => {
-                let (content, index) = sim_file(state, v.id).await?;
-                warnings.extend(index.warnings);
-                detail = content;
+                // Every sim of the version: a multi-sim version is reviewed as a whole.
+                let names = model::sim_names(state, v.id).await?;
+                for name in &names {
+                    let sim = sim_file(state, v.id, name).await?;
+                    if name.is_empty() {
+                        warnings.extend(sim.index.warnings);
+                        detail = sim.content;
+                    } else {
+                        warnings.extend(sim.index.warnings.into_iter().map(|w| format!("sim {name}: {w}")));
+                        detail.push_str(&format!("# ---- sim {name} ----\n{}\n", sim.content));
+                    }
+                }
             }
         }
     }
@@ -199,6 +208,10 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
     let release = latest.filter(|_| s.version_id.is_some()).map(|v| v.label());
     // How to try it: the CactUp command for this kind, reaching what awaits review with the admin's
     // token (CactUp sends x-cactarium-include-unreviewed for --risky-allow-untrusted-artifacts).
+    let first_sim = match latest {
+        Some(v) if e.kind == "sim" => model::sim_names(state, v.id).await?.into_iter().find(|n| !n.is_empty()),
+        _ => None,
+    };
     let command = latest
         .map(|v| {
             let verb = match e.kind.as_str() {
@@ -206,7 +219,11 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
                 "stack" => "install",
                 _ => "import",
             };
-            format!("cactup {verb} {}@{} --risky-allow-untrusted-artifacts", e.slug(), v.label())
+            let what = match &first_sim {
+                Some(n) => format!("{}/{n}", e.slug()),
+                None => e.slug(),
+            };
+            format!("cactup {verb} {what}@{} --risky-allow-untrusted-artifacts", v.label())
         })
         .unwrap_or_default();
     Ok(ReviewView {
@@ -382,17 +399,18 @@ async fn admin_rows(state: &AppState, entries: Vec<Entry>) -> AppResult<Vec<Admi
             curated: e.curated,
             repo_url: tracker::repo_of(state, e.id).await?.map(|r| r.url).unwrap_or_default(),
             tag_rule: match tracker::repo_of(state, e.id).await? {
-                Some(r) if e.curated => {
-                    let mut parts = vec![match &r.tag_pattern {
-                        Some(p) => format!("versions from tags matching {p}"),
-                        None => "versions from vX.Y.Z tags and by commit".to_owned(),
+                Some(r) => {
+                    let mut parts = vec![match (&r.tag_pattern, e.curated) {
+                        (Some(p), _) => format!("versions from tags matching {p}"),
+                        (None, true) => "versions from vX.Y.Z tags and by commit".to_owned(),
+                        (None, false) => "versions from vX.Y.Z tags".to_owned(),
                     }];
                     if let Some(s) = &r.min_version {
                         parts.push(format!("from {s} on"));
                     }
                     parts.join(", ")
                 }
-                _ => String::new(),
+                None => String::new(),
             },
             versions: versions.iter().take(12).map(|v| version_row(&e, v, None)).collect(),
         });
@@ -437,6 +455,10 @@ pub struct EntryAction {
     action: String,
     new_owner: Option<String>,
     new_url: Option<String>,
+    /// For "reread-version": the invalid version to read again.
+    version: Option<String>,
+    /// For "reread-rule": the tag to read the manifest at (default: the default branch).
+    tag: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -479,7 +501,25 @@ pub async fn entry_action(
         "move-repo" => {
             let to = f.new_url.as_deref().unwrap_or("");
             return match tracker::move_repo(&state, &a.user, &e, to).await {
-                Ok(()) => Ok(Redirect::to(&format!("/admin/entries?q={}", e.name)).into_response()),
+                Ok(_) => Ok(Redirect::to(&format!("/admin/entries?q={}", e.name)).into_response()),
+                Err(AppError::BadRequest(m)) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
+                Err(err) => Err(err),
+            };
+        }
+        // An invalid version of a repo entry, read again now (never served, so nothing depends on it).
+        "reread-version" => {
+            let v = f.version.as_deref().unwrap_or("").trim().to_owned();
+            return match tracker::reread_invalid(&state, &a.user, &e, &v).await {
+                Ok(m) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
+                Err(AppError::BadRequest(m) | AppError::Upstream(m) | AppError::Conflict(m)) => {
+                    entries_page(&state, &a, e.name.clone(), Some(m)).await
+                }
+                Err(err) => Err(err),
+            };
+        }
+        "reread-rule" => {
+            return match tracker::reread_rule(&state, &a.user, &e, f.tag.as_deref()).await {
+                Ok(rule) => entries_page(&state, &a, e.name.clone(), Some(format!("{} now follows {rule}", e.slug()))).await,
                 Err(AppError::BadRequest(m)) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
                 Err(err) => Err(err),
             };

@@ -188,29 +188,9 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
 /// fails, and what to do about it. For an upload, where the uploader sees the answer and can try
 /// again; a tag read from a repo uses [`check_pins_at_tag`].
 pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
-    let p = pin_problems(state, sim).await?;
+    let p = pin_problems(state, sim, &[]).await?;
     let all: Vec<String> = p.facts.into_iter().chain(p.passing).collect();
     if all.is_empty() { Ok(()) } else { Err(AppError::bad(format!("not fully specified: {}", all.join("; ")))) }
-}
-
-/// [`check_pins`] for a sim read at a version tag, where an error decides whether the tag is
-/// frozen as an invalid version (never read again) or left unread and tried at the next sync. A
-/// problem that is a fact about the commit makes it invalid, listing every problem; when every
-/// problem may pass (see [`PinProblems`]), the answer is [`AppError::Upstream`] and the tag is
-/// tried again.
-pub async fn check_pins_at_tag(state: &AppState, sim: &SimFile) -> AppResult<()> {
-    let p = pin_problems(state, sim).await?;
-    if !p.facts.is_empty() {
-        let all: Vec<String> = p.facts.into_iter().chain(p.passing).collect();
-        return Err(AppError::bad(format!("not fully specified: {}", all.join("; "))));
-    }
-    if !p.passing.is_empty() {
-        return Err(AppError::Upstream(format!(
-            "pins that can't be checked yet (the tag will be read again): {}",
-            p.passing.join("; ")
-        )));
-    }
-    Ok(())
 }
 
 /// What is wrong with a sim's pins, split by whether it can change without a new commit of the
@@ -221,12 +201,17 @@ pub struct PinProblems {
     /// repo no package on the Cactarium was ever registered for.
     pub facts: Vec<String>,
     /// Things the world can change: the package for the repo is registered but not public yet
-    /// (awaiting review, or a sibling entry not yet approved), its history can't be read right now
-    /// (the network, the host), or the pinned commit isn't in its repo yet (pushed after the tag).
+    /// (awaiting review, or a sibling entry not yet approved, or being registered along with this
+    /// one), its history can't be read right now (the network, the host), or the pinned commit
+    /// isn't in its repo yet (pushed after the tag).
     pub passing: Vec<String>,
 }
 
-async fn pin_problems(state: &AppState, sim: &SimFile) -> AppResult<PinProblems> {
+/// What is wrong with `sim`'s pins, for an upload ([`check_pins`]) or a tag (`tracker::prepare`,
+/// where facts make the version invalid and passing problems leave the tag unread).
+/// `registering` holds normalized URLs of packages being registered right now, in the same
+/// registration: a pin to one is a package that isn't public yet.
+pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String]) -> AppResult<PinProblems> {
     // Public packages first (oldest first), then any other package entry, which only tells a
     // registered-but-not-public repo from one nobody registered.
     let packages: Vec<(String, String, String, bool)> = sqlx::query_as(
@@ -247,6 +232,10 @@ async fn pin_problems(state: &AppState, sim: &SimFile) -> AppResult<PinProblems>
         };
         let norm = crate::git::normalize_url(&pin.url);
         let Some((owner, name, url, public)) = packages.iter().find(|(_, _, u, _)| crate::git::normalize_url(u) == norm) else {
+            if registering.contains(&norm) {
+                out.passing.push(format!("{} ({}) is the repo of a package registered along with this entry, not public yet", pin.name, pin.url));
+                continue;
+            }
             out.facts.push(format!(
                 "{} ({}) isn't the repo of any package on the Cactarium: register it (or fork a package that is, and pin the fork) first",
                 pin.name, pin.url
@@ -390,7 +379,7 @@ pub async fn publish(
     .bind(review)
     .fetch_one(&mut *tx)
     .await?;
-    let sha = store_version(&mut tx, &entry, vid, &label, review, Checked { sim, index }, None).await?;
+    let sha = store_version(&mut tx, &entry, vid, &label, review, "", Checked { sim, index }, EntryText::FromSim { description: None }).await?;
     publish::submit_release(&mut tx, &entry, vid, review, Some(user)).await?;
     crate::audit::audit_with(
         &mut tx,
@@ -405,32 +394,57 @@ pub async fn publish(
     Ok((entry, label, review))
 }
 
-/// Stores a checked sim as version `vid` (`label`) of `entry`: stamps it with `owner/name@label`,
-/// keeps the file, its pins and the thorns it builds. For a sim published from its repo,
-/// `description` is the manifest's, which wins over the file's. Returns the stored file's sha256.
+/// What storing a sim does to its entry's public summary and description.
+pub enum EntryText<'a> {
+    /// The sim is the entry's only one: its summary and description become the entry's, with
+    /// `description` (a repo manifest's) winning over the file's.
+    FromSim { description: Option<&'a str> },
+    /// One of several sims: the entry keeps its own text (the manifest's).
+    Leave,
+}
+
+/// The stamp a stored copy of a sim carries, and the stored text with its sha256: `owner/name@label`
+/// for the entry's only sim (`name` empty), `owner/name/sim@label` for one of several (which needs
+/// `.sim` format 4, written as such). Deterministic, so a version's `prepare` makes it once to know
+/// storing it will succeed.
+pub fn stamped(entry: &Entry, name: &str, label: &str, sim: &SimFile) -> AppResult<(String, String)> {
+    let stamp = if name.is_empty() { format!("{}@{label}", entry.slug()) } else { format!("{}/{name}@{label}", entry.slug()) };
+    let mut sim = sim.clone();
+    sim.sim.cactarium = Some(stamp.parse().map_err(|e| AppError::bad(format!("the stamp {stamp}: {e}")))?);
+    let stored = sim.to_toml().map_err(|e| AppError::bad(format!("stamped as {stamp}: {e}")))?;
+    let sha = hex::encode(Sha256::digest(stored.as_bytes()));
+    Ok((stored, sha))
+}
+
+/// Stores a checked sim as version `vid` (`label`) of `entry`, as its sim `name` ("" for the
+/// entry's only sim): stamps it ([`stamped`]), keeps the file, its pins and the thorns it builds
+/// (the version's thorn index is the union of its sims'). Returns the stored file's sha256.
+#[allow(clippy::too_many_arguments)]
 pub async fn store_version(
     db: &mut sqlx::PgConnection,
     entry: &Entry,
     vid: i64,
     label: &str,
     review: &str,
+    name: &str,
     checked: Checked,
-    description: Option<&str>,
+    text: EntryText<'_>,
 ) -> AppResult<String> {
-    let Checked { mut sim, index } = checked;
-    sim.sim.cactarium = Some(format!("{}@{label}", entry.slug()).parse().map_err(AppError::bad)?);
-    let stored = sim.to_toml().map_err(AppError::bad)?;
-    let sha = hex::encode(Sha256::digest(stored.as_bytes()));
+    let Checked { sim, index } = checked;
+    let (stored, sha) = stamped(entry, name, label, &sim)?;
     let mut tx = sqlx::Connection::begin(&mut *db).await?;
-    sqlx::query("INSERT INTO sim_files (version_id, sha256, content, index) VALUES ($1, $2, $3, $4)")
+    sqlx::query("INSERT INTO sim_files (version_id, name, sha256, content, index) VALUES ($1, $2, $3, $4, $5)")
         .bind(vid)
+        .bind(name)
         .bind(&sha)
         .bind(&stored)
         .bind(serde_json::to_value(&index).map_err(anyhow::Error::from)?)
         .execute(&mut *tx)
         .await?;
     // A release waiting in review doesn't change what the public page says yet.
-    if review == "approved" {
+    if review == "approved"
+        && let EntryText::FromSim { description } = text
+    {
         sqlx::query("UPDATE entries SET summary = COALESCE($2, summary), description = COALESCE($3, description), updated_at = now() WHERE id = $1")
             .bind(entry.id)
             .bind(&sim.sim.summary)
@@ -438,7 +452,7 @@ pub async fn store_version(
             .execute(&mut *tx)
             .await?;
     }
-    tracker::store_pins(&mut tx, vid, &sim.repos).await?;
+    tracker::store_pins(&mut tx, vid, name, &sim.repos).await?;
     tracker::store_built_thorns(&mut tx, vid, &sim.thornlist.text).await?;
     tx.commit().await?;
     Ok(sha)

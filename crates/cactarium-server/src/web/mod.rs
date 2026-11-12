@@ -88,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/{owner}", get(public::owner))
         .route("/{owner}/{name}", get(public::entry))
         .route("/{owner}/{name}/refresh", post(account::refresh))
+        .route("/{owner}/{name}/tag-rule", post(account::reread_rule))
         .route("/{owner}/{name}/yank", post(account::yank))
         .route("/{owner}/{name}/resubmit", post(account::resubmit))
         .route("/{owner}/{name}/heart", post(account::heart))

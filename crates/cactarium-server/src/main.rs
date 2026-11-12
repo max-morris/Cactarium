@@ -53,14 +53,43 @@ enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
-    /// Register a repo (package and/or stack) on behalf of a user; with --owner (the user must be
-    /// an admin), under a namespace that is no user's, such as `et`.
+    /// Register a repo (its package, stack and/or sims) on behalf of a user; with --owner (the
+    /// user must be an admin), under a namespace that is no user's, such as `et`. A repo that
+    /// already has entries gets only the missing ones. Each new entry is read at its newest tag
+    /// (or --tag) first; if one fails, nothing is registered.
     Register {
         username: String,
         url: String,
         #[arg(long)]
         owner: Option<String>,
+        /// Read the manifests at exactly this tag (e.g. when they aren't on the default branch).
+        #[arg(long)]
+        tag: Option<String>,
     },
+    /// A dry run: what registering URL at TAG would add, and how each entry on the repo (new or
+    /// already registered) would read the tag. Writes nothing. With --commit, a tag that doesn't
+    /// exist yet is read as if it named that commit (a branch or a full commit id).
+    Check {
+        url: String,
+        #[arg(long)]
+        tag: String,
+        #[arg(long)]
+        commit: Option<String>,
+        /// The entries' owner (default: the repo's existing owner, else the manifest's first).
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Re-read an entry's tag rule from its manifest on the default branch (or at --tag), as a user
+    /// who manages it: how it switches tag schemes.
+    RereadRule {
+        username: String,
+        slug: String,
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Re-read an invalid version of a (non-curated) repo entry at its frozen commit, as an admin:
+    /// it becomes valid if it reads cleanly now, or is removed if its tag isn't the entry's.
+    Reread { username: String, slug: String, version: String },
     /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
     /// as the given admin.
     Curate { username: String, file: std::path::PathBuf },
@@ -98,8 +127,9 @@ enum Command {
     },
     /// Undo a yank.
     Unyank { username: String, slug: String, version: String },
-    /// Point an entry at its repo's new URL (after a move such as a GitHub transfer), as the given
-    /// admin; refused unless the new URL holds the same tags at the same commits.
+    /// Point an entry, and every other entry on the same repo, at the repo's new URL (after a move
+    /// such as a GitHub transfer), as the given admin; refused unless the new URL holds each one's
+    /// tags at the same commits. All move together, or none does.
     MoveRepo { username: String, slug: String, url: String },
     /// Local development only: create a user who can use the development sign-in.
     DevUser { username: String },
@@ -196,15 +226,53 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Admin { action } => admin(&db, action).await,
-        Command::Register { username, url, owner } => {
+        Command::Register { username, url, owner, tag } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
-            for e in tracker::register(&state, &user, &url, owner.as_deref())
+            let done = tracker::register(&state, &user, &url, owner.as_deref(), tag.as_deref())
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-            {
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for e in &done.entries {
                 println!("Registered {} ({}, {})", e.slug(), e.kind, e.visibility);
             }
+            for n in &done.notes {
+                println!("Note: {n}");
+            }
+            Ok(())
+        }
+        Command::Check { url, tag, commit, owner } => {
+            let state = make_state(cfg, db)?;
+            let (lines, clean) = tracker::check(&state, &url, &tag, commit.as_deref(), owner.as_deref())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for l in &lines {
+                println!("{l}");
+            }
+            anyhow::ensure!(clean, "{tag} would not be read cleanly");
+            Ok(())
+        }
+        Command::RereadRule { username, slug, tag } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            let (owner, name) = slug.split_once('/').context("give owner/name")?;
+            let e = model::find_entry(&state, owner, name)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .context("no such entry")?;
+            let rule = tracker::reread_rule(&state, &user, &e, tag.as_deref()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{} now follows {rule}", e.slug());
+            Ok(())
+        }
+        Command::Reread { username, slug, version } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            let (owner, name) = slug.split_once('/').context("give owner/name")?;
+            let e = model::find_entry(&state, owner, name)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .context("no such entry")?;
+            let said = tracker::reread_invalid(&state, &user, &e, &version).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{said}");
             Ok(())
         }
         Command::PublishSim { username, file, name, version } => {
@@ -283,10 +351,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .context("no such entry")?;
-            tracker::move_repo(&state, &user, &e, &url)
+            for moved in tracker::move_repo(&state, &user, &e, &url)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("{} now reads {url}", e.slug());
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                println!("{} now reads {url}", moved.slug());
+            }
             Ok(())
         }
         Command::Yank { username, slug, version, reason } => {
