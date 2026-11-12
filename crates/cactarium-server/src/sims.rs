@@ -197,13 +197,12 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// sim's repo.
 #[derive(Default)]
 pub struct PinProblems {
-    /// Facts about the commit: a tarball pin (it has no package identity, and never will), or a
-    /// repo no package on the Cactarium was ever registered for.
+    /// Facts about the commit: a tarball pin (it has no package identity, and never will).
     pub facts: Vec<String>,
-    /// Things the world can change: the package for the repo is registered but not public yet
-    /// (awaiting review, or a sibling entry not yet approved, or being registered along with this
-    /// one), its history can't be read right now (the network, the host), or the pinned commit
-    /// isn't in its repo yet (pushed after the tag).
+    /// Things the world can change: no package for the repo is registered yet, or it is but isn't
+    /// public yet (awaiting review, a sibling entry not yet approved, or being registered along
+    /// with this one), its history can't be read right now (the network, the host), or the pinned
+    /// commit isn't in its repo yet (pushed after the tag).
     pub passing: Vec<String>,
 }
 
@@ -236,8 +235,10 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
                 out.passing.push(format!("{} ({}) is the repo of a package registered along with this entry, not public yet", pin.name, pin.url));
                 continue;
             }
-            out.facts.push(format!(
-                "{} ({}) isn't the repo of any package on the Cactarium: register it (or fork a package that is, and pin the fork) first",
+            // No public package for the URL right now: registering it (or the sibling it is)
+            // makes the same commit valid, so at a tag this waits rather than freezing.
+            out.passing.push(format!(
+                "{} ({}) isn't the repo of any package on the Cactarium yet: register it (or fork a package that is, and pin the fork)",
                 pin.name, pin.url
             ));
             continue;

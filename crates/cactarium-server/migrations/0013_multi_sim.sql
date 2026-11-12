@@ -29,3 +29,9 @@ CREATE TABLE foreign_tags (
     seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entry_id, tag)
 );
+
+-- A sim entry's form, fixed when it is registered: 'file' (one sim, addressed owner/name) or
+-- 'files' ([sim.files], each sim addressed owner/name/sim). A tag whose manifest uses the other form
+-- is not the entry's. Every repo-backed sim entry before this migration is a 'file' one.
+ALTER TABLE entry_repos ADD COLUMN sim_form TEXT CHECK (sim_form IN ('file', 'files'));
+UPDATE entry_repos r SET sim_form = 'file' FROM entries e WHERE e.id = r.entry_id AND e.kind = 'sim';

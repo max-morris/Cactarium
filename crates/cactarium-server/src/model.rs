@@ -247,14 +247,13 @@ pub async fn sim_names(state: &AppState, version_id: i64) -> AppResult<Vec<Strin
 }
 
 /// Whether a sim entry publishes named sims (`[sim.files]`): then every sim is addressed
-/// `owner/name/sim`, whatever the count. The form is fixed per entry (a version can't switch it).
+/// `owner/name/sim`, whatever the count. The form is fixed when the entry is registered.
 pub async fn multi_sim(state: &AppState, entry_id: i64) -> AppResult<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1 AND s.name <> '')",
-    )
-    .bind(entry_id)
-    .fetch_one(&state.db)
-    .await?)
+    // Fixed at registration (entry_repos.sim_form); uploaded sims are always one sim.
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM entry_repos WHERE entry_id = $1 AND sim_form = 'files')")
+        .bind(entry_id)
+        .fetch_one(&state.db)
+        .await?)
 }
 
 /// Where to go for help with an entry: the newest usable version's declared contact (for a sim,

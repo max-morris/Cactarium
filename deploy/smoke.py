@@ -875,15 +875,15 @@ check("once the repo answers and the package is public, both tags are read",
       ok and has_version(anon, "max/pinsim", "1.1.0") and has_version(anon, "max/pinsim", "1.2.0"), out[-400:])
 page(anon, "/max/pinsim/1.1.0?tab=pins", contains="max/pinpkg")
 page(anon, "/max/pinsim/1.2.0?tab=pins", contains="bob/pendpkg@1.0.0")
-# Facts about the commit still make it invalid: a pin to a repo nobody registered (yet).
+# A pin to a repo no package is registered for yet waits too: registering it makes the commit valid.
 _, _, ntagged, _ = tiny_package("nobody", "max", "NoArr")
 open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged),
                                                                    ("nobody", "NoArr", REPOS + "/nobody.git", ntagged)]))
 retag(psim, psbare, "v1.3.0")
 ok, out = cli_sync("max/pinsim")
 text = page(maxv, "/max/pinsim?tab=versions")
-check("a pin to a repo no package was registered for is an invalid version",
-      ok and 'href="/max/pinsim/1.3.0"' in text and "the repo of any package" in text, out[-300:] + text[text.find('<table'):][:600])
+check("a pin to a repo no package is registered for yet leaves the tag unread",
+      not ok and "the repo of any package" in out and 'href="/max/pinsim/1.3.0"' not in text, out[-300:] + text[text.find('<table'):][:600])
 
 # On a repo carrying several entries, a tag without one entry's manifest is most likely another
 # entry's release: left unread for that entry, never frozen as an invalid version of it.
@@ -1147,7 +1147,7 @@ write(G, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "gclash"\nowners = [
 commit_tag(G, "a sim named like the package", "v1.0.0")
 publish_tree(G, "gclash")
 ok, out = cli("register", "max", REPOS + "/gclash.git")
-check("a register failing while creating its second entry (a name clash) is refused", not ok and "already exists" in out, out[-300:])
+check("two manifests naming one entry are refused, saying so", not ok and "both name 'gclash'" in out, out[-300:])
 s, _, _ = anon.get("/api/v1/entries/max/gclash")
 check("and writes nothing: the first entry is gone too", s == 404, s)
 
@@ -1198,12 +1198,117 @@ check("a v tag releases only the package", has_version(anon, "max/patrel", "1.1.
 check("kinds with the same pattern share its tags", has_version(anon, "max/patrel-stack", "2.0.0")
       and has_version(anon, "max/patrel-sim", "2.0.0") and not has_version(anon, "max/patrel", "2.0.0"))
 
-# --- An invalid version for a pin to a repo nobody registered becomes valid once it is registered.
+# --- A tag waiting for a pinned repo to be registered is read once it is.
 ok, out = cli("register", "max", REPOS + "/nobody.git")
-check("register the repo the invalid pin named", ok, out[-300:])
-ok, out = cli("reread", "max", "max/pinsim", "1.3.0")
-check("re-read invalid version: it reads cleanly now", ok and "reads cleanly now" in out, out[-300:])
+check("register the repo the waiting pin names", ok, out[-300:])
+ok, out = cli("sync", "max/pinsim")
+check("the waiting tag is read, valid", ok and has_version(anon, "max/pinsim", "1.3.0"), out[-300:])
 page(anon, "/max/pinsim/1.3.0?tab=pins", contains="max/nobody")
+# --- An invalid version that a later registration makes readable: re-read it. (A dependency on a
+# package not registered yet is still a fact at the tag.)
+L = new_tree("needer")
+thorn_at(L, "NdArr")
+write(L, "cactarium.toml", package_toml("needer", "NdArr"))
+commit_tag(L, "needer 1.0", "v1.0.0")
+lbare = publish_tree(L, "needer")
+ok, out = cli("register", "max", REPOS + "/needer.git")
+check("register a package with no dependency yet", ok, out[-300:])
+write(L, "cactarium.toml", package_toml("needer", "NdArr", '\n[[dependency]]\ntarget = "max/latepkg"\nneeds = ["LtArrThorn"]\n'))
+commit_tag(L, "depends on a package not registered yet", "v1.1.0")
+push_all(L, lbare)
+cli("sync", "max/needer")
+check("a dependency on a package nobody registered yet makes the version invalid", "max/latepkg" in versions_of("max/needer")
+      and 'href="/max/needer/1.1.0' in versions_of("max/needer"))
+LT = new_tree("latepkg")
+thorn_at(LT, "LtArr")
+write(LT, "cactarium.toml", package_toml("latepkg", "LtArr"))
+commit_tag(LT, "latepkg", "v1.0.0")
+publish_tree(LT, "latepkg")
+ok, out = cli("register", "max", REPOS + "/latepkg.git")
+check("register the package it depends on", ok, out[-300:])
+ok, out = cli("reread", "max", "max/needer", "1.1.0")
+check("re-read invalid version: it reads cleanly now", ok and "reads cleanly now" in out, out[-300:])
+s, r, _ = resolve("max/needer@1.1.0")
+check("and is served", s == 200 and r.get("slug") == "max/needer@1.1.0", r)
+
+# --- A tag whose manifest file can't be read (not UTF-8) doesn't stop the entry's sync.
+U8 = new_tree("badutf")
+thorn_at(U8, "BuArr")
+write(U8, "cactarium.toml", package_toml("badutf", "BuArr"))
+commit_tag(U8, "1.0", "v1.0.0")
+u8bare = publish_tree(U8, "badutf")
+cli("register", "max", REPOS + "/badutf.git")
+good_u8 = open(os.path.join(U8, "cactarium.toml")).read()
+open(os.path.join(U8, "cactarium.toml"), "wb").write(b"format = 1\n# \xff\xfe broken\n")
+commit_tag(U8, "1.1 unreadable", "v1.1.0")
+write(U8, "cactarium.toml", good_u8)
+commit_tag(U8, "1.2", "v1.2.0")
+push_all(U8, u8bare)
+ok, out = cli("sync", "max/badutf")
+text = versions_of("max/badutf")
+check("an unreadable manifest is an invalid version, and the sync goes on to the next tag",
+      ok and 'href="/max/badutf/1.1.0' in text and "UTF-8" in text and has_version(anon, "max/badutf", "1.2.0"), out[-300:] + text[text.find("<table"):][:500])
+
+# --- The sims' form is the entry's, fixed when it is registered: an older tag in the other form is
+# not its release (not an invalid version), and `check` agrees with the sync.
+D = new_tree("formsims")
+DURL = REPOS + "/formsims.git"
+write(D, "a.sim", pin_sim("alpha", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)]))
+write(D, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "formsims"\nowners = ["max"]\nfile = "a.sim"\n')
+commit_tag(D, "one sim", "v1.0.0")
+write(D, "b.sim", pin_sim("beta", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)]))
+write(D, "cactarium-sim.toml", 'format = 2\n\n[sim]\nname = "formsims"\nowners = ["max"]\n\n[sim.files]\nalpha = "a.sim"\nbeta = "b.sim"\n')
+commit_tag(D, "two sims", "v2.0.0")
+publish_tree(D, "formsims")
+ok, out = cli("check", DURL, "--tag", "v2.0.0", "--owner", "max")
+check("check reads the newest tag cleanly", ok and "max/formsims@2.0.0: reads cleanly (sims: alpha, beta)" in out, out[-400:])
+ok, out = cli("register", "max", DURL)
+text = versions_of("max/formsims")
+check("registered from [sim.files], the entry keeps that form: 2.0.0 is a valid version",
+      ok and has_version(anon, "max/formsims", "2.0.0") and "invalid" not in text, out[-300:] + text[text.find("<table"):][:500])
+check("and the older one-file tag is recorded as not its release, not frozen invalid",
+      not has_version(maxv, "max/formsims", "1.0.0") and "one sim (file)" in page(maxv, "/max/formsims"))
+
+# --- A kind with a tag-pattern the standard form also reads (bare X.Y.Z): its tags are its own; the
+# kind without a pattern doesn't take them.
+E = new_tree("bareform")
+EURL = REPOS + "/bareform.git"
+thorn_at(E, "BfArr")
+write(E, "cactarium.toml", package_toml("bareform", "BfArr", 'tag-pattern = "{major}.{minor}.{patch}"\n'))
+write(E, "a.sim", pin_sim("alpha", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)]))
+write(E, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "bareform-sims"\nowners = ["max"]\nfile = "a.sim"\n')
+commit_tag(E, "sims 1.0", "v1.0.0")
+commit_tag(E, "package 2.0", "2.0.0")
+commit_tag(E, "package 3.0", "3.0.0")
+ebare = publish_tree(E, "bareform")
+ok, out = cli("register", "max", EURL)
+check("a package on bare X.Y.Z tags and sims on the standard form register", ok and out.count("Registered") == 2, out[-400:])
+check("the package takes its bare tags", has_version(anon, "max/bareform", "2.0.0") and has_version(anon, "max/bareform", "3.0.0"))
+check("the sims take only v1.0.0, never the package's bare tags",
+      has_version(anon, "max/bareform-sims", "1.0.0") and not has_version(maxv, "max/bareform-sims", "2.0.0")
+      and not has_version(maxv, "max/bareform-sims", "3.0.0"))
+check("which they list as another entry's", "its tag-pattern {major}.{minor}.{patch} reads 3.0.0" in page(maxv, "/max/bareform-sims"))
+
+# --- register --tag applies to the manifests that read that tag; the others come from their own
+# newest tags.
+TP = new_tree("tagpart")
+TPURL = REPOS + "/tagpart.git"
+thorn_at(TP, "TpArr")
+write(TP, "cactarium.toml", package_toml("tagpart", "TpArr"))
+tp_c = commit_tag(TP, "package", "v1.0.0")
+write(TP, "a.sim", pin_sim("alpha", [("tagpart", "TpArr", TPURL, tp_c)]))
+write(TP, "cactarium-sim.toml", sims_toml("tagpart-sims", {"alpha": "a.sim"}))
+commit_tag(TP, "sims", "sim-v1.0.0")
+publish_tree(TP, "tagpart")
+ok, out = cli("check", TPURL, "--tag", "sim-v1.0.0", "--owner", "max")
+check("check says which manifests read the tag and which come from their own newest tags",
+      ok and "cactarium.toml at sim-v1.0.0 follows version tags" in out and "new package max/tagpart from cactarium.toml at v1.0.0" in out
+      and "new sim max/tagpart-sims from cactarium-sim.toml at sim-v1.0.0" in out, out[-600:])
+ok, out = cli("register", "max", TPURL, "--tag", "sim-v1.0.0")
+check("register --tag on a repo whose package isn't registered registers both", ok and out.count("Registered") == 2, out[-400:])
+check("each at its own tag", has_version(anon, "max/tagpart", "1.0.0") and has_version(anon, "max/tagpart-sims", "1.0.0"))
+
+
 
 # --- The seeded multi-sim entry, registered with --tag beside its package.
 page(anon, "/max/bbh-demo-sims", contains="Sims in this version")

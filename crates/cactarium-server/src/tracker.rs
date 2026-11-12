@@ -159,14 +159,18 @@ pub fn unreadable_at_tag(e: cactup_ecosystem_common::Error) -> AppError {
 }
 
 /// Keeps the repo's tag rule in step with a manifest.
-async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResult<()> {
-    let (pattern, since) = rule.stored();
-    sqlx::query("UPDATE entry_repos SET tag_pattern = $2, min_version = $3 WHERE entry_id = $1")
-        .bind(entry_id)
-        .bind(pattern)
-        .bind(since)
-        .execute(&state.db)
-        .await?;
+/// Moves an entry's `since` to what a new version's manifest says, only while its tag pattern is
+/// still `pattern` (the one the sync read): a re-read of the rule in between wins. Never the
+/// pattern itself, which only a re-read, a curated update or a hand-over sets.
+async fn store_since(state: &AppState, entry_id: i64, since: Option<String>, pattern: Option<&str>) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE entry_repos SET min_version = $2 WHERE entry_id = $1 AND tag_pattern IS NOT DISTINCT FROM $3 AND overlay_manifest IS NULL",
+    )
+    .bind(entry_id)
+    .bind(since)
+    .bind(pattern)
+    .execute(&state.db)
+    .await?;
     Ok(())
 }
 
@@ -276,6 +280,9 @@ pub struct Plan {
     pub owner: String,
     pub existing: Vec<(Entry, String)>,
     pub new: Vec<Planned>,
+    /// How the plan came about where it isn't obvious (a manifest planned from its own newest tag
+    /// rather than the tag named).
+    pub notes: Vec<String>,
 }
 
 /// Where a registration reads its manifests: the newest tag of each entry's own rule, or one named
@@ -287,9 +294,10 @@ pub enum At<'a> {
 }
 
 /// Works out what registering `url` under `owner` would add, without writing anything. Each
-/// manifest's own rule finds its own newest tag, and the manifest there must read that tag as that
-/// version (self-consistency). With a tag named, every manifest there that isn't registered yet
-/// must read that tag as one of its versions. Entries already on the repo stay as they are; they
+/// manifest's own rule finds its own newest tag (leaving out tags another kind's own tag-pattern
+/// reads), and the manifest there must read that tag as that version (self-consistency). With a
+/// tag named, the manifests there that read it as one of their versions are planned at it; the
+/// others from their own newest tags. Entries already on the repo stay as they are; they
 /// must be `owner`'s. Without an owner (a dry run), the repo's existing owner is assumed, else
 /// the first owner the first new manifest lists.
 pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) -> AppResult<Plan> {
@@ -307,6 +315,15 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
     let have: Vec<&str> = existing.iter().map(|(_, f)| f.as_str()).collect();
     let refs = git::ls_tags(policy(state), &url).await.map_err(AppError::bad)?;
     let mut new = Vec::new();
+    let mut notes = Vec::new();
+    // The rules of the entries already on the repo: a tag another kind's own pattern reads isn't a
+    // candidate for a kind without that pattern.
+    let mut sibling_rules = Vec::new();
+    for (e, _) in &existing {
+        if let Some(r) = repo_of(state, e.id).await? {
+            sibling_rules.push(TagRule::of(&r)?);
+        }
+    }
     // The tag to read, and a ref to fetch it by when a host won't serve a bare commit.
     let named = match &at {
         At::Newest => None,
@@ -330,86 +347,99 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
             }
         },
     };
-    match named {
+    // Each manifest to register, with its own rule (and its manifest at the named tag, if one).
+    // With a tag named, the manifests at that tag; else those on the default branch, or with none
+    // there, whatever the newest vX.Y.Z tag carries.
+    let mut candidates: Vec<(&'static str, TagRule, Option<Manifest>)> = Vec::new();
+    let mut named_co = None;
+    let mut fallback = false;
+    match &named {
         Some((r, via)) => {
-            let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(&via)).await.map_err(AppError::bad)?);
+            let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(via)).await.map_err(AppError::bad)?);
             let found = read_manifests(&co, &r.name)?;
             if found.is_empty() {
                 return Err(AppError::bad(format!("no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {}", r.name)));
             }
             for (file, m) in found {
-                if have.contains(&file) {
-                    continue;
+                if !have.contains(&file) {
+                    candidates.push((file, TagRule::of_manifest(&m), Some(m)));
                 }
-                let rule = TagRule::of_manifest(&m);
-                let Some(tv) = rule.version(&r.name) else {
-                    return Err(AppError::bad(format!(
-                        "{file} at {} follows {}, so {} isn't one of its versions; register it from one of its own tags",
-                        r.name,
-                        rule.describe(),
-                        r.name
-                    )));
-                };
-                new.push(Planned { file, kind: kind_of(file), name: name_of(&m), manifest: m, rule, tag: r.clone(), tv, co: co.clone() });
             }
+            named_co = Some(co);
         }
         None => {
             let head = git::resolve_ref(policy(state), &url, None).await.map_err(AppError::bad)?;
             let at_head = git::checkout(policy(state), &url, &head, None).await.map_err(AppError::bad)?;
             let on_head = read_manifests(&at_head, "the default branch")?;
-            // Each manifest on the default branch, with its own rule; with none there, whatever the
-            // newest vX.Y.Z tag carries.
-            let candidates: Vec<(&'static str, TagRule)> = if on_head.is_empty() {
-                MANIFEST_FILES.iter().map(|f| (*f, TagRule::default())).collect()
+            fallback = on_head.is_empty();
+            if fallback {
+                candidates.extend(MANIFEST_FILES.iter().filter(|f| !have.contains(*f)).map(|f| (*f, TagRule::default(), None)));
             } else {
-                on_head.iter().map(|(f, m)| (*f, TagRule::of_manifest(m))).collect()
-            };
-            for (file, rule) in candidates {
-                if have.contains(&file) {
-                    continue;
-                }
-                let tags = version_tags(refs.clone(), &rule);
-                let Some((r, tv)) = newest(&tags) else {
-                    if on_head.is_empty() {
-                        continue;
-                    }
-                    return Err(AppError::bad(format!(
-                        "{file} on the default branch follows {}, and the repo has none yet",
-                        rule.describe()
-                    )));
-                };
-                let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(&r.name)).await.map_err(AppError::bad)?);
-                let Some(text) = git::read_in(&co, file).map_err(AppError::bad)? else {
-                    if on_head.is_empty() {
-                        continue;
-                    }
-                    return Err(AppError::bad(format!(
-                        "{file} is on the default branch but not at {}, its newest version tag; register with --tag naming a tag that has it",
-                        r.name
-                    )));
-                };
-                let m = Manifest::from_repo_file(file, &text).map_err(|e| AppError::bad(format!("{file} at {}: {e}", r.name)))?;
-                let own = TagRule::of_manifest(&m);
-                if own.version(&r.name).as_ref() != Some(tv) {
-                    return Err(AppError::bad(format!(
-                        "{file} at {} follows {}, not {} as on the default branch; register with --tag naming one of its own tags",
-                        r.name,
-                        own.describe(),
-                        rule.describe()
-                    )));
-                }
-                new.push(Planned { file, kind: kind_of(file), name: name_of(&m), manifest: m, rule: own, tag: r.clone(), tv: tv.clone(), co });
-            }
-            if new.is_empty() && existing.is_empty() {
-                return Err(match newest(&version_tags(refs, &TagRule::default())) {
-                    None => AppError::bad(format!("the repo has no {} yet", TagRule::default().describe())),
-                    Some((r, _)) => AppError::bad(format!(
-                        "no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {} (the newest version tag)",
-                        r.name
-                    )),
-                });
+                candidates.extend(
+                    on_head.iter().filter(|(f, _)| !have.contains(f)).map(|(f, m)| (*f, TagRule::of_manifest(m), None)),
+                );
             }
         }
+    }
+    let all_rules: Vec<TagRule> = candidates.iter().map(|(_, r, _)| r.clone()).collect();
+    for (i, (file, rule, at_named)) in candidates.into_iter().enumerate() {
+        let others: Vec<&TagRule> =
+            sibling_rules.iter().chain(all_rules.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, r)| r)).collect();
+        let claimed = |tag: &str| others.iter().find_map(|o| claimed_by(tag, &rule, o));
+        // At the named tag, when the manifest there reads it as one of its own versions.
+        if let (Some(m), Some((r, _)), Some(co)) = (at_named.as_ref(), &named, &named_co) {
+            match (rule.version(&r.name), claimed(&r.name)) {
+                (Some(tv), None) => {
+                    new.push(Planned { file, kind: kind_of(file), name: name_of(m), manifest: m.clone(), rule, tag: r.clone(), tv, co: co.clone() });
+                    continue;
+                }
+                (_, why) => notes.push(format!(
+                    "{file} at {} follows {}{}, so {} isn't one of its versions: it is planned from its own newest tag",
+                    r.name,
+                    rule.describe(),
+                    why.map(|w| format!(" ({w})")).unwrap_or_default(),
+                    r.name
+                )),
+            }
+        }
+        let tags: Vec<(RemoteRef, TrackedVersion)> =
+            version_tags(refs.clone(), &rule).into_iter().filter(|(r, _)| claimed(&r.name).is_none()).collect();
+        let Some((r, tv)) = newest(&tags) else {
+            if fallback {
+                continue;
+            }
+            return Err(AppError::bad(format!("{file} follows {}, and the repo has none of its tags yet", rule.describe())));
+        };
+        let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(&r.name)).await.map_err(AppError::bad)?);
+        let Some(text) = git::read_in(&co, file).map_err(AppError::bad)? else {
+            if fallback {
+                continue;
+            }
+            return Err(AppError::bad(format!(
+                "{file} isn't at {}, its newest version tag; register with --tag naming a tag that has it",
+                r.name
+            )));
+        };
+        let m = Manifest::from_repo_file(file, &text).map_err(|e| AppError::bad(format!("{file} at {}: {e}", r.name)))?;
+        let own = TagRule::of_manifest(&m);
+        if own.version(&r.name).as_ref() != Some(tv) {
+            return Err(AppError::bad(format!(
+                "{file} at {} follows {}, not {}; register with --tag naming one of its own tags",
+                r.name,
+                own.describe(),
+                rule.describe()
+            )));
+        }
+        new.push(Planned { file, kind: kind_of(file), name: name_of(&m), manifest: m, rule: own, tag: r.clone(), tv: tv.clone(), co });
+    }
+    if named.is_none() && fallback && new.is_empty() && existing.is_empty() {
+        return Err(match newest(&version_tags(refs, &TagRule::default())) {
+            None => AppError::bad(format!("the repo has no {} yet", TagRule::default().describe())),
+            Some((r, _)) => AppError::bad(format!(
+                "no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {} (the newest version tag)",
+                r.name
+            )),
+        });
     }
     if new.is_empty() {
         let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
@@ -423,15 +453,25 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
             .or_else(|| owners_of(&new[0].manifest).into_iter().next())
             .unwrap_or_default(),
     };
-    for p in &new {
+    for (i, p) in new.iter().enumerate() {
         if !owners_of(&p.manifest).contains(&owner) {
             return Err(AppError::bad(format!(
                 "{} at {} does not list '{owner}' in owners; add it there to prove you control the repo",
                 p.file, p.tag.name
             )));
         }
+        // Every entry needs its own name: two manifests naming one would collide.
+        if let Some(q) = new[..i].iter().find(|q| q.name == p.name) {
+            return Err(AppError::bad(format!(
+                "{} and {} both name '{}': each manifest becomes its own entry, so give them different names",
+                q.file, p.file, p.name
+            )));
+        }
+        if let Some(e) = model::find_entry(state, &owner, &p.name).await? {
+            return Err(AppError::bad(format!("{} already exists (a {}), so {} can't be registered under that name", e.slug(), e.kind, p.file)));
+        }
     }
-    Ok(Plan { url, owner, existing, new })
+    Ok(Plan { url, owner, existing, new, notes })
 }
 
 impl Plan {
@@ -462,6 +502,7 @@ impl Plan {
                 overlay_manifest: None,
                 tag_pattern,
                 min_version,
+                sim_form: sim_form_of(&p.manifest),
             },
         )
     }
@@ -519,7 +560,7 @@ pub async fn register(
         None => At::Newest,
     };
     let plan = plan(state, Some(&owner), url, at).await?;
-    let mut notes = Vec::new();
+    let mut notes = plan.notes.clone();
     for (label, p) in plan.prepare_all(state).await? {
         notes.extend(p.deferred.iter().map(|d| format!("{label} waits: {d}")));
     }
@@ -540,7 +581,7 @@ pub async fn register(
             },
         )
         .await?;
-        attach_repo(&mut tx, &entry, &plan.url, p.file, None, &p.rule).await?;
+        attach_repo(&mut tx, &entry, &plan.url, p.file, None, &p.rule, sim_form_of(&p.manifest).as_deref()).await?;
         entries.push(entry);
     }
     crate::audit::audit_with(
@@ -558,12 +599,11 @@ pub async fn register(
     .await?;
     tx.commit().await?;
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
+    // The entries exist now, whatever the first sync says: a problem there is reported, kept as the
+    // repo's poll error, and the poller tries again.
     for e in &entries {
-        // A tag that can't be read right now stays unread (kept as the repo's poll error); the
-        // poller tries it again.
-        match sync_as(state, e, Some(user)).await {
-            Ok(_) | Err(AppError::Upstream(_)) => {}
-            Err(err) => return Err(err),
+        if let Err(err) = sync_as(state, e, Some(user)).await {
+            notes.push(format!("{}: its first check of tags: {err}", e.slug()));
         }
     }
     Ok(Registered { entries, notes })
@@ -591,6 +631,7 @@ pub async fn check(
     let mut clean = true;
     match plan(state, owner, url, at).await {
         Ok(p) => {
+            lines.extend(p.notes.iter().cloned());
             for planned in &p.new {
                 lines.push(format!(
                     "new {} {}/{} from {} at {}: version {} (its rule: {})",
@@ -695,7 +736,7 @@ pub async fn register_curated(
         },
     )
     .await?;
-    attach_repo(&mut *state.db.acquire().await?, &entry, &url, PACKAGE_FILE, Some(overlay), &TagRule::of_manifest(&m)).await?;
+    attach_repo(&mut *state.db.acquire().await?, &entry, &url, PACKAGE_FILE, Some(overlay), &TagRule::of_manifest(&m), None).await?;
     // The admin vouches for the tags that exist now; later upstream tags are reviewed unless the
     // entry or its owner is trusted. A failure is kept as the repo's poll error.
     let _ = sync_as(state, &entry, Some(admin)).await;
@@ -727,6 +768,9 @@ pub async fn update_curated(
     }
     let (pattern, since) = TagRule::of_manifest(&m).stored();
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
+    // No sync of this entry runs while its rule changes (see `reread_rule`).
+    let lock = entry_sync_lock(entry.id);
+    let one_at_a_time = lock.lock().await;
     let current = repo_of(state, entry.id).await?.map(|r| r.url).unwrap_or_default();
     if current != url {
         same_history(state, entry, &url).await?;
@@ -758,6 +802,7 @@ pub async fn update_curated(
     )
     .await?;
     tx.commit().await?;
+    drop(one_at_a_time);
     sync_as(state, entry, Some(admin)).await
 }
 
@@ -765,6 +810,9 @@ pub async fn update_curated(
 /// branch, naming the entry's owner) stops using the overlay. Its name and versions stay; its tag
 /// rule becomes the repo manifest's.
 pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResult<()> {
+    // No sync of this entry runs while its rule changes (see `reread_rule`).
+    let lock = entry_sync_lock(entry.id);
+    let _one_at_a_time = lock.lock().await;
     let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
     if !entry.curated || repo.overlay_manifest.is_none() {
         return Err(AppError::bad(format!("{} already uses its repo's manifest", entry.slug())));
@@ -928,6 +976,11 @@ pub async fn reread_rule(state: &AppState, user: &User, entry: &Entry, tag: Opti
         )));
     }
     let tag = tag.map(str::trim).filter(|t| !t.is_empty());
+    // No sync of this entry runs meanwhile (in this process): one judging tags under the old rule
+    // could otherwise record them after the re-read cleared those records. Across processes, the
+    // records and `since` are written only under the rule they were judged by.
+    let lock = entry_sync_lock(entry.id);
+    let one_at_a_time = lock.lock().await;
     let (commit, at) = match tag {
         Some(t) => {
             let c = git::resolve_tag(policy(state), &repo.url, t)
@@ -979,6 +1032,7 @@ pub async fn reread_rule(state: &AppState, user: &User, entry: &Entry, tag: Opti
     )
     .await?;
     tx.commit().await?;
+    drop(one_at_a_time);
     match sync(state, entry).await {
         Ok(_) | Err(AppError::Upstream(_)) => {}
         Err(e) => return Err(e),
@@ -1156,6 +1210,7 @@ pub async fn move_repo(state: &AppState, admin: &User, entry: &Entry, new_url: &
     Ok(all)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attach_repo(
     db: &mut sqlx::PgConnection,
     entry: &Entry,
@@ -1163,9 +1218,10 @@ async fn attach_repo(
     file: &str,
     overlay: Option<&str>,
     rule: &TagRule,
+    sim_form: Option<&str>,
 ) -> AppResult<()> {
     let (pattern, since) = rule.stored();
-    sqlx::query("INSERT INTO entry_repos (entry_id, url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+    sqlx::query("INSERT INTO entry_repos (entry_id, url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version, sim_form) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
         .bind(entry.id)
         .bind(url)
         .bind(file)
@@ -1173,6 +1229,7 @@ async fn attach_repo(
         .bind(overlay)
         .bind(pattern)
         .bind(since)
+        .bind(sim_form)
         .execute(&mut *db)
         .await?;
     Ok(())
@@ -1186,11 +1243,13 @@ pub struct RepoRow {
     pub overlay_manifest: Option<String>,
     pub tag_pattern: Option<String>,
     pub min_version: Option<String>,
+    /// For a sim entry: `file` or `files`, fixed when it was registered (the address depends on it).
+    pub sim_form: Option<String>,
 }
 
 pub async fn repo_of(state: &AppState, entry_id: i64) -> AppResult<Option<RepoRow>> {
     Ok(sqlx::query_as::<_, RepoRow>(
-        "SELECT url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version FROM entry_repos WHERE entry_id = $1",
+        "SELECT url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version, sim_form FROM entry_repos WHERE entry_id = $1",
     )
     .bind(entry_id)
     .fetch_optional(&state.db)
@@ -1363,18 +1422,24 @@ async fn sync_inner(
         if read == MAX_NEW_PER_SYNC {
             break;
         }
-        read += 1;
+        // Only tags read to a conclusion count toward the cap: tags left waiting (Upstream) never
+        // hold up newer ones.
         match ingest(state, entry, repo, &r, &tv, actor).await {
-            Ok(Ingested::Version) => added += 1,
-            Ok(Ingested::Foreign) => {}
+            Ok(Ingested::Version) => {
+                added += 1;
+                read += 1;
+            }
+            Ok(Ingested::Foreign) => read += 1,
             Err(AppError::Upstream(why)) => unfetched.push(why),
             Err(e) => return Err(e),
         }
     }
     if added > 0 {
         publish::touch(state, entry.id).await?;
+    }
+    if added > 0 && repo.overlay_manifest.is_none() {
         // The newest version's manifest may move `since`; the tag form stays the entry's own
-        // until someone re-reads the tag rule.
+        // until someone re-reads the tag rule. A curated entry's rule is its overlay's.
         let newest: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND state <> 'invalid'
              ORDER BY (track = '') DESC, sort_key DESC LIMIT 1",
@@ -1386,7 +1451,7 @@ async fn sync_inner(
         if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
             let rule = TagRule::of_manifest(&m);
             if rule.same_pattern(&TagRule::of(repo)?) {
-                store_rule(state, entry.id, &rule).await?;
+                store_since(state, entry.id, rule.stored().1, repo.tag_pattern.as_deref()).await?;
             }
         }
     }
@@ -1467,8 +1532,23 @@ async fn foreign_reason(
     if repo.overlay_manifest.is_some() {
         return Ok(None);
     }
-    let Some(text) = git::read_in(co, &repo.manifest_file).map_err(AppError::bad)? else {
-        if siblings(state, entry.id, &repo.url).await?.is_empty() {
+    let sibs = siblings(state, entry.id, &repo.url).await?;
+    // A kind that declares a tag-pattern follows only it; the kinds without one stay on the
+    // standard form. So a tag a sibling's own pattern reads (bare 1.2.3 for {major}.{minor}.{patch},
+    // say), which the standard form also reads, is that sibling's, not this entry's.
+    let own = TagRule::of(repo)?;
+    if own.version(&r.name).is_some() && own.pattern.as_ref().is_none_or(|p| p.version(&r.name).is_none()) {
+        for sib in &sibs {
+            let Some(theirs) = repo_of(state, sib.id).await? else { continue };
+            if let Some(why) = claimed_by(&r.name, &own, &TagRule::of(&theirs)?) {
+                return Ok(Some(format!("it is {}'s release: {why}", sib.slug())));
+            }
+        }
+    }
+    // A file that can't be read decides nothing here: prepare reports it (an invalid version).
+    let Ok(read) = git::read_in(co, &repo.manifest_file) else { return Ok(None) };
+    let Some(text) = read else {
+        if sibs.is_empty() {
             return Ok(None);
         }
         return Ok(Some(format!(
@@ -1477,7 +1557,42 @@ async fn foreign_reason(
         )));
     };
     let Ok(m) = Manifest::from_repo_file(&repo.manifest_file, &text) else { return Ok(None) };
+    // The form (one file or [sim.files]) is the entry's, fixed when it was registered: a manifest in
+    // the other form is another scheme's, not a release of this entry.
+    if let (Some(fixed), Some(here)) = (repo.sim_form.as_deref(), sim_form_of(&m))
+        && fixed != here
+    {
+        return Ok(Some(format!(
+            "its {} uses {}, but this entry publishes {} (fixed when it was registered)",
+            repo.manifest_file,
+            form_words(&here),
+            form_words(fixed)
+        )));
+    }
     Ok(inconsistent(&TagRule::of_manifest(&m), &repo.manifest_file, &r.name, tv))
+}
+
+/// Whether `tag` belongs to a sibling with its own tag-pattern, rather than to an entry following
+/// `own`: the sibling's pattern reads it and `own`'s pattern (if any) doesn't, and the two patterns
+/// differ (kinds with the same pattern share its tags). Says why.
+fn claimed_by(tag: &str, own: &TagRule, theirs: &TagRule) -> Option<String> {
+    let p = theirs.pattern.as_ref()?;
+    if own.same_pattern(theirs) || own.pattern.as_ref().is_some_and(|o| o.version(tag).is_some()) {
+        return None;
+    }
+    p.version(tag).map(|_| format!("its tag-pattern {} reads {tag}", p.as_str()))
+}
+
+/// A sim manifest's form: `file` or `files`; `None` for other manifests.
+fn sim_form_of(m: &Manifest) -> Option<String> {
+    m.sim.as_ref().map(|s| match s.form() {
+        SimForm::File(_) => "file".to_owned(),
+        SimForm::Files(_) => "files".to_owned(),
+    })
+}
+
+fn form_words(form: &str) -> &'static str {
+    if form == "files" { "several sims ([sim.files])" } else { "one sim (file)" }
 }
 
 /// Self-consistency: why the manifest's own rule `own` doesn't read `tag` as `tv`, if it doesn't.
@@ -1490,15 +1605,21 @@ fn inconsistent(own: &TagRule, file: &str, tag: &str, tv: &TrackedVersion) -> Op
 }
 
 /// Records `r` as not `entry`'s tag, with why (replacing an earlier judgment of the same tag).
-async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, why: &str) -> AppResult<()> {
+/// Only while the entry's tag rule is still `pattern`, the one the caller judged under: a re-read
+/// of the rule (which clears these records) in between makes the judgment stale, and nothing is
+/// written.
+async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, why: &str, pattern: Option<&str>) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO foreign_tags (entry_id, tag, commit, reason) VALUES ($1, $2, $3, $4)
+        "INSERT INTO foreign_tags (entry_id, tag, commit, reason)
+         SELECT $1, $2, $3, $4 WHERE EXISTS
+           (SELECT 1 FROM entry_repos WHERE entry_id = $1 AND tag_pattern IS NOT DISTINCT FROM $5)
          ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, seen_at = now()",
     )
     .bind(entry.id)
     .bind(&r.name)
     .bind(&r.commit)
     .bind(why)
+    .bind(pattern)
     .execute(&state.db)
     .await?;
     Ok(())
@@ -1533,7 +1654,7 @@ async fn ingest(
         // recorded as not this entry's (judged again if the tag moves) rather than frozen here.
         Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
             if repo.overlay_manifest.is_none() && !siblings(state, entry.id, &repo.url).await?.is_empty() {
-                record_foreign(state, entry, r, &format!("{e:#}, so whose release it is can't be read")).await?;
+                record_foreign(state, entry, r, &format!("{e:#}, so whose release it is can't be read"), repo.tag_pattern.as_deref()).await?;
                 return Ok(Ingested::Foreign);
             }
             (Some(format!("cannot index the tagged commit: {e:#}")), None, None)
@@ -1545,7 +1666,7 @@ async fn ingest(
         }
         Ok(co) => {
             if let Some(why) = foreign_reason(state, entry, repo, &co, r, tv).await? {
-                record_foreign(state, entry, r, &why).await?;
+                record_foreign(state, entry, r, &why, repo.tag_pattern.as_deref()).await?;
                 return Ok(Ingested::Foreign);
             }
             match prepare(state, entry, repo, &co, r, tv, &PrepOpts::default()).await {
@@ -1911,7 +2032,7 @@ async fn prepare(
         p.frozen = Some((frozen, toml, own));
     }
     if let Some(sim) = &m.sim {
-        prepare_sims(state, entry, co, tv, sim, opts, &mut p).await?;
+        prepare_sims(state, entry, repo, co, tv, sim, opts, &mut p).await?;
     }
     let _ = r;
     Ok(p)
@@ -1921,9 +2042,11 @@ async fn prepare(
 /// upload must satisfy, plus what only a repo has (`repo-file` inputs) and what only several sims
 /// have (the stamp each will carry). All or nothing: a version missing one of its sims would freeze
 /// silently incomplete, so one failing sim refuses the version, with every reason.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_sims(
     state: &AppState,
     entry: &Entry,
+    repo: &RepoRow,
     co: &git::Checkout,
     tv: &TrackedVersion,
     sim: &cactup_ecosystem_common::manifest::SimSection,
@@ -1931,24 +2054,17 @@ async fn prepare_sims(
     p: &mut Prepared,
 ) -> AppResult<()> {
     let named = matches!(sim.form(), SimForm::Files(_));
-    // The form is the entry's: switching it would change every address (owner/name against
-    // owner/name/sim), so a manifest that switches is refused.
-    let stored: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT s.name FROM sim_files s JOIN versions v ON v.id = s.version_id WHERE v.entry_id = $1",
-    )
-    .bind(entry.id)
-    .fetch_all(&state.db)
-    .await?;
-    if named && stored.iter().any(String::is_empty) {
+    // The form is the entry's, fixed at registration: switching it would change every address
+    // (owner/name against owner/name/sim). A tag in the other form is recorded as not the entry's
+    // before this runs (`foreign_reason`); here it is only a backstop for other readers.
+    if let Some(fixed) = repo.sim_form.as_deref()
+        && fixed != if named { "files" } else { "file" }
+    {
         return Err(AppError::bad(format!(
-            "this manifest lists [sim.files], but {} publishes one sim (file): switching would change its address; register the sims as a new entry",
-            entry.slug()
-        )));
-    }
-    if !named && stored.iter().any(|n| !n.is_empty()) {
-        return Err(AppError::bad(format!(
-            "this manifest names one file, but {} publishes named sims ([sim.files]): keep [sim.files], even for one sim",
-            entry.slug()
+            "this manifest uses {}, but {} publishes {}: the form is fixed when the entry is registered",
+            form_words(if named { "files" } else { "file" }),
+            entry.slug(),
+            form_words(fixed)
         )));
     }
     let (mut facts, mut passing) = (Vec::new(), Vec::new());
@@ -2314,6 +2430,21 @@ mod tests {
         assert!(sims.version("v1.2.0").is_none());
         assert!(rule(Some("sim-v{major}.{minor}.{patch}")).same_pattern(&sims));
         assert!(!plain.same_pattern(&sims));
+    }
+
+    /// A kind with a tag-pattern follows only it; kinds without one stay on the standard form, so
+    /// a tag a sibling's pattern reads isn't theirs, even when the standard form reads it too.
+    #[test]
+    fn a_siblings_pattern_claims_its_tags() {
+        let plain = rule(None);
+        let bare = rule(Some("{major}.{minor}.{patch}"));
+        let slash = rule(Some("sim/v{major}.{minor}.{patch}"));
+        assert!(plain.version("2.0.0").is_some(), "the standard form reads bare X.Y.Z");
+        assert!(claimed_by("2.0.0", &plain, &bare).is_some());
+        assert!(claimed_by("v2.0.0", &plain, &bare).is_none(), "its pattern doesn't read v2.0.0");
+        assert!(claimed_by("sim/v1.0.0", &plain, &slash).is_some(), "an explicit sim/v pattern is claimed too");
+        assert!(claimed_by("2.0.0", &bare, &rule(Some("{major}.{minor}.{patch}"))).is_none(), "the same pattern shares its tags");
+        assert!(claimed_by("v2.0.0", &plain, &plain).is_none(), "no pattern claims nothing");
     }
 
     /// A tag the stored rule picks is the entry's only if the manifest inside reads it the same way.
