@@ -1317,7 +1317,9 @@ async fn sync_inner(
     for k in &known {
         let (Some(tag), Some(frozen)) = (&k.tag, &k.commit) else { continue };
         match remote.get(tag) {
-            Some(now) if now != frozen && k.state != "tag-moved" => {
+            // An invalid version is never served: a tag moving off it changes nothing (it stays
+            // invalid, never "tag-moved", which would make it look like a usable version).
+            Some(now) if now != frozen && k.state != "tag-moved" && k.state != "invalid" => {
                 mark(state, entry, k.id, "tag-moved", tag, frozen, Some(now)).await?;
             }
             None if k.state != "upstream-missing" && k.state != "invalid" => {

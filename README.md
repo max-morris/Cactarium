@@ -60,11 +60,13 @@ organization with `just cli org create et <your-username> --display-name "Einste
   entry's).
 - `move-repo` moves every entry on the repo together.
 - Rollback: a binary from the retry-not-freeze release on starts on a database a later release
-  migrated, and leaves unread (never freezes) the tags it can't read: format-2 manifests,
-  format-4 sims, a tag without an entry's manifest on a repo with several entries. Under it, a
-  multi-sim entry's pages fail to render (its stored sims are format 4), so hide those entries
-  (Admin, Entries, Hide) for the duration. Before rolling back further than that release, hiding
-  every multi-sim entry is required: hidden entries aren't synced.
+  migrated; leaves unread (never freezes) the tags it can't read: format-2 manifests, format-4
+  sims, a tag without an entry's manifest on a repo with several entries; skips the tags this
+  release recorded as not an entry's (`foreign_tags`); and serves a sim download's file and
+  sha256 from one row. Under it, a multi-sim entry's pages fail to render (its stored sims are
+  format 4), so hide those entries (Admin, Entries, Hide) for the duration. Before rolling back
+  further than that release, hiding every multi-sim entry is required: hidden entries aren't
+  synced.
 
 ### First deploy
 

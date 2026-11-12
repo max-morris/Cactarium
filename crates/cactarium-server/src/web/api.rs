@@ -27,7 +27,6 @@ use crate::git::{self, GitPolicy};
 use crate::model::{self, Entry, Version};
 use crate::security::ClientIp;
 use crate::state::AppState;
-use crate::web::public::sim_file;
 use crate::{sims, stacks, tracker};
 
 pub fn generation() -> String {
@@ -99,7 +98,7 @@ impl FromRequestParts<AppState> for Reviewer {
 /// A version this request may be served: a reviewed one, or for a reviewer one awaiting review.
 /// Rejected versions never.
 fn servable(v: &Version, reviewer: &Reviewer) -> bool {
-    v.approved() || (reviewer.releases && v.review == "pending")
+    v.valid() && (v.approved() || (reviewer.releases && v.review == "pending"))
 }
 
 /// The answer's header saying what it serves awaits review, when it does.
@@ -225,7 +224,7 @@ async fn version_at_commit(state: &AppState, e: &Entry, commit: &str) -> ApiResu
     Ok(model::versions(state, e.id)
         .await?
         .into_iter()
-        .filter(|v| v.commit.as_deref() == Some(commit) && v.state != "invalid")
+        .filter(|v| v.commit.as_deref() == Some(commit) && v.valid())
         .max_by(|a, b| a.sort_key.cmp(&b.sort_key)))
 }
 
@@ -299,7 +298,7 @@ pub async fn resolve(
             let exact = req.is_exact();
             let in_range: Vec<(TrackedVersion, &Version)> = versions
                 .iter()
-                .filter(|v| v.state != "invalid" && (!v.yanked || exact))
+                .filter(|v| v.valid() && (!v.yanked || exact))
                 .filter_map(|v| model::tracked(v).map(|t| (t, v)))
                 .filter(|(t, _)| req.matches(t))
                 .collect();
@@ -786,7 +785,7 @@ pub async fn sim_download(
     };
     let marked = unreviewed_header(&e, Some(&v));
     // The file and its sha256 from one row: the sha always belongs to the file served.
-    let (content, sha) = sim_file(&state, v.id, &which).await.map(|f| (f.content, f.sha256))?;
+    let (content, sha) = crate::web::public::sim_file(&state, v.id, &which).await.map(|f| (f.content, f.sha256))?;
     Ok((
         axum::response::AppendHeaders(marked),
         [

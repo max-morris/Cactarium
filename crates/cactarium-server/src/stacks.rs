@@ -41,20 +41,24 @@ pub struct RepoMove {
 }
 
 /// Loads a base stack's release. Only public stacks, or the extending stack owner's own, can be
-/// bases; anything else is reported exactly like a release that does not exist.
+/// bases; anything else is reported exactly like a release that does not exist. The message is the
+/// same either way, but a stack entry that exists and isn't usable yet (awaiting review, or the
+/// release not read yet) is [`AppError::Upstream`], so a tag that needs it waits instead of
+/// freezing invalid; no stack of that name at all is a fact.
 pub async fn load_release(state: &AppState, owner: &str, slug: &Slug) -> AppResult<FrozenStack> {
-    let unavailable = || AppError::bad(format!("base stack release '{slug}' is not available"));
-    let exact = slug.exact().map_err(|_| unavailable())?;
-    let entry = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
+    let msg = format!("base stack release '{slug}' is not available");
+    let exact = slug.exact().map_err(|_| AppError::bad(&msg))?;
+    let found = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
         .await?
-        .filter(|e| {
-            e.kind == "stack"
-                && (e.visibility == "public" || (e.owner == owner && e.visibility != "hidden"))
-        })
-        .ok_or_else(unavailable)?;
+        .filter(|e| e.kind == "stack");
+    let Some(entry) = found else { return Err(AppError::bad(&msg)) };
+    if !(entry.visibility == "public" || (entry.owner == owner && entry.visibility != "hidden")) {
+        return Err(AppError::Upstream(msg));
+    }
     let v = model::version_by_label(state, entry.id, &exact.to_string())
         .await?
-        .ok_or_else(unavailable)?;
+        .filter(Version::valid)
+        .ok_or(AppError::Upstream(msg))?;
     frozen_of(state, &v).await
 }
 
@@ -323,7 +327,13 @@ pub async fn resolve(
     }
     while let Some(done) = set.join_next().await {
         let (i, result) = done.map_err(anyhow::Error::from)?;
-        match result.map_err(|e| AppError::bad(format!("repo '{}': {e:#}", pins[i].name)))? {
+        // A ref the repo says it doesn't have is a fact about the definition; a repo that couldn't
+        // be read (the network, the host) is not, and a tag read now is tried again later.
+        let result = result.map_err(|e| {
+            let why = format!("repo '{}': {e:#}", pins[i].name);
+            if e.downcast_ref::<git::Missing>().is_some() { AppError::bad(why) } else { AppError::Upstream(why) }
+        });
+        match result? {
             Found::Commit(c) => pins[i].commit = Some(c),
             Found::Base(b) => {
                 pins[i].commit = b.commit;
@@ -391,7 +401,7 @@ impl Lookup {
             Lookup::Branch(b) => Found::Commit(git::resolve_ref(policy, url, b.as_deref()).await?),
             Lookup::Tag(t) => match git::resolve_tag(policy, url, &t).await? {
                 Some(c) => Found::Commit(c),
-                None => anyhow::bail!("{url} has no tag '{t}' (named by its [[stack.pin]])"),
+                None => return Err(git::Missing(format!("{url} has no tag '{t}' (named by its [[stack.pin]])")).into()),
             },
             Lookup::TagElse(t, fallback) => match git::resolve_tag(policy, url, &t).await? {
                 Some(c) => Found::Commit(c),
@@ -450,8 +460,13 @@ pub async fn resolve_package(state: &AppState, slug: &Slug) -> AppResult<(String
     let req: TrackedReq = slug.req().map_err(AppError::bad)?;
     let entry = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
         .await?
-        .filter(|e| e.kind == "package" && e.visibility == "public")
+        .filter(|e| e.kind == "package")
         .ok_or_else(|| AppError::bad(format!("package '{}' does not exist", slug.entry())))?;
+    // A package that exists but isn't public yet, or has no matching version yet, may become
+    // usable without a new commit of this stack: a tag that needs it waits.
+    if entry.visibility != "public" {
+        return Err(AppError::Upstream(format!("package '{}' isn't public yet", slug.entry())));
+    }
     let vs = model::versions(state, entry.id).await?;
     let best = vs
         .iter()
@@ -459,7 +474,7 @@ pub async fn resolve_package(state: &AppState, slug: &Slug) -> AppResult<(String
         .filter_map(|v| model::tracked(v).map(|t| (t, v)))
         .filter(|(t, _)| req.matches(t))
         .max_by(|a, b| a.0.version.cmp(&b.0.version))
-        .ok_or_else(|| AppError::bad(format!("no version of '{}' matches '{req}'", slug.entry())))?
+        .ok_or_else(|| AppError::Upstream(format!("no version of '{}' matches '{req}' yet", slug.entry())))?
         .1;
     let url: String = sqlx::query_scalar("SELECT url FROM entry_repos WHERE entry_id = $1")
         .bind(entry.id)
