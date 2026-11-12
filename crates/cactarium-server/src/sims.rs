@@ -48,12 +48,32 @@ static PRIVATE_PATH: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Checks a `.sim` upload. Errors are reasons it cannot be published.
 pub fn check(bytes: &[u8]) -> AppResult<Checked> {
+    check_as(bytes, Source::Upload)
+}
+
+/// Checks a `.sim` read at a version tag. As [`check`], except that a file from a newer format
+/// generation than this server reads is [`AppError::Upstream`]: not a fact about the commit (an
+/// upgraded server reads it), so the tag is left unread and tried again rather than frozen invalid.
+pub fn check_at_tag(bytes: &[u8]) -> AppResult<Checked> {
+    check_as(bytes, Source::Tag)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    Upload,
+    Tag,
+}
+
+fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
     if bytes.len() > MAX_SIM_BYTES {
         return Err(AppError::bad("the .sim file is larger than 1 MB"));
     }
     let text =
         std::str::from_utf8(bytes).map_err(|_| AppError::bad("the .sim file is not UTF-8 text"))?;
-    let sim = SimFile::from_toml(text).map_err(AppError::bad)?;
+    let sim = SimFile::from_toml(text).map_err(|e| match source {
+        Source::Tag => crate::tracker::unreadable_at_tag(e),
+        Source::Upload => AppError::bad(e),
+    })?;
     let problems = sim.unspecified();
     if !problems.is_empty() {
         let list: Vec<String> = problems.iter().map(|p| p.to_string()).collect();
@@ -161,41 +181,85 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
     Ok(Checked { sim, index })
 }
 
-/// Publishes a checked sim as a version of `owner/name`: `owner` is the user or one of their
-/// organizations (default: the user), `name` defaults to the file's (creating the entry if new).
-/// `version` is the semver version to publish (default: the next major, 1.0.0, 2.0.0, …), so
-/// `owner/name@1` means 1.x.x as for packages and stacks. Returns the entry, the version and
-/// whether it is approved or waits for review.
 /// Every repo a sim pins must be a registered package's, at a commit that package's repo has: a
 /// downstream user must be able to rebuild the sim from the Cactarium alone. The pin's identity is
 /// then `owner/pkg@version` (a commit a version froze) or `owner/pkg#sha` (any other commit of
 /// the repo). A tarball pin (sha256 only) has no package identity. Refuses with every pin that
-/// fails, and what to do about it.
+/// fails, and what to do about it. For an upload, where the uploader sees the answer and can try
+/// again; a tag read from a repo uses [`check_pins_at_tag`].
 pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
-    let packages: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT e.owner, e.name, r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
-         WHERE e.kind = 'package' AND e.visibility = 'public' ORDER BY e.created_at",
+    let p = pin_problems(state, sim).await?;
+    let all: Vec<String> = p.facts.into_iter().chain(p.passing).collect();
+    if all.is_empty() { Ok(()) } else { Err(AppError::bad(format!("not fully specified: {}", all.join("; ")))) }
+}
+
+/// [`check_pins`] for a sim read at a version tag, where an error decides whether the tag is
+/// frozen as an invalid version (never read again) or left unread and tried at the next sync. A
+/// problem that is a fact about the commit makes it invalid, listing every problem; when every
+/// problem may pass (see [`PinProblems`]), the answer is [`AppError::Upstream`] and the tag is
+/// tried again.
+pub async fn check_pins_at_tag(state: &AppState, sim: &SimFile) -> AppResult<()> {
+    let p = pin_problems(state, sim).await?;
+    if !p.facts.is_empty() {
+        let all: Vec<String> = p.facts.into_iter().chain(p.passing).collect();
+        return Err(AppError::bad(format!("not fully specified: {}", all.join("; "))));
+    }
+    if !p.passing.is_empty() {
+        return Err(AppError::Upstream(format!(
+            "pins that can't be checked yet (the tag will be read again): {}",
+            p.passing.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+/// What is wrong with a sim's pins, split by whether it can change without a new commit of the
+/// sim's repo.
+#[derive(Default)]
+pub struct PinProblems {
+    /// Facts about the commit: a tarball pin (it has no package identity, and never will), or a
+    /// repo no package on the Cactarium was ever registered for.
+    pub facts: Vec<String>,
+    /// Things the world can change: the package for the repo is registered but not public yet
+    /// (awaiting review, or a sibling entry not yet approved), its history can't be read right now
+    /// (the network, the host), or the pinned commit isn't in its repo yet (pushed after the tag).
+    pub passing: Vec<String>,
+}
+
+async fn pin_problems(state: &AppState, sim: &SimFile) -> AppResult<PinProblems> {
+    // Public packages first (oldest first), then any other package entry, which only tells a
+    // registered-but-not-public repo from one nobody registered.
+    let packages: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT e.owner, e.name, r.url, e.visibility = 'public' FROM entries e JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.kind = 'package' ORDER BY e.visibility = 'public' DESC, e.created_at",
     )
     .fetch_all(&state.db)
     .await?;
     let policy = crate::git::GitPolicy { allow_local: state.cfg.allow_local_repos };
-    let mut problems: Vec<String> = Vec::new();
+    let mut out = PinProblems::default();
     for pin in &sim.repos {
         let Some(commit) = pin.commit.as_deref() else {
-            problems.push(format!(
+            out.facts.push(format!(
                 "{}: a tarball pin has no package identity; every repo a sim builds from must be a registered package's",
                 pin.name
             ));
             continue;
         };
         let norm = crate::git::normalize_url(&pin.url);
-        let Some((owner, name, url)) = packages.iter().find(|(_, _, u)| crate::git::normalize_url(u) == norm) else {
-            problems.push(format!(
+        let Some((owner, name, url, public)) = packages.iter().find(|(_, _, u, _)| crate::git::normalize_url(u) == norm) else {
+            out.facts.push(format!(
                 "{} ({}) isn't the repo of any package on the Cactarium: register it (or fork a package that is, and pin the fork) first",
                 pin.name, pin.url
             ));
             continue;
         };
+        if !public {
+            out.passing.push(format!(
+                "{} ({}) is the repo of {owner}/{name}, which isn't public yet (awaiting review or hidden)",
+                pin.name, pin.url
+            ));
+            continue;
+        }
         // A commit a version froze is that version; any other must be in the repo's history.
         let frozen: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM versions v JOIN entries e ON e.id = v.entry_id
@@ -215,21 +279,26 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
             Ok(crate::git::PrefixMatch::Many(all)) => all.iter().any(|c| c == commit),
             Ok(crate::git::PrefixMatch::None) => false,
             Err(e) => {
-                problems.push(format!("{}: cannot read {owner}/{name}'s history right now ({e:#}); try again later", pin.name));
+                out.passing.push(format!("{}: cannot read {owner}/{name}'s history right now ({e:#}); try again later", pin.name));
                 continue;
             }
         };
         if !found {
-            problems.push(format!(
+            out.passing.push(format!(
                 "{}: commit {} isn't in {owner}/{name}'s repo: push it there (or to a fork registered as a package)",
                 pin.name,
                 &commit[..commit.len().min(12)]
             ));
         }
     }
-    if problems.is_empty() { Ok(()) } else { Err(AppError::bad(format!("not fully specified: {}", problems.join("; ")))) }
+    Ok(out)
 }
 
+/// Publishes a checked sim as a version of `owner/name`: `owner` is the user or one of their
+/// organizations (default: the user), `name` defaults to the file's (creating the entry if new).
+/// `version` is the semver version to publish (default: the next major, 1.0.0, 2.0.0, …), so
+/// `owner/name@1` means 1.x.x as for packages and stacks. Returns the entry, the version and
+/// whether it is approved or waits for review.
 pub async fn publish(
     state: &AppState,
     user: &User,

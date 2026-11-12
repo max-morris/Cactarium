@@ -114,6 +114,19 @@ async fn still_curated_at(
 
 const CURATED_CHANGED: &str = "the entry changed while this ran (another curated update, a hand-over or a move); reload and try again";
 
+/// A manifest or `.sim` read at a version tag that this server can't read: invalid, unless the file
+/// is only from a newer format generation than this server knows. That is not a fact about the
+/// commit (an upgraded server reads it), so it is [`AppError::Upstream`]: the tag is left unread and
+/// tried again at the next sync instead of being frozen as an invalid version.
+pub fn unreadable_at_tag(e: cactup_ecosystem_common::Error) -> AppError {
+    match e {
+        cactup_ecosystem_common::Error::NewerFormat { .. } => {
+            AppError::Upstream(format!("{e} (this server reads it once it is upgraded)"))
+        }
+        other => AppError::bad(other),
+    }
+}
+
 /// Keeps the repo's tag rule in step with a manifest.
 async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResult<()> {
     let (pattern, since) = rule.stored();
@@ -848,8 +861,14 @@ async fn mark(
     Ok(())
 }
 
+fn short(commit: &str) -> &str {
+    &commit[..10.min(commit.len())]
+}
+
 /// Freezes one tag as a version. A tag whose manifest is missing or wrong still becomes a version,
-/// marked invalid with the reason, so it is not fetched again on every poll.
+/// marked invalid with the reason, so it is not fetched again on every poll. Only facts about the
+/// commit make a version invalid: when `prepare` answers [`AppError::Upstream`] or fails on our
+/// side, nothing is stored and the tag is tried again at the next sync.
 async fn ingest(
     state: &AppState,
     entry: &Entry,
@@ -870,10 +889,26 @@ async fn ingest(
         // Any other fetch failure (the network, the host) is worth trying again: nothing is
         // stored, so the tag is read again at the next sync.
         Err(e) => {
-            return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, &r.commit[..10.min(r.commit.len())])));
+            return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, short(&r.commit))));
         }
         Ok(co) => match prepare(state, entry, repo, &co, r, tv).await {
             Ok(p) => (None, Some(co.tree.clone()), Some(p)),
+            // Not a fact about the commit (a newer format than this server reads, a pinned package
+            // not public yet, a host that didn't answer): nothing is stored, so the tag is read
+            // again at the next sync.
+            Err(AppError::Upstream(why)) => {
+                return Err(AppError::Upstream(format!("{}: {} ({}): {why}", entry.slug(), r.name, short(&r.commit))));
+            }
+            // Our own failure (the database, say) says nothing about the commit either.
+            Err(AppError::Internal(e)) => {
+                tracing::error!("reading {} at {}: {e:#}", entry.slug(), r.name);
+                return Err(AppError::Upstream(format!(
+                    "{}: {} ({}): an internal error while reading it",
+                    entry.slug(),
+                    r.name,
+                    short(&r.commit)
+                )));
+            }
             Err(e) => (Some(e.to_string()), Some(co.tree.clone()), None),
         },
     };
@@ -1001,7 +1036,7 @@ async fn prepare(
             .map_err(AppError::bad)?
             .ok_or_else(|| AppError::bad(format!("no {} at this tag", repo.manifest_file)))?,
     };
-    let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(AppError::bad)?;
+    let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(unreadable_at_tag)?;
     if name_of(&m) != entry.name {
         return Err(AppError::bad(format!(
             "the manifest names '{}', not '{}'",
@@ -1143,8 +1178,7 @@ async fn prepare(
         let text = git::read_in(co, &sim.file)
             .map_err(AppError::bad)?
             .ok_or_else(|| AppError::bad(format!("'{}' does not exist at this tag", sim.file)))?;
-        let checked = crate::sims::check(text.as_bytes())?;
-        crate::sims::check_pins(state, &checked.sim).await?;
+        let checked = crate::sims::check_at_tag(text.as_bytes())?;
         // Inputs read from this repo must be files at this tag (inside the repo, not via a link).
         for i in &checked.sim.inputs {
             let Some(f) = &i.repo_file else { continue };
@@ -1159,6 +1193,8 @@ async fn prepare(
                 )));
             }
         }
+        // Last: facts about the commit (above) make it invalid even while a pin can't be checked yet.
+        crate::sims::check_pins_at_tag(state, &checked.sim).await?;
         p.sim = Some((checked, sim.description.clone()));
     }
     let _ = r;

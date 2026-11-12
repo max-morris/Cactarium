@@ -43,7 +43,7 @@ note = "needs the mixed-precision flesh"
 [[caveat]]
 thorn = "TestReal2"
 note = "needs _Float16 (GCC 12 or newer)"</pre>
-<p>Only <code>format = 1</code> and a <code>[package]</code> with <code>name</code> and <code>owners</code> are required. The reader is strict: an unknown key, or a <code>format</code> newer than 1, is an error, and the tag becomes an invalid version with that message.</p>
+<p>Only <code>format = 1</code> and a <code>[package]</code> with <code>name</code> and <code>owners</code> are required. The reader is strict: an unknown key is an error, and the tag becomes an invalid version with that message. A <code>format</code> newer than this Cactarium reads is not a fact about the commit: the tag is <a href="/docs/publishing#retried">left unread and tried again</a> until the Cactarium is upgraded.</p>
 
 <h2 id="package">[package]</h2>
 <div class="table-box"><table>

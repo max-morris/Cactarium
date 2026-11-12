@@ -757,6 +757,129 @@ maxv.post("/max/repo-sim/refresh", {})
 text = page(maxv, "/max/repo-sim?tab=versions")
 check("a tag whose repo-file is missing is invalid, with the reason", "1.1.0" in text and "not a file in the repo" in text, text[text.find("<table"):][:600])
 
+# Only facts about the commit make a version invalid. A file from a newer format than this server
+# reads, a pinned package that isn't public yet, or a repo history that can't be read right now
+# leaves the tag unread: it is read again at the next sync, never frozen.
+def cli_sync(slug):
+    """`just cli sync`: (ok, output). Not rate-limited, unlike the refresh button and API."""
+    run = subprocess.run(["just", "cli", "sync", slug], capture_output=True, text=True)
+    return run.returncode == 0, run.stdout + run.stderr
+def has_version(v, slug, label):
+    return f'href="/{slug}/{label}"' in v.get(f"/{slug}?tab=versions")[1]
+def retag(cwd, bare, tag):
+    """Commit what changed and (re)point `tag` at it, upstream too."""
+    sh("git", "add", "-A", cwd=cwd); sh("git", *ident, "commit", "-q", "--allow-empty", "-m", tag, cwd=cwd)
+    sh("git", "tag", "-f", tag, cwd=cwd)
+    sh("git", "push", "-q", "--force", bare, "master", f"refs/tags/{tag}", cwd=cwd)
+open(os.path.join(srepo, "data", "blob.txt"), "w").write("data\n")
+good_sim = open(os.path.join(srepo, "runs", "qc0.sim")).read()
+open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(good_sim.replace("format = 3", "format = 99", 1))
+retag(srepo, sbare, "v1.2.0")
+ok, out = cli_sync("max/repo-sim")
+check("a .sim from a newer format leaves its tag unread, to be read again",
+      not ok and "format 99" in out and "tried again" in out, out[-400:])
+check("and stores no version for it", not has_version(maxv, "max/repo-sim", "1.2.0"))
+open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(good_sim)
+retag(srepo, sbare, "v1.2.0")
+ok, out = cli_sync("max/repo-sim")
+check("once the tag holds a file this server reads, it becomes a version", ok and "1 new versions" in out, out[-400:])
+manifest_text = open(os.path.join(srepo, "cactarium-sim.toml")).read()
+open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(manifest_text.replace("format = 1", "format = 99", 1))
+retag(srepo, sbare, "v1.3.0")
+ok, out = cli_sync("max/repo-sim")
+check("a manifest from a newer format leaves its tag unread too", not ok and "format 99" in out, out[-400:])
+open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(manifest_text)
+retag(srepo, sbare, "v1.3.0")
+ok, out = cli_sync("max/repo-sim")
+check("and is read once fixed", ok and "1 new versions" in out, out[-400:])
+def tiny_package(name, owner, arr):
+    """A one-thorn package repo with tag v1.0.0 and one untagged commit after it: (dir, bare, tagged, untagged)."""
+    d = os.path.join(work, name)
+    os.makedirs(os.path.join(d, arr + "Thorn"))
+    for f, t in [("interface.ccl", f"IMPLEMENTS: {arr}Thorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+        open(os.path.join(d, arr + "Thorn", f), "w").write(t)
+    open(os.path.join(d, "cactarium.toml"), "w").write(
+        f'format = 1\n\n[package]\nname = "{name}"\nowners = ["{owner}"]\ndescription = "A package sims pin"\narrangement = "{arr}"\n')
+    sh("git", "init", "-q", "-b", "master", cwd=d)
+    sh("git", "add", "-A", cwd=d); sh("git", *ident, "commit", "-q", "-m", name, cwd=d); sh("git", "tag", "v1.0.0", cwd=d)
+    tagged = sh("git", "rev-parse", "HEAD", cwd=d)
+    open(os.path.join(d, "README.md"), "w").write("later\n")
+    sh("git", "add", "-A", cwd=d); sh("git", *ident, "commit", "-q", "-m", "after the tag", cwd=d)
+    untagged = sh("git", "rev-parse", "HEAD", cwd=d)
+    b = ENV["DEMO_REPOS"] + f"/{name}.git"
+    subprocess.run(["rm", "-rf", b], check=True)
+    sh("git", "clone", "-q", "--bare", d, b, cwd=work)
+    return d, b, tagged, untagged
+
+def pin_sim(name, pins):
+    """A fully specified .sim checking out one thorn from each (repo, arrangement, url, commit)."""
+    th = "!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n" + "".join(
+        f"\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {url}\n!REPO_PATH = $2\n!CHECKOUT =\n{arr}/{arr}Thorn\n"
+        for _, arr, url, _ in pins)
+    repos = "".join(f'\n[[repo]]\nname = "{r}"\nurl = "{url}"\ncommit = "{c}"\n' for r, _, url, c in pins)
+    q = "'" * 3
+    return (f'format = 1\n\n[sim]\nname = "{name}"\nsummary = "The {name} run"\nlicense = "CC0-1.0"\nroot = "Cactus"\n\n'
+            f'[thornlist]\nfilename = "{name}.th"\ntext = {q}\n{th}{q}\n\n'
+            f'[parfile]\nfilename = "{name}.par"\nkind = "par"\ntext = {q}\nActiveThorns = "{name}"\n{q}\n{repos}')
+
+pdir, pbare_pkg, ptagged, puntagged = tiny_package("pinpkg", "max", "PinArr")
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/pinpkg.git", "owner": "max"})
+check("register a package that sims pin", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+psim = os.path.join(work, "pinsim")
+os.makedirs(psim)
+psbare = ENV["DEMO_REPOS"] + "/pinsim.git"
+open(os.path.join(psim, "cactarium-sim.toml"), "w").write('format = 1\n\n[sim]\nname = "pinsim"\nowners = ["max"]\nfile = "pin.sim"\n')
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)]))
+sh("git", "init", "-q", "-b", "master", cwd=psim)
+sh("git", "add", "-A", cwd=psim); sh("git", *ident, "commit", "-q", "-m", "pinsim", cwd=psim); sh("git", "tag", "v1.0.0", cwd=psim)
+subprocess.run(["rm", "-rf", psbare], check=True)
+sh("git", "clone", "-q", "--bare", psim, psbare, cwd=work)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/pinsim.git", "owner": "max"})
+check("register a sim repo pinning a version's commit", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+page(anon, "/max/pinsim/1.0.0")
+# The pinned package's repo goes away for a while, as a host that doesn't answer would.
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", puntagged)]))
+os.rename(pbare_pkg, pbare_pkg + ".away")
+retag(psim, psbare, "v1.1.0")
+ok, out = cli_sync("max/pinsim")
+check("a pin whose repo history can't be read right now leaves the tag unread",
+      not ok and "be checked yet" in out and "max/pinpkg" in out and "tried again" in out, out[-400:])
+check("with no version stored for it", not has_version(maxv, "max/pinsim", "1.1.0"))
+os.rename(pbare_pkg + ".away", pbare_pkg)
+back = time.time()  # a failed history read is remembered for a minute
+# A pinned package that is registered but not public yet: the tag waits for it.
+text = page(maxv, "/admin/users")
+bid = re.search(r'href="/bob">bob</a>.*?action="/admin/users/(\d+)"', text, re.S).group(1)
+maxv.post(f"/admin/users/{bid}", {"action": "untrust"})
+_, qbare, qtagged, _ = tiny_package("pendpkg", "bob", "PendArr")
+bob = Visitor("bob")
+bob.get("/new/repo")
+s, text, _ = bob.post("/new/repo", {"url": REPOS + "/pendpkg.git", "owner": ""})
+check("bob registers a package that waits for review", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged),
+                                                                   ("pendpkg", "PendArr", REPOS + "/pendpkg.git", qtagged)]))
+retag(psim, psbare, "v1.2.0")
+ok, out = cli_sync("max/pinsim")
+check("a pin to a package awaiting review leaves the tag unread", not ok and "public yet" in out, out[-400:])
+check("approve bob's package", decide("bob/pendpkg", "approve") == 303)
+time.sleep(max(0, 62 - (time.time() - back)))
+ok, out = cli_sync("max/pinsim")
+# (The dev site's poller may have read one of them first.)
+check("once the repo answers and the package is public, both tags are read",
+      ok and has_version(anon, "max/pinsim", "1.1.0") and has_version(anon, "max/pinsim", "1.2.0"), out[-400:])
+page(anon, "/max/pinsim/1.1.0?tab=pins", contains="max/pinpkg")
+page(anon, "/max/pinsim/1.2.0?tab=pins", contains="bob/pendpkg@1.0.0")
+# Facts about the commit still make it invalid: a pin to a repo nobody registered.
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged),
+                                                                   ("nobody", "NoArr", REPOS + "/nobody.git", ptagged)]))
+retag(psim, psbare, "v1.3.0")
+ok, out = cli_sync("max/pinsim")
+text = page(maxv, "/max/pinsim?tab=versions")
+check("a pin to a repo no package was registered for is an invalid version",
+      ok and 'href="/max/pinsim/1.3.0"' in text and "the repo of any package" in text, out[-300:] + text[text.find('<table'):][:600])
+
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
 head = git("carpetx", "rev-parse", "master")
