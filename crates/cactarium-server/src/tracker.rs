@@ -424,8 +424,9 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
 /// fix to it (dependencies added, a thorn list corrected) can apply to versions already published.
 /// Each version keeps its commit and tree; its manifest, thorns and claims are replaced by what a
 /// fresh ingest of that commit with the current overlay gives, in one transaction. A version that
-/// can't be fetched or doesn't fit the overlay is left as it was and reported. Invalid versions
-/// are skipped: they are never served. Returns (versions re-read, versions left with why).
+/// can't be fetched or doesn't fit the overlay is left as it was and reported. An invalid version
+/// (never served) that fits the corrected overlay becomes valid, with its review decided as for a
+/// new release the admin vouches for. Returns (versions re-read, versions left with why).
 pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> AppResult<(usize, Vec<String>)> {
     let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
     if !entry.curated || repo.overlay_manifest.is_none() {
@@ -439,9 +440,6 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
     let (mut done, mut left) = (0, Vec::new());
     for v in model::all_versions(state, entry.id).await? {
         let label = v.label();
-        if v.state == "invalid" {
-            continue;
-        }
         if let (Some(since), Ok(tv)) = (&since, label.parse::<TrackedVersion>())
             && tv.version < *since
         {
@@ -468,6 +466,9 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
                 continue;
             }
         };
+        // An invalid version was never served; once it fits, it is reviewed like a new release.
+        let revived = v.state == "invalid";
+        let review = if revived { Some(publish::release_review(state, entry, Some(admin)).await?) } else { None };
         let mut tx = state.db.begin().await?;
         for table in ["thorns", "claims"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE version_id = $1"))
@@ -475,12 +476,22 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query("UPDATE versions SET manifest = $2, readme_html = $3 WHERE id = $1")
-            .bind(v.id)
-            .bind(&p.manifest_json)
-            .bind(&p.readme_html)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE versions SET manifest = $2, readme_html = $3, tree = $4, review = COALESCE($5, review),
+                state = CASE WHEN state = 'invalid' THEN 'ok' ELSE state END,
+                invalid_reason = CASE WHEN state = 'invalid' THEN NULL ELSE invalid_reason END
+             WHERE id = $1",
+        )
+        .bind(v.id)
+        .bind(&p.manifest_json)
+        .bind(&p.readme_html)
+        .bind(&co.tree)
+        .bind(review)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(r) = review {
+            publish::submit_release(&mut tx, entry, v.id, r, Some(admin)).await?;
+        }
         store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
         crate::audit::audit_with(
             &mut tx,
