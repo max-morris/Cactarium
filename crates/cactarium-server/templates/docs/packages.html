@@ -43,7 +43,7 @@ note = "needs the mixed-precision flesh"
 [[caveat]]
 thorn = "TestReal2"
 note = "needs _Float16 (GCC 12 or newer)"</pre>
-<p>Only <code>format = 1</code> and a <code>[package]</code> with <code>name</code> and <code>owners</code> are required. The reader is strict: an unknown key is an error, and the tag becomes an invalid version with that message. A <code>format</code> newer than this Cactarium reads is not a fact about the commit: the tag is <a href="/docs/publishing#retried">left unread and tried again</a> until the Cactarium is upgraded.</p>
+<p>Only <code>format = 1</code> and a <code>[package]</code> with <code>name</code> and <code>owners</code> are required. (Format 2 is also read; only a <a href="/docs/sims#multi">multi-sim</a> <code>cactarium-sim.toml</code> needs it.) The reader is strict: an unknown key is an error, and the tag becomes an invalid version with that message. A <code>format</code> newer than this Cactarium reads is not a fact about the commit: the tag is <a href="/docs/publishing#retried">left unread and tried again</a> until the Cactarium is upgraded.</p>
 
 <h2 id="package">[package]</h2>
 <div class="table-box"><table>
@@ -67,7 +67,7 @@ note = "needs _Float16 (GCC 12 or newer)"</pre>
     <tr><td><code>since</code></td><td>A version, such as <code>"2026.5.0"</code>: release tags below it aren't versions, for example releases from before the repo carried this file. Default: every release tag counts.</td></tr>
   </tbody>
 </table></div>
-<p>The Cactarium reads <code>tag-pattern</code> and <code>since</code> from the manifest on the default branch when the repo is registered. After that it takes them from the newest version's manifest, so a change takes effect once a version that carries it has been read.</p>
+<p>The Cactarium reads <code>tag-pattern</code> and <code>since</code> from the manifest when the repo is registered: from the default branch, or the tag named when registering. After that, a new version's manifest can move <code>since</code>, but a changed <code>tag-pattern</code> takes effect only when someone with the entry <a href="/docs/publishing#switching">re-reads its tag rule</a>, and a tag counts as a version only if the manifest inside it reads it the same way (<a href="/docs/publishing#self-consistency">why</a>). On a repo that also carries a stack or sims, each follows its own rule; without patterns they share <code>vX.Y.Z</code> tags (<a href="/docs/publishing#tags">how tags become versions</a>).</p>
 
 <h2 id="tracks">[tracks.NAME]</h2>
 <p>A track is a tag prefix: <code>mixed-precision/v1.2.0</code> is version 1.2.0 on track <code>mixed-precision</code> (see <a href="/docs/versions#tracks">tracks</a>). A track exists as soon as a tag uses it; this table only describes it.</p>

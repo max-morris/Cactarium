@@ -45,8 +45,26 @@ migrates and restarts.
 
 Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
-[--owner]`, `org list`, `register`, `publish-sim`, `sync`, `token`. Create the `et` organization
-with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
+[--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>]`, `check <url> --tag <tag>
+[--commit <ref>]`, `publish-sim`, `sync`, `reread-rule <user> <owner/name> [--tag <tag>]`,
+`reread <admin> <owner/name> <version>`, `move-repo`, `reapply`, `token`. Create the `et`
+organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
+
+- `register` reads each new entry at its newest tag (or exactly `--tag`) before writing anything,
+  and creates every new entry in one transaction; on a repo that already has entries it adds only
+  the missing ones. `check` is the same reading as a dry run (nothing written), also for tags that
+  don't exist yet (`--commit` names the commit or branch they would name).
+- `reread-rule` makes an entry follow the tag rule of its manifest on the default branch (or at
+  `--tag`): the only way an entry switches tag schemes. `reread` reads an invalid version of a
+  non-curated repo entry again (valid if it reads cleanly now; removed if its tag isn't the
+  entry's).
+- `move-repo` moves every entry on the repo together.
+- Rollback: a binary from the retry-not-freeze release on starts on a database a later release
+  migrated, and leaves unread (never freezes) the tags it can't read: format-2 manifests,
+  format-4 sims, a tag without an entry's manifest on a repo with several entries. Under it, a
+  multi-sim entry's pages fail to render (its stored sims are format 4), so hide those entries
+  (Admin, Entries, Hide) for the duration. Before rolling back further than that release, hiding
+  every multi-sim entry is required: hidden entries aren't synced.
 
 ### First deploy
 
@@ -72,6 +90,13 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
    `carpet-stack`, `carpetx-stack` and `cottonmouth-stack`.
    Then the packages that carry their own `cactarium.toml` rather than a curated one:
    `just cli register --owner et <you> https://github.com/EinsteinToolkit/Cottonmouth`.
+   Cottonmouth's example sims (`cactarium-sim.toml` with `[sim.files]` and
+   `tag-pattern = "sim-v{major}.{minor}.{patch}"`, not on its `main`): first, before tagging,
+   `just cli check https://github.com/EinsteinToolkit/Cottonmouth --tag sim-v1.0.0 --commit <commit>`
+   (the commit's pins must all be public packages, and `et/cottonmouth`'s stored URL must match the
+   pins'), then, once `sim-v1.0.0` is pushed,
+   `just cli register --owner et --tag sim-v1.0.0 <you> https://github.com/EinsteinToolkit/Cottonmouth`,
+   which adds only `et/cottonmouth-sims`.
 7. The starter sim: create a token on the site's Settings page, `cactup login --token <token>`, then,
    in cactarium-curate, `cactup sim publish sims/wavetoy.sim et/wavetoy`. CactUp talks to
    `https://cactarium.cct.lsu.edu` unless `CACTARIUM_URL` or the `cactarium-url` knob says otherwise.

@@ -16,28 +16,106 @@
 <ol class="steps">
   <li>Commit a manifest at the repo root: <code>cactarium.toml</code> for a package, <code>cactarium-stack.toml</code> for a stack, <code>cactarium-sim.toml</code> for a sim. A repo may carry any of the three; each becomes its own entry.</li>
   <li>List the name you publish under (yours, or your organization's) in the manifest's <code>owners</code>.</li>
-  <li>Push a version tag: <code>v1.0.0</code>, or <code>mixed-precision/v1.0.0</code> on a track. See <a href="/docs/versions">Versions and tracks</a>; a manifest can also name a different tag scheme.</li>
+  <li>Push a version tag: <code>v1.0.0</code>, or <code>mixed-precision/v1.0.0</code> on a track. See <a href="/docs/versions">Versions and tracks</a>; a manifest can also name a different tag scheme, and when a repo carries several manifests, <a href="#tags">each follows its own</a>.</li>
   <li>On your dashboard, choose <a href="/new/repo">Register a repo</a> and paste the repo's <code>https://</code> URL.</li>
 </ol>
 
 <h3 id="owners">Owners: proof that you control the repo</h3>
 <p>The Cactarium never asks a forge who may push to a repo. Instead, each manifest names in <code>owners</code> the Cactarium users or organizations allowed to publish it. Only someone who can push to the repo can put a name there, so a manifest that names you proves that you control the repo. This works the same on GitHub, GitLab, Bitbucket or any other public host.</p>
-<p>When you register, the name you publish under must be in the <code>owners</code> of every manifest the repo carries at its newest version tag. Every later tag is checked again: a tag whose manifest no longer names the entry's owner is not published.</p>
+<p>When you register, the name you publish under must be in the <code>owners</code> of every manifest being registered, as it is at the tag it is registered from. Every later tag is checked again: a tag whose manifest no longer names the entry's owner is not published.</p>
 
 <h3 id="registering">What registering does</h3>
-<p>The Cactarium reads the repo at its newest version tag (on the default track if it has one), creates one entry per manifest found there, named after the manifest's <code>name</code>, and then reads every version tag. Each tag becomes a version: the Cactarium checks out exactly the tagged commit, reads the manifest and the files it names, and freezes the commit. Tags that already exist when you register count as published by you, which matters for <a href="/docs/review">review</a>.</p>
+<p>The Cactarium looks at the manifests on the repo's default branch. For each one it finds that manifest's newest version tag, under that manifest's own <a href="#tags">tag rule</a> (on the default track if it has one), and reads the manifest there; each becomes one entry, named after the manifest's <code>name</code>. (A repo whose default branch carries no manifest at all is read at its newest <code>vX.Y.Z</code> tag instead.) Then it reads every version tag of each entry. Each tag becomes a version: the Cactarium checks out exactly the tagged commit, reads the manifest and the files it names, and freezes the commit. Tags that already exist when you register count as published by you, which matters for <a href="/docs/review">review</a>.</p>
+<p>Registering is all or nothing:</p>
+<ul>
+  <li><strong>Read first.</strong> Before anything is written, each new entry is read at its newest tag exactly as its first version will be: the manifest, the thorns, the stack's sources, every sim. If one fails, the error names the entry and the tag, and nothing is registered, not even the entries that read fine. Fix it, push a new tag, and register again. (A sim pin that <a href="#retried">can't be checked yet</a>, such as one to a package registered in the same go, doesn't fail it: that tag simply waits.)</li>
+  <li><strong>One transaction.</strong> Every new entry is created, attached to the repo and recorded in the audit log together, or none is.</li>
+  <li><strong>Only what is missing.</strong> Registering a repo that already has entries adds the manifests that aren't registered yet, and leaves the others alone. They must all be under the same owner. So a repo that gains a <code>cactarium-sim.toml</code> next to its package is registered again to add the sims.</li>
+</ul>
+
+<h3 id="register-tag">Registering at a tag</h3>
+<p>Without a tag, the manifests come from the default branch. When a manifest isn't there yet (say, the sims live on a release branch, or the default branch is behind), name the tag to read: the <em>Tag</em> field of <a href="/new/repo">Register a repo</a>, or on the server's command line</p>
+<pre class="code">just cli register --owner et &lt;admin&gt; --tag sim-v1.0.0 https://github.com/EinsteinToolkit/Cottonmouth</pre>
+<p>The manifests at exactly that tag are read, and that commit is the one that becomes the first version. Each manifest there that isn't registered yet must read the tag as one of its versions under its own rule; one that follows another scheme is refused, so register it from one of its own tags.</p>
+
+<h3 id="check">Checking a release before you tag it</h3>
+<p>The site's operator can run a dry run of the same reading against the live site, without writing anything:</p>
+<pre class="code">just cli check https://github.com/EinsteinToolkit/Cottonmouth --tag sim-v1.0.0
+just cli check https://github.com/EinsteinToolkit/Cottonmouth --tag sim-v1.1.0 --commit main</pre>
+<p>It reports what registering would add and how each new entry's version would read, and, for every entry already on the repo, whether the tag is one of its versions and how it would read: cleanly, as an invalid version (with the reason), as not its own, or waiting for something (a pinned package awaiting review, say). With <code>--commit</code> (a branch or a full commit id), a tag that doesn't exist yet is read as if it named that commit, so a release can be checked before it is tagged. It exits non-zero if anything would be invalid.</p>
 <p>Repo URLs must be public <code>https://</code> URLs without credentials in them. The code stays in your repo. The Cactarium keeps only what it read: the manifest, the facts in each thorn's CCL files, the README, the frozen thornlist of a stack, or the <code>.sim</code> file of a sim.</p>
 <p>A tag whose manifest is missing or wrong still becomes a version, marked <em>invalid</em> with the reason, so it isn't fetched again on every check. Invalid versions are never served. Fix the manifest and push a new tag.</p>
 <p id="retried">Only facts about the tagged commit make a version invalid. When the trouble is not the commit's, the tag is left unread and tried again at every check until it can be read, and the reason shows as the last check's error on the entry's page: the repo host didn't answer, the manifest or <code>.sim</code> uses a newer format than this Cactarium reads yet, a repo a sim pins can't be read right now, the pinned commit isn't in that repo yet (pushed after the tag), or the package for a pinned repo is registered but not public yet (awaiting review). Nothing is frozen until the tag can be read, so pushing the missing commit, or the package's approval, is all it takes.</p>
+<p>Facts about the commit, on the other hand, are frozen: a malformed manifest or <code>.sim</code>, a file it names that isn't there, a tarball pin, a pin to a repo no package was ever registered for. An invalid version is never served, so an admin can read one again later (Admin, Entries, <em>Re-read invalid version</em>, or <code>just cli reread &lt;admin&gt; &lt;owner/name&gt; &lt;version&gt;</code>), for an entry released from its repo: if the commit reads cleanly now (the pinned repo has since been registered, say), the version becomes valid and is reviewed like a newly pushed tag; if the tag turns out not to be the entry's at all (see <a href="#not-ours">tags that aren't the entry's</a>), the invalid version is removed. Curated packages use <a href="/docs/curated">re-apply</a> instead.</p>
 
 <h3 id="new-tags">New tags: polling, webhooks and "Check for new tags now"</h3>
 <p>The Cactarium finds later tags in three ways:</p>
 <ul>
   <li><strong>Polling.</strong> It checks every registered repo for new, moved and deleted tags on a fixed interval, every four hours unless the site is configured otherwise.</li>
-  <li><strong>A webhook.</strong> On a package's page, people who manage it find a payload URL and a secret under <em>Manage</em>, <em>Webhook for instant updates</em>. On GitHub, add them under Settings, Webhooks, with content type <code>application/json</code> and "Just the push event"; each push then makes the Cactarium check the repo at once. GitLab ("Tag push events", with the secret as the token) and Bitbucket use the same URL with <code>gitlab</code> or <code>bitbucket</code> in place of <code>github</code>, as in <code>/hooks/gitlab/…</code>.</li>
+  <li><strong>A webhook.</strong> On a package's page, people who manage it find a payload URL and a secret under <em>Manage</em>, <em>Webhook for instant updates</em>. On GitHub, add them under Settings, Webhooks, with content type <code>application/json</code> and "Just the push event"; each push then makes the Cactarium check the repo at once. GitLab ("Tag push events", with the secret as the token) and Bitbucket use the same URL with <code>gitlab</code> or <code>bitbucket</code> in place of <code>github</code>, as in <code>/hooks/gitlab/…</code>. A repo that carries several entries needs only one hook, any entry's: a delivery checks every entry on the repo.</li>
   <li><strong>Check for new tags now.</strong> This button, in the <em>Manage</em> box of a package or a repo-backed stack, runs the same check on demand. Scripts and CactUp can call <code>POST /api/v1/packages/{owner}/{name}/refresh</code> with an API token (see <a href="/docs/api#refresh">the API</a>).</li>
 </ul>
 <p>One check reads at most 50 new tags; the rest follow on the next check. If a check fails, the <em>Manage</em> box shows why.</p>
+
+<h2 id="tags">One repo, several entries: how tags become versions</h2>
+<p>A repo can carry a package (<code>cactarium.toml</code>), a stack (<code>cactarium-stack.toml</code>) and sims (<code>cactarium-sim.toml</code>), each its own entry. Every entry has its own <strong>tag rule</strong>, read from its own manifest: which tags are its versions. At each of those tags, the entry reads <em>its own</em> manifest file and nothing else, so one tag can be a version of one entry, of several, or of none. The rule is shown under <em>Manage</em> on each entry's page.</p>
+
+<h3 id="shared">No tag-pattern: every kind shares vX.Y.Z tags</h3>
+<p>A manifest without <code>tag-pattern</code> follows the usual tags: <code>vX.Y.Z</code>, and <code>track/vX.Y.Z</code> on a track. When none of a repo's manifests gives a pattern, they all follow the same tags, and <strong>one tag releases every kind the repo carries at that commit</strong>, each read from its own manifest:</p>
+<pre class="code">cactarium.toml          [package] name = "cottonmouth"
+cactarium-stack.toml    [stack]   name = "cottonmouth-stack"
+cactarium-sim.toml      [sim]     name = "cottonmouth-sims"
+
+git tag v1.2.0   →   et/cottonmouth@1.2.0, et/cottonmouth-stack@1.2.0 and et/cottonmouth-sims@1.2.0</pre>
+<p>A kind whose manifest isn't at that commit simply has no version there: on a repo with several entries, a tag without an entry's manifest is <a href="#not-ours">not that entry's</a>, rather than a broken version of it. So a repo that adds its sims manifest at v1.3.0 gets sims versions from v1.3.0 on, with no <code>since</code> needed.</p>
+
+<h3 id="own-pattern">A kind with a tag-pattern follows only its pattern</h3>
+<p>To release one kind on its own schedule, give its manifest a <code>tag-pattern</code>. That kind then follows only tags matching the pattern, and the kinds without one stay on <code>vX.Y.Z</code>. Cottonmouth releases its example sims separately from the package:</p>
+<pre class="code"># cactarium-sim.toml
+format = 2
+
+[sim]
+name = "cottonmouth-sims"
+owners = ["et"]
+tag-pattern = "sim-v{major}.{minor}.{patch}"
+
+[sim.files]
+qc0-z4c = "examples/sims/qc0-z4c.sim"
+mag-tov = "examples/sims/mag-tov.sim"</pre>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Tag</th><th scope="col"><code>et/cottonmouth</code> (no pattern)</th><th scope="col"><code>et/cottonmouth-sims</code> (<code>sim-v{major}.{minor}.{patch}</code>)</th></tr></thead>
+  <tbody>
+    <tr><td><code>v1.3.0</code></td><td>version 1.3.0</td><td>not one of its tags, even if the commit carries <code>cactarium-sim.toml</code></td></tr>
+    <tr><td><code>sim-v1.0.0</code></td><td>not one of its tags</td><td>version 1.0.0, with every sim <code>[sim.files]</code> lists there</td></tr>
+    <tr><td><code>mixed-precision/v1.0.0</code></td><td>1.0.0 on track <code>mixed-precision</code></td><td>not one of its tags (a pattern's versions are all on the default track)</td></tr>
+  </tbody>
+</table></div>
+
+<h3 id="same-pattern">Kinds with the same pattern share its tags</h3>
+<p>Two manifests giving the same <code>tag-pattern</code> share those tags, just as manifests without one share <code>vX.Y.Z</code>. With <code>tag-pattern = "rel-{major}.{minor}.{patch}"</code> in both <code>cactarium-stack.toml</code> and <code>cactarium-sim.toml</code>, and none in <code>cactarium.toml</code>, the tag <code>rel-2.0.0</code> releases the stack and the sims at 2.0.0, and <code>v1.1.0</code> releases only the package.</p>
+
+<h3 id="no-slash">Never sim/v…</h3>
+<p>Don't tag a kind's releases <code>sim/v1.0.0</code> (or <code>stack/v…</code>). A slash is how a tag names a <a href="/docs/versions#tracks">track</a>: under the usual rule, <code>sim/v1.0.0</code> is version 1.0.0 <em>on a track named sim</em>, so every kind without a pattern on the repo (the package, typically) takes it as a release of its own. Use a pattern with a dash or another separator, such as <code>sim-v{major}.{minor}.{patch}</code>, which no other rule reads.</p>
+
+<h3 id="self-consistency">A tag counts only if the manifest inside agrees</h3>
+<p>The rule an entry keeps picks its candidate tags. A candidate becomes a version only if <strong>the manifest inside that tag reads the tag the same way</strong>, under its own <code>tag-pattern</code>. This is what keeps a later change in a manifest from pulling an entry onto another kind's tags. Say <code>cottonmouth-sims</code> follows <code>sim-vX.Y.Z</code>, and a later commit drops <code>tag-pattern</code> from <code>cactarium-sim.toml</code>:</p>
+<ul>
+  <li>the next <code>sim-v1.3.0</code> tag is still a candidate for the sims, but the manifest inside follows <code>vX.Y.Z</code> now and doesn't read <code>sim-v1.3.0</code> at all, so the tag is <em>not the entry's</em>: it is recorded as such, never frozen, and its rule is not adopted;</li>
+  <li>the sims keep following <code>sim-vX.Y.Z</code>; the package's <code>v</code> tags never become sims versions behind anyone's back.</li>
+</ul>
+<p>Registering checks the same thing: each new entry's manifest must read the tag it is registered from as one of its versions.</p>
+
+<h3 id="not-ours">Tags that aren't the entry's</h3>
+<p>A candidate tag is recorded as <em>not this entry's</em> instead of becoming an invalid version when the manifest inside reads it under another rule (above), or when the repo carries other entries and the tag has no manifest for this one: it is another kind's release, or from before this kind's manifest existed. The entry's managers see these tags, with the reason, under <em>Manage</em>, <em>Tags that aren't this entry's</em>. They are judged again if the tag moves, and when the entry's tag rule is re-read. A repo with a single entry keeps the old behavior: a tag without its manifest is an invalid version, which is what <code>since</code> is for.</p>
+
+<h3 id="switching">Switching schemes</h3>
+<p>Because a tag never changes an entry's rule on its own, switching schemes (adding, changing or removing a <code>tag-pattern</code>) is explicit:</p>
+<ol class="steps">
+  <li>Change <code>tag-pattern</code> in the manifest, and commit it.</li>
+  <li>On the entry's page, under <em>Manage</em>, <em>Switch tag schemes</em>, choose <em>Re-read tag rule</em>: from the default branch, or, when the new manifest isn't there yet, from a tag that carries it (which must be one of its versions under the new rule). Admins have the same button on Admin, Entries, and the operator has <code>just cli reread-rule &lt;user&gt; &lt;owner/name&gt; [--tag &lt;tag&gt;]</code>.</li>
+  <li>The entry follows the new rule from then on; tags recorded as not its own are judged again under it.</li>
+</ol>
+<p>Number the new scheme's versions above the old ones. A new version that sorts below a version taken from a different tag form (a new <code>v1.1.5</code> under an earlier <code>sim-v1.2.0</code>, say) is flagged for reviewers, because ranges keep choosing the higher one. A new version's manifest can move <code>since</code> on its own; only the tag form needs the re-read.</p>
 
 <h2 id="upload">By upload</h2>
 <h3 id="upload-stack">Publish a stack</h3>
