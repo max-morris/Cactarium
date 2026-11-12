@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::audit::audit;
+use crate::claims::ClaimRec;
 use crate::auth::{SignedIn, User, random_token, sha256};
 use crate::error::{AppError, AppResult};
 use crate::model::{self, ENTRY_COLS, Entry, fmt_date, fmt_time, semver_sort_key};
@@ -342,22 +343,8 @@ pub async fn cut_release(
         own,
     )
     .await?;
-    for (kind, list) in [
-        ("depends-on", &m.depends_on),
-        ("works-with", &m.works_with),
-        ("incompatible-with", &m.incompatible_with),
-    ] {
-        for c in list {
-            sqlx::query("INSERT INTO claims (version_id, kind, target_owner, target_name, range, note) VALUES ($1, $2, $3, $4, $5, $6)")
-                .bind(vid)
-                .bind(kind)
-                .bind(c.target.owner.as_str())
-                .bind(c.target.name.as_str())
-                .bind(c.range.as_ref().map(|r| r.to_string()))
-                .bind(&c.note)
-                .execute(&mut *tx)
-                .await?;
-        }
+    for c in ClaimRec::of_manifest(&m) {
+        c.insert(&mut tx, vid).await?;
     }
     publish::submit_release(&mut tx, &entry, vid, review, Some(user)).await?;
     crate::audit::audit_with(

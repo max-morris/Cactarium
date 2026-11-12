@@ -5,6 +5,7 @@
 
 mod audit;
 mod auth;
+mod claims;
 mod config;
 mod curate;
 mod error;

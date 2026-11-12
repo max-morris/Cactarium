@@ -21,13 +21,16 @@ description = "CCTK_REAL4/REAL2 storage; needs a mixed-precision flesh"
 [[fork-of]]
 target = "et/carpetx"
 
-[[depends-on]]
-target = "max-morris/cactus"
-range = "mixed-precision:^1"
+[[dependency]]
+target = "max-morris/cactus@mixed-precision:^1"
+
+[[dependency]]
+target = "et/amrex@^2026.5"
+needs = ["AMReX"]
+needed-by = ["CarpetX", "Loop"]
 
 [[works-with]]
-target = "max-morris/carpetx-mp"
-range = "^1"
+target = "max-morris/carpetx-mp@^1"
 
 [[incompatible-with]]
 target = "et/et-stack"
@@ -49,7 +52,8 @@ note = "needs _Float16 (GCC 12 or newer)"</pre>
     <tr><td><code>homepage</code></td><td>A web page about the package, recorded with each version's manifest.</td></tr>
     <tr><td><code>contact</code></td><td>Where to go for help or to report a problem: an <code>https://</code> URL (an issue tracker, a forum) or a <code>mailto:</code> address. Shown on the package page as "Help and problems" and returned by the API. Default: the repo.</td></tr>
     <tr><td><code>readme</code></td><td>The README to show on the package page, a path relative to the repo root. It is rendered as Markdown and sanitized. Default: <code>README.md</code>.</td></tr>
-    <tr><td><code>arrangement</code></td><td>The arrangement the thorns belong to, for a repo whose thorns sit at its root, or that is itself one thorn (see <a href="#layouts">repo layouts</a>). A repo laid out as <code>Arrangement/Thorn/</code> doesn't need it.</td></tr>
+    <tr><td><code>arrangement</code></td><td>The arrangement every thorn belongs to, whatever folder it sits in: needed for a repo whose thorns sit at its root, that is itself one thorn, or whose folders don't name the arrangement (see <a href="#layouts">repo layouts</a>). A repo laid out as <code>Arrangement/Thorn/</code> doesn't need it.</td></tr>
+    <tr><td><code>root</code></td><td>Where the thorns are, relative to the repo root, when not at it: the folder holding the <code>Arrangement/Thorn/</code> (or <code>Thorn/</code>) directories, such as <code>"Auxiliary/Cactus"</code> for Kranc. Thorns elsewhere in the repo aren't published. Default: the repo root.</td></tr>
     <tr><td><code>thorns</code></td><td>The thorns to publish, by directory name, such as <code>["CarpetX", "Loop"]</code>. Thorns found but not listed are left out. A repo that is itself one thorn names that thorn here. Default: every directory with an <code>interface.ccl</code>.</td></tr>
     <tr><td><code>default-track</code></td><td>The track the package page shows first: a track name, or <code>"default"</code> for the unprefixed tags. Only the page uses it: a reference without a track always means the unprefixed track. Default: the unprefixed track.</td></tr>
     <tr><td><code>tag-pattern</code></td><td>How release tags become versions when they aren't <code>vX.Y.Z</code>, such as <code>"ET_{major}_{minor}_v{patch}"</code>. With a pattern, only the tags it matches are versions, all on the default track. See <a href="/docs/versions#tag-pattern">tag patterns</a>. Default: <code>vX.Y.Z</code> and <code>track/vX.Y.Z</code>.</td></tr>
@@ -67,30 +71,48 @@ note = "needs _Float16 (GCC 12 or newer)"</pre>
   </tbody>
 </table></div>
 
+<h2 id="dependencies">[[dependency]]</h2>
+<p>A thorn's CCL already says <em>what</em> it needs: the implementations it inherits from or is friends with, the capabilities and thorns it requires, the functions it requires. A dependency says <em>where that comes from</em>: which package, at which versions or commit. It never repeats the CCL.</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Field</th><th scope="col">What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>target</code><br><span class="small muted">required</span></td><td>The package (or stack) depended on: <code>owner/name</code> for any version on its default track, <code>owner/name@RANGE</code> for a <a href="/docs/versions">range</a> such as <code>^2026.5</code> or <code>mixed-precision:^1</code>, or <code>owner/name#SHA</code> for one commit, full or abbreviated. Name thorns in <code>needs</code>, not here.</td></tr>
+    <tr><td><code>needs</code></td><td>Thorns of the target that are needed whatever the CCL says, such as <code>["CarpetX"]</code>: to choose among packages that provide the same implementation (both Carpet and CarpetX implement <code>Driver</code>), or for a need the CCL can't express, such as including a header by path. Default: whichever of the target's thorns the CCL requirements resolve to.</td></tr>
+    <tr><td><code>needed-by</code></td><td>Thorns of this package the dependency is for, such as <code>["CarpetPETSc"]</code>; a version whose manifest names a thorn it doesn't publish is invalid. Default: every thorn. Only a package has thorns, so a stack's dependencies can't use it.</td></tr>
+    <tr><td><code>note</code></td><td>Free text shown with the dependency.</td></tr>
+  </tbody>
+</table></div>
+<p>The package page lists dependencies under <em>Compatibility</em>, and the API returns them with the claims (kind <code>dependency</code>).</p>
+
 <h2 id="claims">Claims</h2>
-<p>Claims declare how the package relates to other entries. The Cactarium shows them under <em>Compatibility</em> on the package page and returns them from the API. They are statements, not instructions: nothing resolves them into a build.</p>
+<p>Claims declare how the package relates to other entries. The Cactarium shows them under <em>Compatibility</em> on the package page and returns them from the API. They are statements, not instructions.</p>
 <div class="table-box"><table>
   <thead><tr><th scope="col">Table</th><th scope="col">Fields</th><th scope="col">Means</th></tr></thead>
   <tbody>
-    <tr><td><code>[[fork-of]]</code></td><td><code>target</code>, <code>note</code></td><td>This package is a fork of the <code>target</code> package. It is listed under <em>Forks</em> on the upstream's page, with a link to <a href="/docs/finding#forks">compare the two</a>.</td></tr>
-    <tr><td><code>[[depends-on]]</code></td><td><code>target</code>, <code>range</code>, <code>note</code></td><td>This package needs the target package or stack.</td></tr>
-    <tr><td><code>[[works-with]]</code></td><td><code>target</code>, <code>range</code>, <code>note</code></td><td>Known to work with the target.</td></tr>
-    <tr><td><code>[[incompatible-with]]</code></td><td><code>target</code>, <code>range</code>, <code>note</code></td><td>Known not to work with the target.</td></tr>
+    <tr><td><code>[[fork-of]]</code></td><td><code>target</code>, <code>note</code></td><td>This package is a fork of the <code>target</code> package, and a drop-in replacement for it at the versions <code>target</code> names. It is listed under <em>Forks</em> on the upstream's page, with a link to <a href="/docs/finding#forks">compare the two</a>; see <a href="#forks">Forks as replacements</a>.</td></tr>
+    <tr><td><code>[[works-with]]</code></td><td><code>target</code>, <code>note</code></td><td>Known to work with the target.</td></tr>
+    <tr><td><code>[[incompatible-with]]</code></td><td><code>target</code>, <code>note</code></td><td>Known not to work with the target.</td></tr>
   </tbody>
 </table></div>
-<p><code>target</code> is a bare <code>owner/name</code>; versions go in <code>range</code>. A range is a version range on a track, such as <code>^1</code>, <code>mixed-precision:^1.2</code>, or a bare track name, meaning any version on that track. Without <code>range</code>, the claim covers every version on the target's default track. <code>note</code> is free text shown with the claim.</p>
+<p>Every claim takes a target as a dependency does: <code>owner/name</code>, <code>owner/name@RANGE</code> or <code>owner/name#SHA</code>. A range is a version range on a track, such as <code>^1</code>, <code>mixed-precision:^1.2</code>, or a bare track name, meaning any version on that track. Without one, the claim covers every version on the target's default track. Manifests written before ranges moved into <code>target</code> give them as a separate <code>range</code> key; that still reads, but not together with a range in <code>target</code>. <code>note</code> is free text shown with the claim.</p>
+
+<h2 id="forks">Forks as replacements</h2>
+<p>A fork says which versions of its upstream it replaces: <code>target = "et/carpet@~2026.5"</code> for the 2026.5 series, <code>et/carpet#abc1234</code> for the one commit it was forked from, or a bare <code>et/carpet</code> for every version on the default track. Anything that depends on the upstream, whether a package, a stack or a sim, can then use the fork instead, as long as some published version of the upstream is both one the dependency accepts and one the fork replaces. A sim pinned to <code>et/carpet@2026.5.1</code> takes a fork of <code>~2026.5</code>; a dependency on <code>et/carpet@^2027</code> doesn't. A dependency on one commit takes only a fork of that commit.</p>
+<p>A fork and its upstream are never installed together: they share thorn names. A fork is used only when someone chooses it, never in place of the upstream on its own, and its own dependencies then stand in for the upstream's. Reviewers see a warning when a fork lacks thorns its upstream has, since it isn't a full drop-in then.</p>
 
 <h2 id="caveat">[[caveat]]</h2>
 <p>A note attached to one thorn, such as a platform requirement. <code>thorn</code> names the thorn and <code>note</code> says what to know. The package page marks the thorn on its <em>Thorns</em> tab and lists the note under <em>Compatibility</em>.</p>
 
 <h2 id="layouts">Repo layouts</h2>
-<p>A thorn is a directory with an <code>interface.ccl</code>. The Cactarium looks for thorns at three depths and needs to be told the arrangement when the path doesn't give it:</p>
+<p>A thorn is a directory with an <code>interface.ccl</code>. The Cactarium looks for thorns at three depths below the repo root (or its <code>root</code>) and needs to be told the arrangement when the path doesn't give it:</p>
 <div class="table-box"><table>
   <thead><tr><th scope="col">Layout</th><th scope="col">The manifest needs</th></tr></thead>
   <tbody>
     <tr><td><code>Arrangement/Thorn/</code>, one or more arrangements</td><td>Nothing: the path names both.</td></tr>
     <tr><td><code>Thorn/</code> at the root: the repo is one arrangement</td><td><code>arrangement = "CarpetX"</code></td></tr>
     <tr><td>The repo root is itself one thorn</td><td><code>arrangement</code>, and <code>thorns</code> naming that one thorn</td></tr>
+    <tr><td>Thorns below a folder of the repo (Kranc's <code>Auxiliary/Cactus/KrancNumericalTools/GenericFD</code>)</td><td><code>root = "Auxiliary/Cactus"</code>, then whichever of the rows here applies from there</td></tr>
+    <tr><td><code>Folder/Thorn/</code>, where the folder isn't the arrangement (GRHayL's <code>implementations/GRHayLib</code>)</td><td><code>arrangement = "GRHayL"</code>: it wins over the folder name</td></tr>
   </tbody>
 </table></div>
 <p>The last layout is how the Einstein Toolkit's ExternalLibraries repos work: <code>ExternalLibraries-HDF5</code> holds the thorn <code>ExternalLibraries/HDF5</code> at its root.</p>

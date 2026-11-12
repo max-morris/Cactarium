@@ -25,14 +25,18 @@
     <tr><td><code>owner/pkg@1</code></td><td>the newest 1.x.x (the same as <code>^1</code>)</td></tr>
     <tr><td><code>owner/pkg@^1.2.3</code></td><td>the newest 1.x.x from 1.2.3 on: caret allows anything that keeps the leftmost non-zero number</td></tr>
     <tr><td><code>owner/pkg@~1.2.3</code></td><td>the newest 1.2.x from 1.2.3 on: tilde allows patch updates only</td></tr>
-    <tr><td><code>owner/pkg@&gt;=1.2, &lt;2</code></td><td>the newest version in that interval</td></tr>
+    <tr><td><code>owner/pkg@&gt;=1.2, &lt;2</code></td><td>the newest version in that interval; commas or spaces separate the comparators (<code>&gt;=1.2 &lt;2</code>), and an operator may stand apart from its version (<code>&gt;= 1.2 &lt; 2</code>)</td></tr>
+    <tr><td><code>owner/pkg@1.2.3 - 2.3.4</code></td><td>the newest version from 1.2.3 through 2.3.4, both included; a partial upper bound covers what it names (<code>1.2 - 2.3</code> is <code>&gt;=1.2.0, &lt;2.4.0</code>)</td></tr>
+    <tr><td><code>owner/pkg@^1.2 || &gt;=2.5.0 &lt;2.6</code></td><td>the newest version that any of the alternatives allows</td></tr>
     <tr><td><code>owner/pkg@mixed-precision:1.2</code></td><td>the newest 1.2.x on track <code>mixed-precision</code></td></tr>
     <tr><td><code>owner/pkg@mixed-precision</code></td><td>the newest version on track <code>mixed-precision</code></td></tr>
+    <tr><td><code>owner/pkg@mixed-precision:^1 || :^2</code></td><td>the newest 1.x.x on track <code>mixed-precision</code> or 2.x.x on the default track (<code>:</code> alone names it): each alternative has its own track, and if one names a track, every alternative must</td></tr>
     <tr><td><code>owner/pkg@7b3a6b19…</code> (a full commit id)</td><td>the package at that commit (packages only; see <a href="#commits">commits</a>)</td></tr>
   </tbody>
 </table></div>
 <p>With date-like versions such as the Einstein Toolkit's: <code>et/carpetx-stack@2026.5.0</code> is that release, <code>@2026.5</code> the newest 2026.5.N (that release line's updates), and <code>@2026</code> the newest release of 2026.</p>
-<p>Ranges never cross tracks: a reference without a track only ever matches the default track. A range chooses the highest matching version that is published (approved in review), not yanked and not invalid.</p>
+<p>The Cactarium shows a range in one normal form: <code>&gt;=1.2 &lt;2</code> is shown as <code>&gt;=1.2, &lt;2</code>. Quote a reference with spaces, <code>&lt;</code>, <code>&gt;</code> or <code>|</code> on a command line: <code>cactup add 'owner/pkg@&gt;=1.2 &lt;2'</code>.</p>
+<p>An alternative never crosses tracks: one without a track only ever matches the default track. A range chooses the highest matching version that is published (approved in review), not yanked and not invalid.</p>
 
 <h2 id="tag-pattern">Release tags that aren't vX.Y.Z: tag-pattern and since</h2>
 <p>Some projects tag releases their own way. A manifest's <code>tag-pattern</code> says how: literal text around <code>{major}</code>, <code>{minor}</code> and <code>{patch}</code>, each exactly once, with no spaces. The Einstein Toolkit's pattern is</p>

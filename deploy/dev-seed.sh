@@ -96,14 +96,12 @@ description = "CCTK_REAL4 and CCTK_REAL2 grid functions; needs a mixed-precision
 [[fork-of]]
 target = "et/carpetx"
 
-[[depends-on]]
-target = "et/et-stack"
-range = "^2026"
+[[dependency]]
+target = "et/et-stack@^2026"
 note = "the flesh and CactusBase from this stack"
 
 [[incompatible-with]]
-target = "et/et-stack"
-range = "<2026"
+target = "et/et-stack@<2026"
 
 [[caveat]]
 thorn = "TestReal4"
@@ -211,7 +209,7 @@ R=$WORK/spacetimex
 thorn "$R/Z4c" Z4c 'REQUIRES THORNS: Loop'
 thorn "$R/NewRadX" NewRadX ''
 printf '# SpacetimeX\n\nZ4c evolution on CarpetX.\n' > "$R/README.md"
-printf 'format = 1\n\n[package]\nname = "spacetimex"\nowners = ["alice"]\ndescription = "Spacetime evolution thorns for CarpetX"\narrangement = "SpacetimeX"\n' > "$R/cactarium.toml"
+printf 'format = 1\n\n[package]\nname = "spacetimex"\nowners = ["alice"]\ndescription = "Spacetime evolution thorns for CarpetX"\narrangement = "SpacetimeX"\n\n[[dependency]]\ntarget = "et/carpetx"\nneeds = ["Loop"]\nneeded-by = ["Z4c"]\n' > "$R/cactarium.toml"
 commit "$R" "SpacetimeX"; g "$R" tag v0.1.0; publish spacetimex
 
 echo "Registering on the local site"

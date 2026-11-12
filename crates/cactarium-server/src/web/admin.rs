@@ -8,6 +8,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 use crate::audit::audit;
+use crate::claims::ClaimRec;
 use crate::auth::Admin;
 use crate::error::{AppError, AppResult};
 use crate::model::{self, ENTRY_COLS, Entry, fmt_time};
@@ -164,16 +165,28 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
             }
         }
     }
-    let claims: Vec<(String, String, String, Option<String>, Option<String>)> =
-        match latest {
-            Some(v) => sqlx::query_as(
-                "SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1",
-            )
+    let claims = match latest {
+        Some(v) => ClaimRec::of_version(&state.db, v.id).await?,
+        None => vec![],
+    };
+    // A fork-of is a promise of a drop-in replacement: say so when the fork lacks upstream thorns.
+    if let Some(v) = latest.filter(|_| claims.iter().any(|c| c.kind == "fork-of")) {
+        let own: Vec<String> = sqlx::query_scalar("SELECT name FROM thorns WHERE version_id = $1")
             .bind(v.id)
             .fetch_all(&state.db)
-            .await?,
-            None => vec![],
-        };
+            .await?;
+        for c in &claims {
+            if let Some((upstream, missing)) = c.fork_gap(&state.db, &own).await?
+                && !missing.is_empty()
+            {
+                warnings.push(format!(
+                    "fork-of {}: not a drop-in replacement for {upstream}, which also has {}",
+                    c.target(),
+                    missing.join(", ")
+                ));
+            }
+        }
+    }
     let checked: HashMap<String, bool> = serde_json::from_value(s.checklist.clone()).unwrap_or_default();
     let release = latest.filter(|_| s.version_id.is_some()).map(|v| v.label());
     Ok(ReviewView {
@@ -191,16 +204,7 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
         summary: e.summary.clone().unwrap_or_default(),
         versions: versions.iter().map(|v| version_row(e, v, None)).collect(),
         thorns,
-        claims: claims
-            .into_iter()
-            .map(|(k, o, n, r, note)| ClaimRow {
-                kind: k.replace('-', " "),
-                target: format!("{o}/{n}"),
-                target_url: format!("/{o}/{n}"),
-                range: r.unwrap_or_default(),
-                note: note.unwrap_or_default(),
-            })
-            .collect(),
+        claims: claims.iter().map(ClaimRec::row).collect(),
         warnings,
         readme_html,
         detail,

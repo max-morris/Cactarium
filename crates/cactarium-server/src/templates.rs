@@ -114,7 +114,12 @@ pub struct ClaimRow {
     pub kind: String,
     pub target: String,
     pub target_url: String,
+    /// `@<range>`, `#<sha>` or empty.
     pub range: String,
+    /// A dependency's thorns of the target, comma-separated.
+    pub needs: String,
+    /// A dependency's thorns of this package, comma-separated; empty means every thorn.
+    pub needed_by: String,
     pub note: String,
 }
 

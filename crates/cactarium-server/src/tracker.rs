@@ -18,6 +18,7 @@ use serde_json::json;
 
 use cactup_ecosystem_common::version::TagPattern;
 use crate::audit::audit;
+use crate::claims::ClaimRec;
 use crate::auth::{User, random_token};
 use crate::error::{AppError, AppResult};
 use crate::git::{self, GitPolicy, RemoteRef};
@@ -807,8 +808,7 @@ pub struct PackageTip {
     pub commit: String,
     pub tree: String,
     pub thorns: Vec<(String, String, String, ccl::ThornFacts)>,
-    /// (kind, target, range, note)
-    pub claims: Vec<(String, String, Option<String>, Option<String>)>,
+    pub claims: Vec<ClaimRec>,
 }
 
 /// The commit a package's default branch names now.
@@ -840,11 +840,7 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppRe
         commit: commit.to_owned(),
         tree: co.tree.clone(),
         thorns: p.thorns,
-        claims: p
-            .claims
-            .into_iter()
-            .map(|(k, t, range, note)| (k.to_owned(), format!("{}/{}", t.owner, t.name), range, note))
-            .collect(),
+        claims: p.claims,
     })
 }
 
@@ -853,7 +849,7 @@ struct Prepared {
     readme_html: Option<String>,
     summary: Option<String>,
     thorns: Vec<(String, String, String, ccl::ThornFacts)>,
-    claims: Vec<(&'static str, Slug, Option<String>, Option<String>)>,
+    claims: Vec<ClaimRec>,
     frozen: Option<(FrozenStack, String, Option<String>)>,
     /// A sim published from its repo: the `.sim` the manifest names, checked as an upload is,
     /// and the manifest's own description.
@@ -885,24 +881,7 @@ async fn prepare(
     if !entry.curated && !owners_of(&m).contains(&entry.owner) {
         return Err(AppError::bad(format!("the manifest's owners no longer include '{}'", entry.owner)));
     }
-    let mut claims = Vec::new();
-    for c in &m.fork_of {
-        claims.push(("fork-of", c.target.clone(), None, c.note.clone()));
-    }
-    for (kind, list) in [
-        ("depends-on", &m.depends_on),
-        ("works-with", &m.works_with),
-        ("incompatible-with", &m.incompatible_with),
-    ] {
-        for c in list {
-            claims.push((
-                kind,
-                c.target.clone(),
-                c.range.as_ref().map(|r| r.to_string()),
-                c.note.clone(),
-            ));
-        }
-    }
+    let claims = ClaimRec::of_manifest(&m);
     let manifest_json = serde_json::to_value(&m).map_err(anyhow::Error::from)?;
     let mut p = Prepared {
         manifest_json,
@@ -925,16 +904,25 @@ async fn prepare(
             );
         }
         let allow = pkg.thorns.as_ref();
-        let root = co.path.clone();
+        // [package] root: where the thorns are, when not at the repo root (Kranc: Auxiliary/Cactus).
+        // The crate checked it is a plain relative path; a folder that isn't there finds no thorns.
+        let sub = pkg.root.clone().unwrap_or_default();
+        let root = co.path.join(&sub);
         let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root))
             .await
             .map_err(anyhow::Error::from)?;
         for t in scanned {
             // A repo that is one thorn (the Einstein Toolkit's ExternalLibraries-* repos) names it,
             // and its arrangement, in the manifest.
+            // Thorn directories stay relative to the repo root, root folder included.
+            let in_repo = |d: &std::path::Path| {
+                let d = std::path::Path::new(&sub).join(d);
+                let s = d.to_string_lossy().into_owned();
+                if s.is_empty() { ".".to_owned() } else { s }
+            };
             let (name, dir) = match (t.name.clone(), allow.map(Vec::as_slice), &pkg.arrangement) {
-                (Some(n), _, _) => (n, t.dir.to_string_lossy().into_owned()),
-                (None, Some([one]), Some(_)) => (one.clone(), ".".to_owned()),
+                (Some(n), _, _) => (n, in_repo(&t.dir)),
+                (None, Some([one]), Some(_)) => (one.clone(), in_repo(std::path::Path::new(""))),
                 (None, _, _) => {
                     return Err(AppError::bad(
                         "the repo root is itself a thorn: name it and its arrangement in the manifest \
@@ -945,7 +933,9 @@ async fn prepare(
             if t.name.is_some() && allow.is_some_and(|a| !a.contains(&name)) {
                 continue;
             }
-            let arrangement = match (&t.arrangement, &pkg.arrangement) {
+            // The manifest's arrangement, when given, wins over the folder the thorn sits in:
+            // GRHayL keeps GRHayLib under implementations/, which is no arrangement.
+            let arrangement = match (&pkg.arrangement, &t.arrangement) {
                 (Some(a), _) => a.clone(),
                 (None, Some(a)) => a.clone(),
                 (None, None) => {
@@ -958,6 +948,14 @@ async fn prepare(
         }
         if p.thorns.is_empty() {
             return Err(AppError::bad("no thorns found (directories with an interface.ccl)"));
+        }
+        for c in &p.claims {
+            if let Some(t) = c.needed_by.iter().find(|t| !p.thorns.iter().any(|(_, name, _, _)| name == *t)) {
+                return Err(AppError::bad(format!(
+                    "the dependency on {} is needed by '{t}', which is not one of this package's thorns",
+                    c.target()
+                )));
+            }
         }
     }
     if let Some(stack) = &m.stack {
@@ -1025,16 +1023,8 @@ async fn store_prepared(
             .execute(&mut *db)
             .await?;
     }
-    for (kind, target, range, note) in &p.claims {
-        sqlx::query("INSERT INTO claims (version_id, kind, target_owner, target_name, range, note) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(vid)
-            .bind(kind)
-            .bind(target.owner.as_str())
-            .bind(target.name.as_str())
-            .bind(range)
-            .bind(note)
-            .execute(&mut *db)
-            .await?;
+    for c in &p.claims {
+        c.insert(&mut *db, vid).await?;
     }
     if let Some((frozen, toml, own)) = &p.frozen {
         store_release(db, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone())
