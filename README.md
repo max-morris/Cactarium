@@ -70,6 +70,8 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
 6. The official stacks, carpetx-stack before cottonmouth-stack (which extends it):
    `just cli register --owner et <you> https://github.com/max-morris/<stack>` for `et-stack`,
    `carpet-stack`, `carpetx-stack` and `cottonmouth-stack`.
+   Then the packages that carry their own `cactarium.toml` rather than a curated one:
+   `just cli register --owner et <you> https://github.com/EinsteinToolkit/Cottonmouth`.
 7. The starter sim: create a token on the site's Settings page, `cactup login --token <token>`, then,
    in cactarium-curate, `cactup sim publish sims/wavetoy.sim et/wavetoy`. CactUp talks to
    `https://cactarium.cct.lsu.edu` unless `CACTARIUM_URL` or the `cactarium-url` knob says otherwise.
