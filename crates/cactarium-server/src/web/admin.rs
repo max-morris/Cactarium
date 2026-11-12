@@ -197,8 +197,21 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
     }
     let checked: HashMap<String, bool> = serde_json::from_value(s.checklist.clone()).unwrap_or_default();
     let release = latest.filter(|_| s.version_id.is_some()).map(|v| v.label());
+    // How to try it: the CactUp command for this kind, reaching what awaits review with the admin's
+    // token (CactUp sends x-cactarium-include-unreviewed for --risky-allow-untrusted-artifacts).
+    let command = latest
+        .map(|v| {
+            let verb = match e.kind.as_str() {
+                "package" => "add",
+                "stack" => "install",
+                _ => "import",
+            };
+            format!("cactup {verb} {}@{} --risky-allow-untrusted-artifacts", e.slug(), v.label())
+        })
+        .unwrap_or_default();
     Ok(ReviewView {
         id: s.id,
+        command,
         seen: versions.iter().map(|v| v.id).max().unwrap_or(0),
         release: release.unwrap_or_default(),
         entry_trusted: e.trusted,

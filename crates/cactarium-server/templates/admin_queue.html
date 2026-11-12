@@ -24,6 +24,7 @@
       <h2 class="mono"><a href="{{ r.entry_url }}">{{ r.entry }}</a>{% if !r.release.is_empty() %}@{{ r.release }}{% endif %}</h2>
       {% if !r.summary.is_empty() %}<p class="lead">{{ r.summary }}</p>{% endif %}
       <p class="small muted">{% if r.submitter.is_empty() %}A tag pushed to <span class="mono">{{ r.owner }}</span>'s repo{% else %}Submitted by <span class="mono">{{ r.submitter }}</span>{% if r.submitter_trusted %} (trusted){% endif %}{% endif %}</p>
+      {% if !r.command.is_empty() %}<p class="small">Try it with an admin token (<code>cactup login</code>): <code class="mono">{{ r.command }}</code></p>{% endif %}
     </div>
     <div class="split">
       <div class="split-main stack">
