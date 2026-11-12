@@ -1135,6 +1135,7 @@ async fn prepare(
             .map_err(AppError::bad)?
             .ok_or_else(|| AppError::bad(format!("'{}' does not exist at this tag", sim.file)))?;
         let checked = crate::sims::check(text.as_bytes())?;
+        crate::sims::check_pins(state, &checked.sim).await?;
         // Inputs read from this repo must be files at this tag (inside the repo, not via a link).
         for i in &checked.sim.inputs {
             let Some(f) = &i.repo_file else { continue };

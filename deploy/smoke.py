@@ -250,6 +250,12 @@ if tok:
     check("API responses carry api-generation", hdrs.get("api-generation") == "1", hdrs.get("api-generation"))
     s, body, _ = anon.req("POST", "/api/v1/sims/alice/qc0-demo", raw=sim.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
     check("a token cannot publish under another owner", s == 403, s)
+    # Every pin must be a registered package's repo, at a commit it has: not fully specified otherwise.
+    import re as _re
+    last_commit = _re.findall(r'commit = "([0-9a-f]{40})"', sim)[-1]
+    fake = sim.replace(f'commit = "{last_commit}"', 'commit = "' + "0" * 40 + '"')
+    s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=fake.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
+    check("a sim pinning a commit its package's repo doesn't have is refused", s == 400 and "ot fully specified" in body and "isn't in" in body, f"{s} {body[:240]}")
     bad = sim.replace('commit = "', 'commit = "zz', 1)
     s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=bad.encode(), headers={"Authorization": f"Bearer {tok.group(1)}"})
     check("an invalid .sim is refused with a message", s == 400 and '"code":"bad-request"' in body, f"{s} {body[:200]}")

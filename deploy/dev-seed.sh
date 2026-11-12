@@ -36,11 +36,13 @@ thorn() { # thorn DIR IMPLEMENTS [configuration.ccl text]
 
 echo "Building demo repos in $REPOS"
 
-# The flesh: an unregistered source every stack uses.
+# The flesh, published as a flesh package (et/cactus): a sim's every pin must be a registered
+# package's, the flesh included.
 new_repo cactus
-mkdir -p "$WORK/cactus/src" "$WORK/cactus/lib"
-echo 'all:' > "$WORK/cactus/Makefile"; echo 'int main(void) { return 0; }' > "$WORK/cactus/src/main.c"; echo '# flesh libs' > "$WORK/cactus/lib/README"
-commit cactus "The flesh"; publish cactus
+mkdir -p "$WORK/cactus/src/main" "$WORK/cactus/lib/sbin"
+echo 'all:' > "$WORK/cactus/Makefile"; echo 'int main(void) { return 0; }' > "$WORK/cactus/src/main/flesh.cc"; echo '# CST' > "$WORK/cactus/lib/sbin/CST"
+printf 'format = 1\n\n[package]\nname = "cactus"\nowners = ["et"]\ndescription = "The Cactus flesh (a demo stand-in)"\nflesh = true\n' > "$WORK/cactus/cactarium.toml"
+commit cactus "The flesh"; g cactus tag v1.0.0; publish cactus
 
 # CactusBase: another unregistered source.
 new_repo cactusbase
@@ -290,6 +292,12 @@ machine = "qbd"
 flavor = "cpu"
 base = "et/et-stack@2026.5.0"
 EOF
+# The sim pins the flesh, CactusBase and CarpetX: each must be a registered package's repo.
+cli register max $U/cactus.git --owner et
+mkdir -p "$DEMO/files/curate/manifests"
+printf '[[package]]\nowner = "et"\nurl = "%s"\nmanifest = "manifests/cactusbase.toml"\n' "$U/cactusbase.git" > "$DEMO/files/curate/curate.toml"
+printf 'format = 1\n\n[package]\nname = "cactusbase"\nowners = ["et"]\ndescription = "CactusBase (a demo stand-in)"\narrangement = "CactusBase"\n' > "$DEMO/files/curate/manifests/cactusbase.toml"
+cli curate max /demo/curate/curate.toml
 cli publish-sim max /demo/qc0.sim
 
 # Move a frozen tag upstream: the site keeps serving the frozen commit and raises an alert.

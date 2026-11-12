@@ -166,6 +166,70 @@ pub fn check(bytes: &[u8]) -> AppResult<Checked> {
 /// `version` is the semver version to publish (default: the next major, 1.0.0, 2.0.0, …), so
 /// `owner/name@1` means 1.x.x as for packages and stacks. Returns the entry, the version and
 /// whether it is approved or waits for review.
+/// Every repo a sim pins must be a registered package's, at a commit that package's repo has: a
+/// downstream user must be able to rebuild the sim from the Cactarium alone. The pin's identity is
+/// then `owner/pkg@version` (a commit a version froze) or `owner/pkg#sha` (any other commit of
+/// the repo). A tarball pin (sha256 only) has no package identity. Refuses with every pin that
+/// fails, and what to do about it.
+pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
+    let packages: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT e.owner, e.name, r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.kind = 'package' AND e.visibility = 'public' ORDER BY e.created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let policy = crate::git::GitPolicy { allow_local: state.cfg.allow_local_repos };
+    let mut problems: Vec<String> = Vec::new();
+    for pin in &sim.repos {
+        let Some(commit) = pin.commit.as_deref() else {
+            problems.push(format!(
+                "{}: a tarball pin has no package identity; every repo a sim builds from must be a registered package's",
+                pin.name
+            ));
+            continue;
+        };
+        let norm = crate::git::normalize_url(&pin.url);
+        let Some((owner, name, url)) = packages.iter().find(|(_, _, u)| crate::git::normalize_url(u) == norm) else {
+            problems.push(format!(
+                "{} ({}) isn't the repo of any package on the Cactarium: register it (or fork a package that is, and pin the fork) first",
+                pin.name, pin.url
+            ));
+            continue;
+        };
+        // A commit a version froze is that version; any other must be in the repo's history.
+        let frozen: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM versions v JOIN entries e ON e.id = v.entry_id
+                            WHERE e.owner = $1 AND e.name = $2 AND v.commit = $3 AND v.state <> 'invalid')",
+        )
+        .bind(owner)
+        .bind(name)
+        .bind(commit)
+        .fetch_one(&state.db)
+        .await?;
+        if frozen {
+            continue;
+        }
+        let prefix = &commit[..commit.len().min(12)];
+        let found = match crate::git::resolve_commit_prefix(policy, url, prefix).await {
+            Ok(crate::git::PrefixMatch::One(c)) => c == commit,
+            Ok(crate::git::PrefixMatch::Many(all)) => all.iter().any(|c| c == commit),
+            Ok(crate::git::PrefixMatch::None) => false,
+            Err(e) => {
+                problems.push(format!("{}: cannot read {owner}/{name}'s history right now ({e:#}); try again later", pin.name));
+                continue;
+            }
+        };
+        if !found {
+            problems.push(format!(
+                "{}: commit {} isn't in {owner}/{name}'s repo: push it there (or to a fork registered as a package)",
+                pin.name,
+                &commit[..commit.len().min(12)]
+            ));
+        }
+    }
+    if problems.is_empty() { Ok(()) } else { Err(AppError::bad(format!("not fully specified: {}", problems.join("; ")))) }
+}
+
 pub async fn publish(
     state: &AppState,
     user: &User,
@@ -175,6 +239,7 @@ pub async fn publish(
     checked: Checked,
 ) -> AppResult<(Entry, String, &'static str)> {
     let Checked { sim, index } = checked;
+    check_pins(state, &sim).await?;
     let owner = owner
         .map(str::trim)
         .filter(|o| !o.is_empty())

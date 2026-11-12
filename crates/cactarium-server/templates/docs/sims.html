@@ -37,7 +37,7 @@ A black hole and neutron star merger like GW230529, at high resolution.
 <p>These checks apply to every upload and to the file at every tag of a repo-backed sim. An upload that fails one is refused with the reason; a tag that fails one becomes an invalid version with the reason.</p>
 <ul>
   <li>The file is at most 1 MiB of UTF-8 text and a valid <code>.sim</code>. The reader is strict: unknown keys, or a format newer than the server knows, are errors.</li>
-  <li>It is <strong>fully specified</strong>: every <code>[[repo]]</code> is pinned to a commit or a sha256, none was dirty when exported, and every thorn in the build comes from one of those repos.</li>
+  <li>It is <strong>fully specified</strong>: every <code>[[repo]]</code> is pinned to a commit, none was dirty when exported, and every thorn in the build comes from one of those repos. And every repo is a <strong>registered package's</strong>, the flesh included (<code>et/cactus</code> or a fork of it), at a commit that package's repo has: a published version's commit, or any other commit of its history. Someone downstream can then rebuild the sim from the Cactarium alone. A repo that isn't on the Cactarium is registered first, or the sim pins a fork that is; a tarball pin has no package identity and is refused.</li>
   <li><strong>The pins agree with the thornlist</strong>: the <code>[[repo]]</code> entries name exactly the repos the thornlist checks out, none missing and none extra.</li>
   <li>Its <code>[sim] root</code> matches the thornlist's <code>!DEFINE ROOT</code>.</li>
 </ul>
