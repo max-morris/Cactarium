@@ -8,7 +8,7 @@ use axum::http::header;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
-    API_GENERATION, ClaimInfo, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed,
+    API_GENERATION, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed,
     ReleaseRequest, Resolved, CONTACT_HEADER, SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER,
     UNTRUSTED_HEADER, VersionInfo,
 };
@@ -20,6 +20,7 @@ use cactup_ecosystem_common::stack::FrozenStack;
 use serde::Deserialize;
 
 use crate::auth::{User, sha256};
+use crate::claims::ClaimRec;
 use crate::error::{ApiError, ApiResult, AppError};
 use crate::git::{self, GitPolicy};
 use crate::model::{self, Entry, Version};
@@ -130,15 +131,12 @@ async fn version_body(state: &AppState, v: &Version, url: &str) -> ApiResult<Pac
             .fetch_all(&state.db)
             .await
             .map_err(AppError::from)?;
-    let claims: Vec<(String, String, String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1 ORDER BY kind")
-            .bind(v.id)
-            .fetch_all(&state.db)
-            .await
-            .map_err(AppError::from)?;
+    let claims = ClaimRec::of_version(&state.db, v.id).await?;
+    let flesh = v.manifest.as_ref().and_then(|m| m["package"]["flesh"].as_bool()).unwrap_or(false);
     Ok(PackageVersion {
         version: version_info(v),
         url: url.to_owned(),
+        flesh,
         thorns: thorns
             .into_iter()
             .map(|(arrangement, thorn, dir, facts)| ThornInfo {
@@ -148,10 +146,7 @@ async fn version_body(state: &AppState, v: &Version, url: &str) -> ApiResult<Pac
                 facts: serde_json::from_value::<ThornFacts>(facts).unwrap_or_default(),
             })
             .collect(),
-        claims: claims
-            .into_iter()
-            .map(|(kind, o, n, range, note)| ClaimInfo { kind, target: format!("{o}/{n}"), range, note })
-            .collect(),
+        claims: claims.iter().map(ClaimRec::info).collect(),
     })
 }
 
@@ -212,10 +207,7 @@ pub async fn resolve(
         Ok(req) => {
             // An exact request (`1.2.3`) still reaches a yanked version, which the response marks
             // `yanked`; a range never chooses one.
-            let exact = req.req.comparators.len() == 1 && {
-                let c = &req.req.comparators[0];
-                c.op == semver::Op::Exact && c.minor.is_some() && c.patch.is_some()
-            };
+            let exact = req.is_exact();
             versions
                 .iter()
                 .filter(|v| v.usable() || (exact && v.yanked && v.approved() && v.state != "invalid"))
@@ -339,6 +331,7 @@ pub async fn package_tip(
     let body = PackageVersion {
         version: tip_version_info(&e, &label, &t),
         url,
+        flesh: t.flesh,
         thorns: t
             .thorns
             .iter()
@@ -349,16 +342,7 @@ pub async fn package_tip(
                 facts: facts.clone(),
             })
             .collect(),
-        claims: t
-            .claims
-            .iter()
-            .map(|(kind, target, range, note)| ClaimInfo {
-                kind: kind.clone(),
-                target: target.clone(),
-                range: range.clone(),
-                note: note.clone(),
-            })
-            .collect(),
+        claims: t.claims.iter().map(ClaimRec::info).collect(),
     };
     Ok(match commit {
         Some(_) => ([untrusted_header(trusted)], Json(body)).into_response(),

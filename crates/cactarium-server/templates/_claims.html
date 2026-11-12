@@ -1,6 +1,8 @@
 {% for c in claims %}
 <div class="claim"><span class="muted small">{{ c.kind }}</span>
-  <span><a class="mono" href="{{ c.target_url }}">{{ c.target }}</a> <span class="mono">{{ c.range }}</span></span>
+  <span><a class="mono" href="{{ c.target_url }}">{{ c.target }}</a><span class="mono">{{ c.range }}</span></span>
+  {% if !c.needs.is_empty() %}<span class="small">needs <span class="mono">{{ c.needs }}</span></span>{% endif %}
+  {% if !c.needed_by.is_empty() %}<span class="small">for <span class="mono">{{ c.needed_by }}</span></span>{% endif %}
   {% if !c.note.is_empty() %}<span class="muted small">{{ c.note }}</span>{% endif %}
 </div>
 {% else %}

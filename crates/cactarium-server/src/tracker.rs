@@ -18,6 +18,7 @@ use serde_json::json;
 
 use cactup_ecosystem_common::version::TagPattern;
 use crate::audit::audit;
+use crate::claims::ClaimRec;
 use crate::auth::{User, random_token};
 use crate::error::{AppError, AppResult};
 use crate::git::{self, GitPolicy, RemoteRef};
@@ -266,7 +267,12 @@ pub async fn register(
     }
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
     for e in &entries {
-        sync_as(state, e, Some(user)).await?;
+        // A tag whose commit can't be fetched right now stays unread (kept as the repo's poll
+        // error); the poller tries it again.
+        match sync_as(state, e, Some(user)).await {
+            Ok(_) | Err(AppError::Upstream(_)) => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(entries)
 }
@@ -411,6 +417,98 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Admin-only: re-reads the published versions of a curated package with its current overlay
+/// manifest. A curated package's manifest is metadata the Cactarium keeps, not repo content, so a
+/// fix to it (dependencies added, a thorn list corrected) can apply to versions already published.
+/// Each version keeps its commit and tree; its manifest, thorns and claims are replaced by what a
+/// fresh ingest of that commit with the current overlay gives, in one transaction. A version that
+/// can't be fetched or doesn't fit the overlay is left as it was and reported. An invalid version
+/// (never served) that fits the corrected overlay becomes valid, with its review decided as for a
+/// new release the admin vouches for. Returns (versions re-read, versions left with why).
+pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> AppResult<(usize, Vec<String>)> {
+    let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
+    if !entry.curated || repo.overlay_manifest.is_none() {
+        return Err(AppError::bad(format!("{} isn't curated: its versions read the repo's own manifest", entry.slug())));
+    }
+    // The overlay's since bounds what it curates: an older version stays as it was (yank it if no
+    // range should choose it any more).
+    let since = Manifest::from_repo_file(PACKAGE_FILE, repo.overlay_manifest.as_deref().unwrap_or_default())
+        .ok()
+        .and_then(|m| m.package.and_then(|p| p.since));
+    let (mut done, mut left) = (0, Vec::new());
+    for v in model::all_versions(state, entry.id).await? {
+        let label = v.label();
+        if let (Some(since), Ok(tv)) = (&since, label.parse::<TrackedVersion>())
+            && tv.version < *since
+        {
+            left.push(format!("{label}: older than the manifest's since ({since}), so not curated; yank it if no range should choose it"));
+            continue;
+        }
+        let Some(commit) = v.commit.clone() else {
+            left.push(format!("{label}: has no commit"));
+            continue;
+        };
+        let tv: TrackedVersion = label.parse().map_err(AppError::bad)?;
+        let r = RemoteRef { name: v.tag.clone().unwrap_or_else(|| tv.conventional_tag()), commit: commit.clone() };
+        let co = match git::checkout(policy(state), &repo.url, &commit, v.tag.as_deref()).await {
+            Ok(co) => co,
+            Err(e) => {
+                left.push(format!("{label}: cannot fetch {commit}: {e:#}"));
+                continue;
+            }
+        };
+        let p = match prepare(state, entry, &repo, &co, &r, &tv).await {
+            Ok(p) => p,
+            Err(e) => {
+                left.push(format!("{label}: {e}"));
+                continue;
+            }
+        };
+        // An invalid version was never served; once it fits, it is reviewed like a new release.
+        let revived = v.state == "invalid";
+        let review = if revived { Some(publish::release_review(state, entry, Some(admin)).await?) } else { None };
+        let mut tx = state.db.begin().await?;
+        for table in ["thorns", "claims"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE version_id = $1"))
+                .bind(v.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "UPDATE versions SET manifest = $2, readme_html = $3, tree = $4, review = COALESCE($5, review),
+                state = CASE WHEN state = 'invalid' THEN 'ok' ELSE state END,
+                invalid_reason = CASE WHEN state = 'invalid' THEN NULL ELSE invalid_reason END
+             WHERE id = $1",
+        )
+        .bind(v.id)
+        .bind(&p.manifest_json)
+        .bind(&p.readme_html)
+        .bind(&co.tree)
+        .bind(review)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(r) = review {
+            publish::submit_release(&mut tx, entry, v.id, r, Some(admin)).await?;
+        }
+        store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
+        crate::audit::audit_with(
+            &mut tx,
+            Some(admin.id),
+            "curated.reapply",
+            Some(&entry.slug()),
+            json!({ "version": label, "commit": commit }),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        done += 1;
+    }
+    if done > 0 {
+        publish::touch(state, entry.id).await?;
+    }
+    Ok((done, left))
 }
 
 /// Checks that `url` holds the history the entry's published versions froze: every tagged version
@@ -667,6 +765,8 @@ async fn sync_inner(
     }
 
     let mut added = 0;
+    // Tags whose commits couldn't be fetched this time: left unread, so the next sync tries again.
+    let mut unfetched: Vec<String> = Vec::new();
     for (r, tv) in version_tags(refs, &TagRule::of(repo)?) {
         if by_tag.contains_key(r.name.as_str()) {
             continue;
@@ -674,8 +774,11 @@ async fn sync_inner(
         if added == MAX_NEW_PER_SYNC {
             break;
         }
-        ingest(state, entry, repo, &r, &tv, actor).await?;
-        added += 1;
+        match ingest(state, entry, repo, &r, &tv, actor).await {
+            Ok(()) => added += 1,
+            Err(AppError::Upstream(why)) => unfetched.push(why),
+            Err(e) => return Err(e),
+        }
     }
     if added > 0 {
         publish::touch(state, entry.id).await?;
@@ -691,6 +794,15 @@ async fn sync_inner(
         if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
             store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
         }
+    }
+    // What couldn't be fetched is reported (it becomes the repo's poll error) and tried again.
+    if !unfetched.is_empty() {
+        return Err(AppError::Upstream(format!(
+            "{} new version(s) read; {} tag(s) will be tried again at the next sync: {}",
+            added,
+            unfetched.len(),
+            unfetched.join("; ")
+        )));
     }
     Ok(added)
 }
@@ -746,9 +858,15 @@ async fn ingest(
     let base = |reason: Option<String>, tree: Option<String>| (reason, tree);
     let co = git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await;
     let (invalid, tree, prepared) = match co {
-        Err(e) => {
-            let (reason, tree) = base(Some(format!("cannot fetch the tagged commit: {e:#}")), None);
+        // Too large is a fact about the commit: the version is stored invalid, as for a bad manifest.
+        Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
+            let (reason, tree) = base(Some(format!("cannot index the tagged commit: {e:#}")), None);
             (reason, tree, None)
+        }
+        // Any other fetch failure (the network, the host) is worth trying again: nothing is
+        // stored, so the tag is read again at the next sync.
+        Err(e) => {
+            return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, &r.commit[..10.min(r.commit.len())])));
         }
         Ok(co) => match prepare(state, entry, repo, &co, r, tv).await {
             Ok(p) => (None, Some(co.tree.clone()), Some(p)),
@@ -806,9 +924,10 @@ async fn ingest(
 pub struct PackageTip {
     pub commit: String,
     pub tree: String,
+    /// A Cactus flesh (no thorns), per its manifest.
+    pub flesh: bool,
     pub thorns: Vec<(String, String, String, ccl::ThornFacts)>,
-    /// (kind, target, range, note)
-    pub claims: Vec<(String, String, Option<String>, Option<String>)>,
+    pub claims: Vec<ClaimRec>,
 }
 
 /// The commit a package's default branch names now.
@@ -836,15 +955,13 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppRe
     let p = prepare(state, entry, &repo, &co, &r, &tv)
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
+    let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);
     Ok(PackageTip {
         commit: commit.to_owned(),
         tree: co.tree.clone(),
+        flesh,
         thorns: p.thorns,
-        claims: p
-            .claims
-            .into_iter()
-            .map(|(k, t, range, note)| (k.to_owned(), format!("{}/{}", t.owner, t.name), range, note))
-            .collect(),
+        claims: p.claims,
     })
 }
 
@@ -853,11 +970,13 @@ struct Prepared {
     readme_html: Option<String>,
     summary: Option<String>,
     thorns: Vec<(String, String, String, ccl::ThornFacts)>,
-    claims: Vec<(&'static str, Slug, Option<String>, Option<String>)>,
+    claims: Vec<ClaimRec>,
     frozen: Option<(FrozenStack, String, Option<String>)>,
     /// A sim published from its repo: the `.sim` the manifest names, checked as an upload is,
     /// and the manifest's own description.
     sim: Option<(crate::sims::Checked, Option<String>)>,
+    /// What reviewers should look at (deps.rs): stored with the version.
+    smells: Vec<String>,
 }
 
 async fn prepare(
@@ -885,24 +1004,7 @@ async fn prepare(
     if !entry.curated && !owners_of(&m).contains(&entry.owner) {
         return Err(AppError::bad(format!("the manifest's owners no longer include '{}'", entry.owner)));
     }
-    let mut claims = Vec::new();
-    for c in &m.fork_of {
-        claims.push(("fork-of", c.target.clone(), None, c.note.clone()));
-    }
-    for (kind, list) in [
-        ("depends-on", &m.depends_on),
-        ("works-with", &m.works_with),
-        ("incompatible-with", &m.incompatible_with),
-    ] {
-        for c in list {
-            claims.push((
-                kind,
-                c.target.clone(),
-                c.range.as_ref().map(|r| r.to_string()),
-                c.note.clone(),
-            ));
-        }
-    }
+    let claims = ClaimRec::of_manifest(&m);
     let manifest_json = serde_json::to_value(&m).map_err(anyhow::Error::from)?;
     let mut p = Prepared {
         manifest_json,
@@ -912,6 +1014,7 @@ async fn prepare(
         claims,
         frozen: None,
         sim: None,
+        smells: Vec::new(),
     };
 
     if let Some(pkg) = &m.package {
@@ -924,17 +1027,38 @@ async fn prepare(
                     .map_err(anyhow::Error::from)?,
             );
         }
+        // A flesh package is the Cactus flesh itself: checked by its files, and no thorns.
+        if pkg.flesh {
+            for marker in ["src/main/flesh.cc", "lib/sbin/CST"] {
+                if !co.path.join(marker).is_file() {
+                    return Err(AppError::bad(format!(
+                        "[package] flesh = true, but this commit has no {marker}: it isn't a Cactus flesh"
+                    )));
+                }
+            }
+        }
         let allow = pkg.thorns.as_ref();
-        let root = co.path.clone();
-        let scanned = tokio::task::spawn_blocking(move || ccl::scan_tree(&root))
-            .await
-            .map_err(anyhow::Error::from)?;
+        // [package] root: where the thorns are, when not at the repo root (Kranc: Auxiliary/Cactus).
+        // The crate checked it is a plain relative path; a folder that isn't there finds no thorns.
+        let sub = pkg.root.clone().unwrap_or_default();
+        let root = co.path.join(&sub);
+        let scanned = if pkg.flesh {
+            Vec::new()
+        } else {
+            tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?
+        };
         for t in scanned {
             // A repo that is one thorn (the Einstein Toolkit's ExternalLibraries-* repos) names it,
             // and its arrangement, in the manifest.
+            // Thorn directories stay relative to the repo root, root folder included.
+            let in_repo = |d: &std::path::Path| {
+                let d = std::path::Path::new(&sub).join(d);
+                let s = d.to_string_lossy().into_owned();
+                if s.is_empty() { ".".to_owned() } else { s }
+            };
             let (name, dir) = match (t.name.clone(), allow.map(Vec::as_slice), &pkg.arrangement) {
-                (Some(n), _, _) => (n, t.dir.to_string_lossy().into_owned()),
-                (None, Some([one]), Some(_)) => (one.clone(), ".".to_owned()),
+                (Some(n), _, _) => (n, in_repo(&t.dir)),
+                (None, Some([one]), Some(_)) => (one.clone(), in_repo(std::path::Path::new(""))),
                 (None, _, _) => {
                     return Err(AppError::bad(
                         "the repo root is itself a thorn: name it and its arrangement in the manifest \
@@ -945,7 +1069,13 @@ async fn prepare(
             if t.name.is_some() && allow.is_some_and(|a| !a.contains(&name)) {
                 continue;
             }
-            let arrangement = match (&t.arrangement, &pkg.arrangement) {
+            // exclude-thorns: thorns that can't build aren't published.
+            if pkg.exclude_thorns.contains(&name) {
+                continue;
+            }
+            // The manifest's arrangement, when given, wins over the folder the thorn sits in:
+            // GRHayL keeps GRHayLib under implementations/, which is no arrangement.
+            let arrangement = match (&pkg.arrangement, &t.arrangement) {
                 (Some(a), _) => a.clone(),
                 (None, Some(a)) => a.clone(),
                 (None, None) => {
@@ -956,9 +1086,27 @@ async fn prepare(
             };
             p.thorns.push((arrangement, name, dir, t.facts));
         }
-        if p.thorns.is_empty() {
+        if p.thorns.is_empty() && !pkg.flesh {
             return Err(AppError::bad("no thorns found (directories with an interface.ccl)"));
         }
+        for c in &p.claims {
+            if let Some(t) = c.needed_by.iter().find(|t| !p.thorns.iter().any(|(_, name, _, _)| name == *t)) {
+                return Err(AppError::bad(format!(
+                    "the dependency on {} is needed by '{t}', which is not one of this package's thorns",
+                    c.target()
+                )));
+            }
+        }
+        // exclude-thorns names thorns the repo has: a name it doesn't is a typo.
+        if !pkg.exclude_thorns.is_empty() {
+            let root = co.path.join(pkg.root.clone().unwrap_or_default());
+            let all = tokio::task::spawn_blocking(move || ccl::scan_tree(&root)).await.map_err(anyhow::Error::from)?;
+            if let Some(x) = pkg.exclude_thorns.iter().find(|x| !all.iter().any(|t| t.name.as_deref() == Some(x.as_str()))) {
+                return Err(AppError::bad(format!("exclude-thorns names '{x}', which this commit doesn't have")));
+            }
+        }
+        // The CCL and the dependencies must agree; what reviewers should see comes back as smells.
+        p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path).await?;
     }
     if let Some(stack) = &m.stack {
         let own = match &stack.thornlist {
@@ -1014,6 +1162,11 @@ async fn store_prepared(
     track: &str,
     p: Prepared,
 ) -> AppResult<()> {
+    sqlx::query("UPDATE versions SET smells = $2 WHERE id = $1")
+        .bind(vid)
+        .bind(&p.smells)
+        .execute(&mut *db)
+        .await?;
     for (arr, name, dir, facts) in &p.thorns {
         sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(vid)
@@ -1025,16 +1178,8 @@ async fn store_prepared(
             .execute(&mut *db)
             .await?;
     }
-    for (kind, target, range, note) in &p.claims {
-        sqlx::query("INSERT INTO claims (version_id, kind, target_owner, target_name, range, note) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(vid)
-            .bind(kind)
-            .bind(target.owner.as_str())
-            .bind(target.name.as_str())
-            .bind(range)
-            .bind(note)
-            .execute(&mut *db)
-            .await?;
+    for c in &p.claims {
+        c.insert(&mut *db, vid).await?;
     }
     if let Some((frozen, toml, own)) = &p.frozen {
         store_release(db, entry, vid, track, frozen, toml, "tag", frozen.recipe.clone(), own.clone())

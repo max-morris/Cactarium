@@ -24,8 +24,10 @@ publish() { git clone -q --bare "$(at "$1")" "$REPOS/$(basename "$1").git"; }
 commit() { g "$1" add -A; g "$1" commit -m "$2"; }
 
 thorn() { # thorn DIR IMPLEMENTS [configuration.ccl text]
+  # Demo thorns require only what the demo packages provide, so every published version passes
+  # the dependency check (each hard CCL requirement is met by its package or a dependency's needs).
   mkdir -p "$1"
-  printf '# Interface definition for thorn %s\nIMPLEMENTS: %s\nINHERITS: grid\n' "$(basename "$1")" "$2" > "$1/interface.ccl"
+  printf '# Interface definition for thorn %s\nIMPLEMENTS: %s\n' "$(basename "$1")" "$2" > "$1/interface.ccl"
   printf '# Parameter definitions\n' > "$1/param.ccl"
   printf '# Schedule definitions\n' > "$1/schedule.ccl"
   [ -n "${3:-}" ] && printf '%s\n' "$3" > "$1/configuration.ccl"
@@ -49,7 +51,7 @@ commit cactusbase "CactusBase"; publish cactusbase
 # CarpetX: a package with a default track and a mixed-precision track.
 new_repo carpetx
 R=$WORK/carpetx
-thorn "$R/CarpetX" driver $'REQUIRES AMReX MPI yaml_cpp zlib\nREQUIRES THORNS: Arith Loop\nOPTIONAL ADIOS2 Silo\n{\n}'
+thorn "$R/CarpetX" driver $'REQUIRES THORNS: Arith Loop\nOPTIONAL AMReX MPI yaml_cpp zlib ADIOS2 Silo\n{\n}'
 thorn "$R/Loop" Loop 'REQUIRES THORNS: Arith'
 thorn "$R/Arith" Arith 'OPTIONAL NSIMD yaml_cpp'
 cat > "$R/README.md" <<'EOF'
@@ -96,14 +98,12 @@ description = "CCTK_REAL4 and CCTK_REAL2 grid functions; needs a mixed-precision
 [[fork-of]]
 target = "et/carpetx"
 
-[[depends-on]]
-target = "et/et-stack"
-range = "^2026"
+[[works-with]]
+target = "et/et-stack@^2026"
 note = "the flesh and CactusBase from this stack"
 
 [[incompatible-with]]
-target = "et/et-stack"
-range = "<2026"
+target = "et/et-stack@<2026"
 
 [[caveat]]
 thorn = "TestReal4"
@@ -116,7 +116,7 @@ publish carpetx
 # Upstream CarpetX, published by an admin in the et namespace (its own authors haven't).
 new_repo carpetx-et
 R=$WORK/carpetx-et
-thorn "$R/CarpetX" driver $'REQUIRES AMReX MPI yaml_cpp zlib\nREQUIRES THORNS: Arith Loop'
+thorn "$R/CarpetX" driver $'REQUIRES THORNS: Arith Loop\nOPTIONAL AMReX MPI yaml_cpp zlib\n{\n}'
 thorn "$R/Loop" Loop 'REQUIRES THORNS: Arith'
 thorn "$R/Arith" Arith ''
 printf '# CarpetX\n\nThe Einstein Toolkit AMReX-based driver (a demo stand-in).\n' > "$R/README.md"
@@ -211,7 +211,7 @@ R=$WORK/spacetimex
 thorn "$R/Z4c" Z4c 'REQUIRES THORNS: Loop'
 thorn "$R/NewRadX" NewRadX ''
 printf '# SpacetimeX\n\nZ4c evolution on CarpetX.\n' > "$R/README.md"
-printf 'format = 1\n\n[package]\nname = "spacetimex"\nowners = ["alice"]\ndescription = "Spacetime evolution thorns for CarpetX"\narrangement = "SpacetimeX"\n' > "$R/cactarium.toml"
+printf 'format = 1\n\n[package]\nname = "spacetimex"\nowners = ["alice"]\ndescription = "Spacetime evolution thorns for CarpetX"\narrangement = "SpacetimeX"\n\n[[dependency]]\ntarget = "et/carpetx"\nneeds = ["Loop"]\nneeded-by = ["Z4c"]\n' > "$R/cactarium.toml"
 commit "$R" "SpacetimeX"; g "$R" tag v0.1.0; publish spacetimex
 
 echo "Registering on the local site"

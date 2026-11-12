@@ -263,10 +263,10 @@ async fn exec(
             let d = dir.to_path_buf();
             let size = tokio::task::spawn_blocking(move || dir_size(&d)).await.unwrap_or(0);
             if size > max {
-                return anyhow!(
+                return anyhow::Error::new(TooLarge(format!(
                     "{what}: the download passed {} MB and was stopped",
                     max / (1024 * 1024)
-                );
+                )));
             }
         }
     };
@@ -708,6 +708,19 @@ async fn lookup_commits(
         .collect())
 }
 
+/// A commit refused for its size: a fact about the content, unlike a fetch that failed for the
+/// network's or the host's reasons, which is worth trying again.
+#[derive(Debug)]
+pub struct TooLarge(pub String);
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
 /// A commit checked out into a temporary directory, removed when dropped.
 pub struct Checkout {
     dir: Option<tempfile::TempDir>,
@@ -781,7 +794,7 @@ pub async fn checkout(
         .filter_map(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok())
         .sum();
     if total > MAX_TREE_BYTES {
-        bail!("the repo is too large to index ({} MB at this commit)", total / (1024 * 1024));
+        return Err(TooLarge(format!("the repo is too large to index ({} MB at this commit)", total / (1024 * 1024))).into());
     }
     run(g(&["-c", "advice.detachedHead=false", "checkout", "-q", commit]), "checking out the commit")
         .await?;
@@ -792,7 +805,7 @@ pub async fn checkout(
     let p = path.clone();
     let size = tokio::task::spawn_blocking(move || dir_size(&p)).await?;
     if size > MAX_TREE_BYTES {
-        bail!("the repo is too large to index ({} MB)", size / (1024 * 1024));
+        return Err(TooLarge(format!("the repo is too large to index ({} MB)", size / (1024 * 1024))).into());
     }
     Ok(Checkout { dir: Some(dir), path, tree })
 }

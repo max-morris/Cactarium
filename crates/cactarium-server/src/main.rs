@@ -5,8 +5,10 @@
 
 mod audit;
 mod auth;
+mod claims;
 mod config;
 mod curate;
+mod deps;
 mod error;
 mod flights;
 mod git;
@@ -79,6 +81,10 @@ enum Command {
     },
     /// Check an entry's repo for new and moved tags now.
     Sync { slug: String },
+    /// Re-read the published versions of a curated package (or, without one, of every curated
+    /// package) with its current manifest, as the given admin: same commits, new dependencies,
+    /// claims and thorn list.
+    Reapply { username: String, slug: Option<String> },
     /// Yank a version on behalf of a user who manages the entry (or an admin): it stays
     /// downloadable by exact version, but no range chooses it.
     Yank {
@@ -292,6 +298,43 @@ async fn main() -> anyhow::Result<()> {
                 .context("no such entry")?;
             let n = tracker::sync(&state, &e).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{}: {n} new versions", e.slug());
+            Ok(())
+        }
+        Command::Reapply { username, slug } => {
+            let state = make_state(cfg, db)?;
+            let admin = cli_user(&state, &username).await?;
+            anyhow::ensure!(admin.is_admin(), "{username} is not an admin");
+            let entries: Vec<model::Entry> = match slug {
+                Some(s) => {
+                    let (owner, name) = s.split_once('/').context("give owner/name")?;
+                    vec![model::find_entry(&state, owner, name)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .context("no such entry")?]
+                }
+                None => sqlx::query_as(&format!(
+                    "SELECT {} FROM entries WHERE curated ORDER BY owner, name",
+                    model::ENTRY_COLS
+                ))
+                .fetch_all(&state.db)
+                .await?,
+            };
+            let mut failed = 0;
+            for e in &entries {
+                match tracker::reapply_curated(&state, &admin, e).await {
+                    Ok((done, left)) => {
+                        println!("{}: {done} re-read", e.slug());
+                        for l in &left {
+                            println!("  left as it was: {l}");
+                        }
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        println!("{}: {err}", e.slug());
+                    }
+                }
+            }
+            anyhow::ensure!(failed == 0, "{failed} of {} failed", entries.len());
             Ok(())
         }
         Command::Token { username, name, days } => {

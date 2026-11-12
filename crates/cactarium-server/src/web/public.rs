@@ -10,6 +10,7 @@ use cactup_ecosystem_common::sim::{ParfileKind, SimFile};
 use serde::Deserialize;
 
 use crate::auth::{User, Visitor};
+use crate::claims::ClaimRec;
 use crate::error::{AppError, AppResult};
 use crate::git::normalize_url;
 use crate::markdown;
@@ -480,22 +481,7 @@ async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<
 }
 
 async fn claims_of(state: &AppState, version_id: i64) -> AppResult<Vec<ClaimRow>> {
-    let rows: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT kind, target_owner, target_name, range, note FROM claims WHERE version_id = $1 ORDER BY kind, target_owner, target_name",
-    )
-    .bind(version_id)
-    .fetch_all(&state.db)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(k, o, n, r, note)| ClaimRow {
-            kind: k.replace('-', " "),
-            target: format!("{o}/{n}"),
-            target_url: format!("/{o}/{n}"),
-            range: r.unwrap_or_default(),
-            note: note.unwrap_or_default(),
-        })
-        .collect())
+    Ok(ClaimRec::of_version(&state.db, version_id).await?.iter().map(ClaimRec::row).collect())
 }
 
 pub async fn thorn_rows(
