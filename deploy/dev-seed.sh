@@ -300,6 +300,47 @@ printf 'format = 1\n\n[package]\nname = "cactusbase"\nowners = ["et"]\ndescripti
 cli curate max /demo/curate/curate.toml
 cli publish-sim max /demo/qc0.sim
 
+# A repo carrying a package and a multi-sim entry (Cottonmouth's shape): the package releases with
+# vX.Y.Z tags; its example sims, listed in [sim.files], with their own sim-vX.Y.Z tags (a
+# tag-pattern, never sim/v..., which reads as a track). The sims manifest lives on a branch, not on
+# master, so it is registered from its tag: `register --tag`, which adds only the missing entry.
+new_repo bbh-demo
+R=$WORK/bbh-demo
+thorn "$R/BBHDemo" BBHDemo ''
+printf 'format = 1\n\n[package]\nname = "bbh-demo"\nowners = ["max"]\ndescription = "A demo package that ships its own example sims"\narrangement = "BBHDemoArr"\n' > "$R/cactarium.toml"
+commit "$R" "bbh-demo 1.0.0"; g "$R" tag v1.0.0
+PKG=$(git -C "$R" rev-parse HEAD)
+g "$R" checkout -b sims
+mkdir -p "$R/examples/sims"
+demo_sim() { # demo_sim NAME SUMMARY: a fully specified .sim building the package's thorn
+  local q="'''"
+  printf '%s\n' "format = 1" "" "[sim]" "name = \"$1\"" "summary = \"$2\"" "license = \"CC0-1.0\"" "root = \"Cactus\"" "" \
+    "[thornlist]" "filename = \"$1.th\"" "text = $q" "!CRL_VERSION = 1.0" "!DEFINE ROOT = Cactus" \
+    "!TARGET = \$ROOT/arrangements" "!TYPE = git" "!URL = $U/bbh-demo.git" "!REPO_PATH = \$2" "!CHECKOUT =" \
+    "BBHDemoArr/BBHDemo" "$q" "" "[parfile]" "filename = \"$1.par\"" "kind = \"par\"" "text = $q" \
+    "ActiveThorns = \"BBHDemo\"" "$q" "" "[[repo]]" "name = \"bbh-demo\"" "url = \"$U/bbh-demo.git\"" "commit = \"$PKG\""
+}
+demo_sim qc0 "Head-on QC-0, low resolution" > "$R/examples/sims/qc0.sim"
+demo_sim tov "A single TOV star" > "$R/examples/sims/tov.sim"
+cat > "$R/cactarium-sim.toml" <<'TOML'
+format = 2
+
+[sim]
+name = "bbh-demo-sims"
+owners = ["max"]
+description = "bbh-demo's example simulations, released together with sim-vX.Y.Z tags."
+tag-pattern = "sim-v{major}.{minor}.{patch}"
+
+[sim.files]
+qc0 = "examples/sims/qc0.sim"
+tov = "examples/sims/tov.sim"
+TOML
+commit "$R" "Example sims"; g "$R" tag sim-v1.0.0
+g "$R" checkout master
+publish bbh-demo
+cli register max $U/bbh-demo.git
+cli register max $U/bbh-demo.git --tag sim-v1.0.0
+
 # Move a frozen tag upstream: the site keeps serving the frozen commit and raises an alert.
 R=$WORK/carpetx
 g "$R" checkout master

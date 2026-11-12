@@ -674,14 +674,17 @@ def ktag(msg, tag):
     sh("git", "add", "-A", cwd=kdem); sh("git", *ident, "commit", "-q", "-m", msg, cwd=kdem); sh("git", "tag", tag, cwd=kdem)
 sh("git", "init", "-q", "-b", "master", cwd=kdem)
 kmanifest('into = "KadathDemo/src/demolib"\n'); ktag("kadathdemo", "v1.0.0")
-kmanifest(''); ktag("forget into", "v1.1.0")
-kmanifest('into = "KadathDemo/src"\n'); ktag("into a folder in use", "v1.2.0")
 kbare = ENV["DEMO_REPOS"] + "/kadathdemo.git"
 subprocess.run(["rm", "-rf", kbare], check=True)
 sh("git", "clone", "-q", "--bare", kdem, kbare, cwd=work)
 maxv.get("/new/repo")
 s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/kadathdemo.git", "owner": "max"})
 check("a package depending on a library registers", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+# Later tags with mistakes (registration reads the newest tag first and would refuse them).
+kmanifest(''); ktag("forget into", "v1.1.0")
+kmanifest('into = "KadathDemo/src"\n'); ktag("into a folder in use", "v1.2.0")
+sh("git", "push", "-q", kbare, "master", "--tags", cwd=kdem)
+subprocess.run(["just", "cli", "sync", "max/kadathdemo"], capture_output=True, text=True)
 s, body, _ = anon.get("/api/v1/packages/max/kadathdemo/versions")
 check("its dependency carries into, and no needs", s == 200 and '"into":"KadathDemo/src/demolib"' in body
       and '"target":"et/demolib"' in body and '"needs"' not in body, body[:500])
@@ -765,7 +768,8 @@ def cli_sync(slug):
     run = subprocess.run(["just", "cli", "sync", slug], capture_output=True, text=True)
     return run.returncode == 0, run.stdout + run.stderr
 def has_version(v, slug, label):
-    return f'href="/{slug}/{label}"' in v.get(f"/{slug}?tab=versions")[1]
+    """Whether the entry's version list links `label` (a multi-sim entry's links carry ?sim=)."""
+    return re.search(rf'href="/{re.escape(slug)}/{re.escape(label)}["?]', v.get(f"/{slug}?tab=versions")[1]) is not None
 def retag(cwd, bare, tag):
     """Commit what changed and (re)point `tag` at it, upstream too."""
     sh("git", "add", "-A", cwd=cwd); sh("git", *ident, "commit", "-q", "--allow-empty", "-m", tag, cwd=cwd)
@@ -871,9 +875,10 @@ check("once the repo answers and the package is public, both tags are read",
       ok and has_version(anon, "max/pinsim", "1.1.0") and has_version(anon, "max/pinsim", "1.2.0"), out[-400:])
 page(anon, "/max/pinsim/1.1.0?tab=pins", contains="max/pinpkg")
 page(anon, "/max/pinsim/1.2.0?tab=pins", contains="bob/pendpkg@1.0.0")
-# Facts about the commit still make it invalid: a pin to a repo nobody registered.
+# Facts about the commit still make it invalid: a pin to a repo nobody registered (yet).
+_, _, ntagged, _ = tiny_package("nobody", "max", "NoArr")
 open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged),
-                                                                   ("nobody", "NoArr", REPOS + "/nobody.git", ptagged)]))
+                                                                   ("nobody", "NoArr", REPOS + "/nobody.git", ntagged)]))
 retag(psim, psbare, "v1.3.0")
 ok, out = cli_sync("max/pinsim")
 text = page(maxv, "/max/pinsim?tab=versions")
@@ -902,10 +907,321 @@ check("a repo with a package and a sim registers both", run.returncode == 0 and 
 os.remove(os.path.join(sib, "run.sim")); os.remove(os.path.join(sib, "cactarium-sim.toml"))
 retag(sib, sibbare, "v1.1.0")
 ok, out = cli_sync("max/sibrepo-sim")
-check("a tag without the sim's manifest, on a repo with other entries, is left unread for the sim",
-      not ok and "another entry's release" in out and not has_version(maxv, "max/sibrepo-sim", "1.1.0"), out[-400:])
+check("a tag without the sim's manifest, on a repo with other entries, is recorded as not the sim's, never frozen",
+      ok and not has_version(maxv, "max/sibrepo-sim", "1.1.0") and '<span class="mono">v1.1.0</span>: it has no cactarium-sim.toml' in maxv.get("/max/sibrepo-sim")[1], out[-400:])
 ok, out = cli_sync("max/sibrepo")
 check("and is the package's release", ok and has_version(maxv, "max/sibrepo", "1.1.0"), out[-400:])
+# ---------------------------------------------------------------------------------------------
+# Several entries on one repo, multi-sim entries, and how tags become versions per entry. All on
+# scratch repos built here.
+def cli(*args):
+    """`just cli ...`: (ok, output)."""
+    run = subprocess.run(["just", "cli", *args], capture_output=True, text=True)
+    return run.returncode == 0, run.stdout + run.stderr
+
+def resolve(req):
+    s, body, hdrs = anon.get("/api/v1/resolve?req=" + urllib.parse.quote(req))
+    try:
+        return s, json.loads(body), hdrs
+    except ValueError:
+        return s, {"raw": body}, hdrs
+
+def new_tree(name):
+    d = os.path.join(work, name)
+    subprocess.run(["rm", "-rf", d], check=True)
+    os.makedirs(d)
+    sh("git", "init", "-q", "-b", "master", cwd=d)
+    return d
+
+def write(d, rel, text):
+    path = os.path.join(d, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").write(text)
+
+def thorn_at(d, arr):
+    for f, t in [("interface.ccl", f"IMPLEMENTS: {arr}Thorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+        write(d, f"{arr}Thorn/{f}", t)
+
+def commit_tag(d, msg, *tags):
+    sh("git", "add", "-A", cwd=d); sh("git", *ident, "commit", "-q", "--allow-empty", "-m", msg, cwd=d)
+    for t in tags:
+        sh("git", "tag", "-f", t, cwd=d)
+    return sh("git", "rev-parse", "HEAD", cwd=d)
+
+def publish_tree(d, name):
+    b = ENV["DEMO_REPOS"] + f"/{name}.git"
+    subprocess.run(["rm", "-rf", b], check=True)
+    sh("git", "clone", "-q", "--bare", d, b, cwd=work)
+    return b
+
+def push_all(d, bare):
+    sh("git", "push", "-q", "--force", bare, "--all", cwd=d)
+    sh("git", "push", "-q", "--force", bare, "--tags", cwd=d)
+
+def package_toml(name, arr, extra=""):
+    return f'format = 1\n\n[package]\nname = "{name}"\nowners = ["max"]\ndescription = "{name}, a scratch package"\narrangement = "{arr}"\n{extra}'
+
+def sims_toml(name, files, pattern="sim-v{major}.{minor}.{patch}"):
+    pat = f'tag-pattern = "{pattern}"\n' if pattern else ""
+    listed = "".join(f'{k} = "{v}"\n' for k, v in files.items())
+    return (f'format = 2\n\n[sim]\nname = "{name}"\nowners = ["max"]\ndescription = "Example sims of {name}"\n{pat}'
+            f'\n[sim.files]\n{listed}')
+
+def versions_of(slug):
+    return page(maxv, f"/{slug}?tab=versions")
+
+# --- A package and a two-sim entry on one repo, the sims released with their own sim-vX.Y.Z tags,
+# from a branch (the default branch has no sims manifest, as Cottonmouth's main has none).
+M = new_tree("msrepo")
+MURL = REPOS + "/msrepo.git"
+write(M, "README.md", "before the manifest\n")
+commit_tag(M, "before the manifest", "v0.9.0")
+thorn_at(M, "MsArr")
+write(M, "cactarium.toml", package_toml("msrepo", "MsArr"))
+pkg_c = commit_tag(M, "msrepo 1.0.0", "v1.0.0")
+mbare = publish_tree(M, "msrepo")
+ok, out = cli("register", "max", MURL)
+check("register the package (the default branch has only cactarium.toml)", ok and "Registered max/msrepo (package" in out, out[-400:])
+text = versions_of("max/msrepo")
+check("its tag from before the manifest is invalid (no siblings yet)", 'href="/max/msrepo/0.9.0"' in text and "no cactarium.toml" in text, text[text.find("<table"):][:500])
+sh("git", "checkout", "-q", "-b", "sims", cwd=M)
+def ms_sim(name):
+    return pin_sim(name, [("msrepo", "MsArr", MURL, pkg_c)])
+write(M, "examples/sims/alpha.sim", ms_sim("alpha"))
+write(M, "examples/sims/beta.sim", ms_sim("beta"))
+write(M, "cactarium-sim.toml", sims_toml("msrepo-sims", {"alpha": "examples/sims/alpha.sim", "beta": "examples/sims/beta.sim"}))
+# sim/v1.0.0 is the form never to use: the default rule reads it as track "sim".
+commit_tag(M, "example sims", "sim-v1.0.0", "sim/v1.0.0")
+push_all(M, mbare)
+ok, out = cli("register", "max", MURL)
+check("registering again from the default branch finds nothing to add", not ok and "nothing to add" in out, out[-400:])
+ok, out = cli("check", MURL, "--tag", "sim-v1.0.0")
+check("cactarium check: the dry run reads the new entry at the tag, and what the package makes of it",
+      ok and "new sim max/msrepo-sims" in out and "max/msrepo-sims@1.0.0: reads cleanly (sims: alpha, beta)" in out
+      and "max/msrepo: sim-v1.0.0 isn't one of its tags" in out, out[-800:])
+page(anon, "/max/msrepo-sims", expect=404)  # the dry run wrote nothing
+ok, out = cli("register", "max", MURL, "--tag", "sim-v1.0.0")
+check("register --tag adds only the missing entry", ok and "Registered max/msrepo-sims (sim" in out and "max/msrepo (" not in out, out[-400:])
+ok, out = cli("sync", "max/msrepo")
+check("no cross-ingest: sim-v1.0.0 is not a package version", "sim-v1.0.0" not in versions_of("max/msrepo"))
+check("but sim/v1.0.0 is, on a track named sim: why sims never use sim/v...", has_version(maxv, "max/msrepo", "sim:1.0.0"))
+check("and the sims take only their own tag", has_version(maxv, "max/msrepo-sims", "1.0.0") and not has_version(maxv, "max/msrepo-sims", "sim:1.0.0"))
+# Three-part resolution and per-sim downloads, each with its own sha256.
+shas = {}
+for sim in ["alpha", "beta"]:
+    s, r, _ = resolve(f"max/msrepo-sims/{sim}@1")
+    check(f"max/msrepo-sims/{sim}@1 resolves to that sim of 1.0.0",
+          s == 200 and r.get("slug") == f"max/msrepo-sims/{sim}@1.0.0" and r.get("sim") == sim and r.get("tag") == "sim-v1.0.0"
+          and "newer-without-sim" not in r, r)
+    s, body, hdrs = anon.get(f"/api/v1/sims/max/msrepo-sims/1.0.0/download?sim={sim}")
+    import hashlib as _h
+    sha = _h.sha256(body.encode()).hexdigest()
+    shas[sim] = sha
+    check(f"download ?sim={sim}: the stamped file, with its own sha256",
+          s == 200 and hdrs.get("x-sha256") == sha and f'cactarium = "max/msrepo-sims/{sim}@1.0.0"' in body
+          and body.startswith("format = 4"), f"{s} {hdrs.get('x-sha256')} {sha} {body[:200]}")
+check("each sim has its own file and sha", shas.get("alpha") != shas.get("beta"))
+s, r, _ = resolve("max/msrepo-sims@1")
+check("owner/name of a multi-sim entry is refused, listing its sims",
+      s == 400 and "max/msrepo-sims/alpha" in str(r) and "max/msrepo-sims/beta" in str(r), r)
+s, body, _ = anon.get("/api/v1/sims/max/msrepo-sims/1.0.0/download")
+check("its download without ?sim= is refused, naming the sims", s == 400 and "alpha" in body and "beta" in body, f"{s} {body[:200]}")
+s, r, _ = resolve("max/repo-sim/alpha@1")
+check("a one-sim entry has no sims to name", s == 400 and "is one sim" in str(r), r)
+s, body, _ = anon.get("/api/v1/sims/max/repo-sim/1.0.0/download?sim=alpha")
+check("nor does its download take ?sim=", s == 400, f"{s} {body[:200]}")
+s, body, _ = anon.get("/api/v1/entries/max/msrepo-sims")
+check("the entry lists its sims", s == 200 and json.loads(body).get("sims") == ["alpha", "beta"], body[:300])
+page(anon, "/max/msrepo-sims", contains="Sims in this version")
+text = page(anon, "/max/msrepo-sims/1.0.0?sim=beta&tab=pins", contains="max/msrepo@1.0.0")
+check("the sim page names the sim in its import command and links", "cactup import max/msrepo-sims/beta@1.0.0" in text
+      and "download.sim?sim=beta" in text and re.search(r"sim=beta&(amp|#38);tab=thornlist", text) is not None, text[:0])
+s, body, _ = anon.get("/max/msrepo-sims/1.0.0/download.sim?sim=alpha")
+check("the web download takes ?sim= too", s == 200 and "max/msrepo-sims/alpha@1.0.0" in body, f"{s} {body[:200]}")
+# A vX.Y.Z tag that also carries cactarium-sim.toml is the package's, never the sims'.
+commit_tag(M, "package 2.0.0 on the sims branch", "v2.0.0")
+push_all(M, mbare)
+cli("sync", "max/msrepo"); cli("sync", "max/msrepo-sims")
+check("a v tag carrying cactarium-sim.toml is the package's", has_version(maxv, "max/msrepo", "2.0.0"))
+check("and not the sims'", not has_version(maxv, "max/msrepo-sims", "2.0.0"))
+# One bad sim refuses the whole version, with the reason.
+write(M, "examples/sims/beta.sim", ms_sim("beta").replace(f'commit = "{pkg_c}"', 'dirty = true'))
+commit_tag(M, "a broken beta", "sim-v1.1.0")
+push_all(M, mbare)
+ok, out = cli("sync", "max/msrepo-sims")
+text = versions_of("max/msrepo-sims")
+check("one bad sim makes the version invalid, naming the sim", 'href="/max/msrepo-sims/1.1.0' in text and "sim beta" in text, text[text.find("<table"):][:700])
+ok, out = cli("reread", "max", "max/msrepo-sims", "1.1.0")
+check("re-reading an invalid version that still fails leaves it, with the reason", not ok and "sim beta" in out, out[-300:])
+# A dropped sim resolves to its last version, flagged. Checked first with a dry run of the branch.
+write(M, "cactarium-sim.toml", sims_toml("msrepo-sims", {"alpha": "examples/sims/alpha.sim"}))
+sh("git", "add", "-A", cwd=M); sh("git", *ident, "commit", "-q", "-m", "drop beta", cwd=M)
+push_all(M, mbare)
+ok, out = cli("check", MURL, "--tag", "sim-v1.2.0", "--commit", "sims")
+check("cactarium check reads a tag that doesn't exist yet, at a branch", ok and "max/msrepo-sims@1.2.0: reads cleanly (sims: alpha)" in out, out[-500:])
+commit_tag(M, "sims 1.2.0", "sim-v1.2.0")
+push_all(M, mbare)
+cli("sync", "max/msrepo-sims")
+s, r, _ = resolve("max/msrepo-sims/alpha@1")
+check("alpha@1 is the newest 1.x holding it", s == 200 and r.get("slug") == "max/msrepo-sims/alpha@1.2.0" and "newer-without-sim" not in r, r)
+s, r, _ = resolve("max/msrepo-sims/beta@1")
+check("a dropped sim resolves to its last version, flagged",
+      s == 200 and r.get("slug") == "max/msrepo-sims/beta@1.0.0" and r.get("newer-without-sim") == "1.2.0", r)
+s, r, _ = resolve("max/msrepo-sims/gamma@1")
+check("a sim no version holds is refused, naming the newest's sims", s == 400 and "gamma" in str(r) and "max/msrepo-sims/alpha" in str(r), r)
+page(anon, "/max/msrepo-sims/1.2.0?sim=beta", contains="has no sim")
+# A later sims manifest without tag-pattern doesn't flip the rule onto the package's v tags.
+write(M, "cactarium-sim.toml", sims_toml("msrepo-sims", {"alpha": "examples/sims/alpha.sim"}, pattern=None))
+commit_tag(M, "manifest without a pattern", "sim-v1.3.0", "v1.3.0")
+push_all(M, mbare)
+cli("sync", "max/msrepo-sims"); cli("sync", "max/msrepo")
+text = page(maxv, "/max/msrepo-sims")
+check("a sim-v tag whose manifest dropped the pattern is not the sims' (recorded, not frozen)",
+      not has_version(maxv, "max/msrepo-sims", "1.3.0") and '<span class="mono">sim-v1.3.0</span>' in text and "this entry's" in text, text[text.find("Manage"):][:900])
+check("the rule doesn't flip: the sims still follow sim-v tags", "tags matching sim-v{major}.{minor}.{patch}" in text)
+check("and v1.3.0 is the package's", has_version(maxv, "max/msrepo", "1.3.0"))
+check("the manage panel lists the other entry on the repo", "Also on this repo" in text and 'href="/max/msrepo">max/msrepo</a>' in text)
+# A verified webhook on one entry syncs every entry on the repo.
+commit_tag(M, "package 1.4.0", "v1.4.0")
+push_all(M, mbare)
+hook_id = re.search(r"/hooks/github/(\d+)", text).group(1)
+secret = re.search(r'Secret: <code class="mono">([^<]+)</code>', text).group(1)
+import hmac as _hmac
+payload = b'{"ref":"refs/tags/v1.4.0"}'
+sig = "sha256=" + _hmac.new(secret.encode(), payload, "sha256").hexdigest()
+s, _, _ = anon.req("POST", f"/hooks/github/{hook_id}", raw=payload, headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "push", "Content-Type": "application/json"})
+check("the sims entry's webhook is accepted", s == 202, s)
+for _ in range(30):
+    if has_version(anon, "max/msrepo", "1.4.0"):
+        break
+    time.sleep(1)
+check("and it synced the package, its sibling", has_version(anon, "max/msrepo", "1.4.0"))
+# Switching schemes is explicit: re-read the tag rule (here at a tag whose manifest has no pattern).
+ok, out = cli("reread-rule", "max", "max/msrepo-sims")
+check("re-reading the rule from a default branch without the manifest is refused", not ok and "no cactarium-sim.toml" in out, out[-300:])
+ok, out = cli("reread-rule", "max", "max/msrepo-sims", "--tag", "v1.3.0")
+check("re-read tag rule switches the sims to vX.Y.Z tags", ok and "now follows version tags" in out, out[-300:])
+check("tags judged not its own before are read again under the new rule: v1.3.0 is a sims version now",
+      has_version(maxv, "max/msrepo-sims", "1.3.0") and has_version(maxv, "max/msrepo-sims", "1.4.0"))
+check("tags without its manifest, or whose manifest follows sim-v, stay not its own",
+      not has_version(maxv, "max/msrepo-sims", "2.0.0") and not has_version(maxv, "max/msrepo-sims", "0.9.0"))
+# A new version sorting below one taken from another tag form gets a reviewer's warning.
+commit_tag(M, "a low number", "v1.1.5")
+push_all(M, mbare)
+cli("sync", "max/msrepo-sims")
+page(maxv, "/max/msrepo-sims/1.1.5?sim=alpha", contains="sorts below 1.2.0")
+# An invalid version frozen before the repo had siblings: re-read, it turns out not to be the entry's.
+ok, out = cli("reread", "max", "max/msrepo", "0.9.0")
+check("re-read invalid version: a tag that isn't the entry's (no manifest, siblings now) is removed",
+      ok and "isn't max/msrepo's tag" in out and not has_version(maxv, "max/msrepo", "0.9.0"), out[-300:])
+# Moving the repo moves every entry on it, together.
+mmoved = ENV["DEMO_REPOS"] + "/msrepo-moved.git"
+subprocess.run(["rm", "-rf", mmoved], check=True)
+sh("git", "clone", "-q", "--bare", mbare, mmoved, cwd=work)
+text = page(maxv, "/admin/entries?q=msrepo")
+mid = re.search(r'href="/max/msrepo">max/msrepo</a>.*?action="/admin/entries/(\d+)"', text, re.S).group(1)
+s, text, _ = maxv.post(f"/admin/entries/{mid}", {"action": "move-repo", "new_url": REPOS + "/msrepo-moved.git"})
+check("move-repo with siblings is accepted", s == 303, text[text.find("alert"):][:300])
+for slug in ["max/msrepo", "max/msrepo-sims"]:
+    s, body, _ = anon.get(f"/api/v1/entries/{slug}")
+    check(f"{slug} now reads the new URL", s == 200 and json.loads(body)["repo"].endswith("msrepo-moved.git"), body[:300])
+
+# --- A register that fails partway writes nothing.
+F = new_tree("fpkg")
+thorn_at(F, "FArr")
+write(F, "cactarium.toml", package_toml("fpkg", "FArr"))
+f_c = commit_tag(F, "fpkg")
+write(F, "run.sim", pin_sim("frun", [("fpkg", "FArr", REPOS + "/fpkg.git", f_c)]).replace(f'commit = "{f_c}"', ""))
+write(F, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "fpkg-sims"\nowners = ["max"]\nfile = "run.sim"\n')
+commit_tag(F, "a broken sim", "v1.0.0")
+publish_tree(F, "fpkg")
+ok, out = cli("register", "max", REPOS + "/fpkg.git")
+check("a register whose sims fail at their newest tag is refused, naming them", not ok and "max/fpkg-sims@1.0.0" in out, out[-400:])
+page(anon, "/max/fpkg", expect=404)  # the package, though fine, wasn't registered either
+G = new_tree("gclash")
+thorn_at(G, "GArr")
+write(G, "cactarium.toml", package_toml("gclash", "GArr"))
+g_c = commit_tag(G, "gclash")
+write(G, "run.sim", pin_sim("grun", [("gclash", "GArr", REPOS + "/gclash.git", g_c)]))
+write(G, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "gclash"\nowners = ["max"]\nfile = "run.sim"\n')
+commit_tag(G, "a sim named like the package", "v1.0.0")
+publish_tree(G, "gclash")
+ok, out = cli("register", "max", REPOS + "/gclash.git")
+check("a register failing while creating its second entry (a name clash) is refused", not ok and "already exists" in out, out[-300:])
+s, _, _ = anon.get("/api/v1/entries/max/gclash")
+check("and writes nothing: the first entry is gone too", s == 404, s)
+
+# --- No tag-pattern anywhere: package, stack and sims share one vX.Y.Z tag.
+S = new_tree("sharedrel")
+SURL = REPOS + "/sharedrel.git"
+thorn_at(S, "ShArr")
+write(S, "cactarium.toml", package_toml("sharedrel", "ShArr"))
+s_c = commit_tag(S, "the package")
+write(S, "s.th", f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {SURL}\n!REPO_PATH = $2\n!CHECKOUT =\nShArr/ShArrThorn\n")
+write(S, "cactarium-stack.toml", 'format = 1\n\n[stack]\nname = "sharedrel-stack"\nowners = ["max"]\ndescription = "A stack beside its package"\nthornlist = "s.th"\n')
+write(S, "run.sim", pin_sim("sharedrel-sim", [("sharedrel", "ShArr", SURL, s_c)]))
+write(S, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "sharedrel-sim"\nowners = ["max"]\nfile = "run.sim"\n')
+commit_tag(S, "one release of all three", "v1.0.0")
+publish_tree(S, "sharedrel")
+ok, out = cli("register", "max", SURL)
+check("a repo with a package, a stack and a sim registers all three", ok and out.count("Registered") == 3, out[-500:])
+for slug in ["max/sharedrel", "max/sharedrel-stack", "max/sharedrel-sim"]:
+    s, r, _ = resolve(f"{slug}@1.0.0")
+    check(f"without patterns, one v tag released {slug} too", s == 200 and r.get("tag") == "v1.0.0", r)
+
+# --- One kind on vX.Y.Z; two kinds with the same tag-pattern, which share their tags.
+T = new_tree("patrel")
+TURL = REPOS + "/patrel.git"
+thorn_at(T, "PtArr")
+write(T, "cactarium.toml", package_toml("patrel", "PtArr"))
+t_c = commit_tag(T, "the package")
+write(T, "s.th", f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {TURL}\n!REPO_PATH = $2\n!CHECKOUT =\nPtArr/PtArrThorn\n")
+write(T, "cactarium-stack.toml", 'format = 1\n\n[stack]\nname = "patrel-stack"\nowners = ["max"]\nthornlist = "s.th"\ntag-pattern = "rel-{major}.{minor}.{patch}"\n')
+write(T, "run.sim", pin_sim("patrel-sim", [("patrel", "PtArr", TURL, t_c)]))
+write(T, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "patrel-sim"\nowners = ["max"]\nfile = "run.sim"\ntag-pattern = "rel-{major}.{minor}.{patch}"\n')
+commit_tag(T, "first releases", "v1.0.0", "rel-1.0.0")
+tbare = publish_tree(T, "patrel")
+ok, out = cli("register", "max", TURL)
+check("a repo whose stack and sims share a tag-pattern registers", ok and out.count("Registered") == 3, out[-500:])
+s, r, _ = resolve("max/patrel@1.0.0")
+check("the package follows v tags", s == 200 and r.get("tag") == "v1.0.0", r)
+for slug in ["max/patrel-stack", "max/patrel-sim"]:
+    s, r, _ = resolve(f"{slug}@1.0.0")
+    check(f"{slug} follows only its pattern", s == 200 and r.get("tag") == "rel-1.0.0", r)
+commit_tag(T, "package only", "v1.1.0")
+commit_tag(T, "stack and sims only", "rel-2.0.0")
+push_all(T, tbare)
+for slug in ["max/patrel", "max/patrel-stack", "max/patrel-sim"]:
+    cli("sync", slug)
+check("a v tag releases only the package", has_version(anon, "max/patrel", "1.1.0")
+      and not has_version(anon, "max/patrel-stack", "1.1.0") and not has_version(anon, "max/patrel-sim", "1.1.0"))
+check("kinds with the same pattern share its tags", has_version(anon, "max/patrel-stack", "2.0.0")
+      and has_version(anon, "max/patrel-sim", "2.0.0") and not has_version(anon, "max/patrel", "2.0.0"))
+
+# --- An invalid version for a pin to a repo nobody registered becomes valid once it is registered.
+ok, out = cli("register", "max", REPOS + "/nobody.git")
+check("register the repo the invalid pin named", ok, out[-300:])
+ok, out = cli("reread", "max", "max/pinsim", "1.3.0")
+check("re-read invalid version: it reads cleanly now", ok and "reads cleanly now" in out, out[-300:])
+page(anon, "/max/pinsim/1.3.0?tab=pins", contains="max/nobody")
+
+# --- The seeded multi-sim entry, registered with --tag beside its package.
+page(anon, "/max/bbh-demo-sims", contains="Sims in this version")
+page(anon, "/max/bbh-demo-sims/1.0.0?sim=tov&tab=thornlist", contains="BBHDemoArr/BBHDemo")
+s, r, _ = resolve("max/bbh-demo-sims/qc0")
+check("the seeded sims resolve by name", s == 200 and r.get("slug") == "max/bbh-demo-sims/qc0@1.0.0", r)
+
+# --- An old CactUp against this server: it knows neither sims nor the new fields.
+s, r, _ = resolve("max/repo-sim@1")
+check("old CactUp: a one-sim entry resolves exactly as before (no new fields)",
+      s == 200 and r.get("slug", "").startswith("max/repo-sim@1.") and "sim" not in r and "newer-without-sim" not in r, r)
+s, body, hdrs = anon.get("/api/v1/sims/max/repo-sim/1.0.0/download")
+check("old CactUp: its download is unchanged (no ?sim=, a two-part stamp, its old format)",
+      s == 200 and 'cactarium = "max/repo-sim@1.0.0"' in body and body.startswith("format = 3") and hdrs.get("x-sha256"), body[:120])
+s, r, _ = resolve("max/msrepo-sims@1")
+check("old CactUp: owner/name on a multi-sim entry is an error it shows, never a wrong file", s == 400 and r.get("error", {}).get("code") == "bad-request", r)
+s, _, _ = anon.get("/api/v1/sims/max/msrepo-sims/1.2.0/download")
+check("old CactUp: a download without ?sim= is refused, so it can't fetch a sim it didn't name", s == 400, s)
 
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
