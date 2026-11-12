@@ -880,6 +880,33 @@ text = page(maxv, "/max/pinsim?tab=versions")
 check("a pin to a repo no package was registered for is an invalid version",
       ok and 'href="/max/pinsim/1.3.0"' in text and "the repo of any package" in text, out[-300:] + text[text.find('<table'):][:600])
 
+# On a repo carrying several entries, a tag without one entry's manifest is most likely another
+# entry's release: left unread for that entry, never frozen as an invalid version of it.
+sib = os.path.join(work, "sibrepo")
+os.makedirs(os.path.join(sib, "SibArrThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: SibArrThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(sib, "SibArrThorn", f), "w").write(t)
+open(os.path.join(sib, "cactarium.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "sibrepo"\nowners = ["max"]\ndescription = "A package with a sim beside it"\narrangement = "SibArr"\n')
+sh("git", "init", "-q", "-b", "master", cwd=sib)
+sh("git", "add", "-A", cwd=sib); sh("git", *ident, "commit", "-q", "-m", "package", cwd=sib)
+sib_c = sh("git", "rev-parse", "HEAD", cwd=sib)
+open(os.path.join(sib, "run.sim"), "w").write(pin_sim("sibrun", [("sibrepo", "SibArr", REPOS + "/sibrepo.git", sib_c)]))
+open(os.path.join(sib, "cactarium-sim.toml"), "w").write('format = 1\n\n[sim]\nname = "sibrepo-sim"\nowners = ["max"]\nfile = "run.sim"\n')
+sh("git", "add", "-A", cwd=sib); sh("git", *ident, "commit", "-q", "-m", "and a sim", cwd=sib); sh("git", "tag", "v1.0.0", cwd=sib)
+sibbare = ENV["DEMO_REPOS"] + "/sibrepo.git"
+subprocess.run(["rm", "-rf", sibbare], check=True)
+sh("git", "clone", "-q", "--bare", sib, sibbare, cwd=work)
+run = subprocess.run(["just", "cli", "register", "max", REPOS + "/sibrepo.git"], capture_output=True, text=True)
+check("a repo with a package and a sim registers both", run.returncode == 0 and run.stdout.count("Registered") == 2, run.stdout + run.stderr[-300:])
+os.remove(os.path.join(sib, "run.sim")); os.remove(os.path.join(sib, "cactarium-sim.toml"))
+retag(sib, sibbare, "v1.1.0")
+ok, out = cli_sync("max/sibrepo-sim")
+check("a tag without the sim's manifest, on a repo with other entries, is left unread for the sim",
+      not ok and "another entry's release" in out and not has_version(maxv, "max/sibrepo-sim", "1.1.0"), out[-400:])
+ok, out = cli_sync("max/sibrepo")
+check("and is the package's release", ok and has_version(maxv, "max/sibrepo", "1.1.0"), out[-400:])
+
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
 head = git("carpetx", "rev-parse", "master")

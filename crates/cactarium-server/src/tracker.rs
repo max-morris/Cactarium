@@ -127,6 +127,16 @@ pub fn unreadable_at_tag(e: cactup_ecosystem_common::Error) -> AppError {
     }
 }
 
+/// Whether another entry's repo is the same as `url` (compared normalized).
+async fn shares_repo(state: &AppState, entry_id: i64, url: &str) -> AppResult<bool> {
+    let norm = git::normalize_url(url);
+    let others: Vec<String> = sqlx::query_scalar("SELECT url FROM entry_repos WHERE entry_id <> $1")
+        .bind(entry_id)
+        .fetch_all(&state.db)
+        .await?;
+    Ok(others.iter().any(|u| git::normalize_url(u) == norm))
+}
+
 /// Keeps the repo's tag rule in step with a manifest.
 async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResult<()> {
     let (pattern, since) = rule.stored();
@@ -799,7 +809,9 @@ async fn sync_inner(
     }
     if added > 0 {
         publish::touch(state, entry.id).await?;
-        // The newest version's manifest says how later tags become versions.
+        // The newest version's manifest may move `since`. It never switches the tag form by
+        // itself: a manifest that dropped or changed its tag-pattern would otherwise move the entry
+        // onto other tags (another kind's, on a repo carrying several entries).
         let newest: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND state <> 'invalid'
              ORDER BY (track = '') DESC, sort_key DESC LIMIT 1",
@@ -809,7 +821,10 @@ async fn sync_inner(
         .await?
         .flatten();
         if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
-            store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
+            let rule = TagRule::of_manifest(&m);
+            if rule.stored().0 == repo.tag_pattern {
+                store_rule(state, entry.id, &rule).await?;
+            }
         }
     }
     // What couldn't be fetched is reported (it becomes the repo's poll error) and tried again.
@@ -1032,9 +1047,19 @@ async fn prepare(
 ) -> AppResult<Prepared> {
     let text = match &repo.overlay_manifest {
         Some(o) => o.clone(),
-        None => git::read_in(co, &repo.manifest_file)
-            .map_err(AppError::bad)?
-            .ok_or_else(|| AppError::bad(format!("no {} at this tag", repo.manifest_file)))?,
+        None => match git::read_in(co, &repo.manifest_file).map_err(AppError::bad)? {
+            Some(t) => t,
+            // On a repo that carries other entries too, a tag without this entry's manifest is
+            // most likely another entry's release, not a broken release of this one: left unread
+            // rather than frozen invalid.
+            None if shares_repo(state, entry.id, &repo.url).await? => {
+                return Err(AppError::Upstream(format!(
+                    "no {} at this tag, and the repo carries other entries: probably another entry's release",
+                    repo.manifest_file
+                )));
+            }
+            None => return Err(AppError::bad(format!("no {} at this tag", repo.manifest_file))),
+        },
     };
     let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(unreadable_at_tag)?;
     if name_of(&m) != entry.name {
