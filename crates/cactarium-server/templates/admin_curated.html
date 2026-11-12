@@ -26,10 +26,16 @@ description = ""
   <div class="card stack-sm">
     <div class="row-wrap between">
       <a class="mono strong" href="{{ e.url }}">{{ e.slug }}</a>
-      <form method="post" action="/admin/curated/{{ e.id }}/hand-over">
-        <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
-        <button class="button small ghost" type="submit" title="The repo now carries its own cactarium.toml">Use the repo's manifest</button>
-      </form>
+      <div class="row-wrap">
+        <form method="post" action="/admin/curated/{{ e.id }}/reapply">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          <button class="button small ghost" type="submit" title="Re-read the published versions (same commits) with the current manifest: its dependencies, claims and thorn list">Apply the manifest to published versions</button>
+        </form>
+        <form method="post" action="/admin/curated/{{ e.id }}/hand-over">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          <button class="button small ghost" type="submit" title="The repo now carries its own cactarium.toml">Use the repo's manifest</button>
+        </form>
+      </div>
     </div>
     {% if !e.tag_rule.is_empty() %}<p class="small">{{ e.tag_rule }}</p>{% endif %}
     <p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span> ({{ v.commit }}){% if !loop.last %} · {% endif %}{% else %}No versions yet.{% endfor %}</p>

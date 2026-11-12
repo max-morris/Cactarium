@@ -414,6 +414,76 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
     Ok(())
 }
 
+/// Admin-only: re-reads the published versions of a curated package with its current overlay
+/// manifest. A curated package's manifest is metadata the Cactarium keeps, not repo content, so a
+/// fix to it (dependencies added, a thorn list corrected) can apply to versions already published.
+/// Each version keeps its commit and tree; its manifest, thorns and claims are replaced by what a
+/// fresh ingest of that commit with the current overlay gives, in one transaction. A version that
+/// can't be fetched or doesn't fit the overlay is left as it was and reported. Invalid versions
+/// are skipped: they are never served. Returns (versions re-read, versions left with why).
+pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> AppResult<(usize, Vec<String>)> {
+    let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
+    if !entry.curated || repo.overlay_manifest.is_none() {
+        return Err(AppError::bad(format!("{} isn't curated: its versions read the repo's own manifest", entry.slug())));
+    }
+    let (mut done, mut left) = (0, Vec::new());
+    for v in model::all_versions(state, entry.id).await? {
+        let label = v.label();
+        if v.state == "invalid" {
+            continue;
+        }
+        let Some(commit) = v.commit.clone() else {
+            left.push(format!("{label}: has no commit"));
+            continue;
+        };
+        let tv: TrackedVersion = label.parse().map_err(AppError::bad)?;
+        let r = RemoteRef { name: v.tag.clone().unwrap_or_else(|| tv.conventional_tag()), commit: commit.clone() };
+        let co = match git::checkout(policy(state), &repo.url, &commit, v.tag.as_deref()).await {
+            Ok(co) => co,
+            Err(e) => {
+                left.push(format!("{label}: cannot fetch {commit}: {e:#}"));
+                continue;
+            }
+        };
+        let p = match prepare(state, entry, &repo, &co, &r, &tv).await {
+            Ok(p) => p,
+            Err(e) => {
+                left.push(format!("{label}: {e}"));
+                continue;
+            }
+        };
+        let mut tx = state.db.begin().await?;
+        for table in ["thorns", "claims"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE version_id = $1"))
+                .bind(v.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE versions SET manifest = $2, readme_html = $3 WHERE id = $1")
+            .bind(v.id)
+            .bind(&p.manifest_json)
+            .bind(&p.readme_html)
+            .execute(&mut *tx)
+            .await?;
+        store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
+        crate::audit::audit_with(
+            &mut tx,
+            Some(admin.id),
+            "curated.reapply",
+            Some(&entry.slug()),
+            json!({ "version": label, "commit": commit }),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        done += 1;
+    }
+    if done > 0 {
+        publish::touch(state, entry.id).await?;
+    }
+    Ok((done, left))
+}
+
 /// Checks that `url` holds the history the entry's published versions froze: every tagged version
 /// whose tag is still where it was frozen has that tag at the same commit there, and every version
 /// named by commit can be fetched from it. A moved repo (say, transferred to an organization) passes;

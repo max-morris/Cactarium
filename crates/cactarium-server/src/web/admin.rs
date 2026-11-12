@@ -523,6 +523,28 @@ pub async fn hand_over(
     }
 }
 
+/// Re-reads a curated package's published versions with its current overlay manifest.
+pub async fn reapply(
+    State(state): State<AppState>,
+    a: Admin,
+    Path(id): Path<i64>,
+    Form(f): Form<CsrfOnly>,
+) -> AppResult<Response> {
+    a.0.session.check_csrf(&f.csrf)?;
+    let e = model::entry_by_id(&state, id).await?;
+    match tracker::reapply_curated(&state, &a.0.user, &e).await {
+        Ok((_, left)) if left.is_empty() => Ok(Redirect::to("/admin/curated").into_response()),
+        Ok((done, left)) => {
+            curated_page(&state, &a, Some(format!("{}: {done} re-read; left as they were: {}", e.slug(), left.join("; "))))
+                .await
+        }
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+            curated_page(&state, &a, Some(format!("{}: {m}", e.slug()))).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CsrfOnly {
     #[serde(rename = "_csrf")]
