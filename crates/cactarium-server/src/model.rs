@@ -92,8 +92,14 @@ impl Version {
         self.review == "approved"
     }
 
+    /// Not invalid: neither marked so nor carrying a reason it was found invalid (a row that was
+    /// invalid stays unservable whatever later happens to its tag).
+    pub fn valid(&self) -> bool {
+        self.state != "invalid" && self.invalid_reason.is_none()
+    }
+
     pub fn usable(&self) -> bool {
-        self.approved() && !self.yanked && self.state != "invalid"
+        self.approved() && !self.yanked && self.valid()
     }
 }
 
@@ -296,6 +302,33 @@ pub fn fmt_time(t: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row that was found invalid is never usable, whatever its state says now.
+    #[test]
+    fn a_reason_for_invalid_makes_a_version_unusable() {
+        let v = Version {
+            id: 1,
+            entry_id: 1,
+            track: String::new(),
+            version: "1.1.0".into(),
+            sort_key: semver_sort_key(&semver::Version::new(1, 1, 0)),
+            tag: Some("v1.1.0".into()),
+            commit: None,
+            tree: None,
+            is_virtual: false,
+            state: "tag-moved".into(),
+            invalid_reason: Some("the manifest names 'x', not 'y'".into()),
+            yanked: false,
+            yank_reason: None,
+            review: "approved".into(),
+            manifest: None,
+            readme_html: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert!(!v.valid() && !v.usable());
+        let ok = Version { state: "tag-moved".into(), invalid_reason: None, ..v };
+        assert!(ok.valid() && ok.usable());
+    }
 
     #[test]
     fn semver_keys_order_prereleases_first() {

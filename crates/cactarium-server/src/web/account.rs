@@ -290,7 +290,7 @@ pub async fn cut_release(
     }
     // Resolve before anything is created, so a definition that fails leaves no trace.
     let own = thornlist.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("{t}\n"));
-    let resolution = stacks::resolve(state, &owner, stack, own.as_deref(), None).await?;
+    let resolution = stacks::resolve(state, &owner, stack, own.as_deref(), None).await.map_err(stacks::for_a_person)?;
     let slug = format!("{owner}/{name}@{label}").parse().map_err(AppError::bad)?;
     let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
     let entry = match existing {
@@ -373,7 +373,8 @@ pub async fn new_stack(
         .await
     {
         Ok((e, _)) => Ok(Redirect::to(&e.url()).into_response()),
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+        // On a form, something not available yet is simply what stops this release now.
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
             Ok(page(&NewStackPage {
                 ctx: PageCtx::new(&state, Some(&s.session)),
                 error: Some(m),

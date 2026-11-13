@@ -30,6 +30,17 @@ use crate::state::AppState;
 
 /// At most this many tags are ingested per sync; the rest follow on later polls.
 const MAX_NEW_PER_SYNC: usize = 50;
+/// At most this many waiting tags (left unread earlier) are tried again per sync, after the new ones.
+const MAX_WAITING_PER_SYNC: usize = 10;
+
+/// Whether a sync honors waiting tags' backoff. The poller does; a sync someone asked for (the
+/// button, the API, the command line, a registration) tries the waiting tags now, still at most
+/// [`MAX_WAITING_PER_SYNC`] of them.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Pace {
+    Now,
+    Background,
+}
 
 fn policy(state: &AppState) -> GitPolicy {
     GitPolicy { allow_local: state.cfg.allow_local_repos }
@@ -114,6 +125,29 @@ async fn still_curated_at(
 
 const CURATED_CHANGED: &str = "the entry changed while this ran (another curated update, a hand-over or a move); reload and try again";
 
+/// A manifest or `.sim` read at a version tag that this server can't read: invalid, unless the file
+/// is only from a newer format generation than this server knows. That is not a fact about the
+/// commit (an upgraded server reads it), so it is [`AppError::Upstream`]: the tag is left unread and
+/// tried again at the next sync instead of being frozen as an invalid version.
+pub fn unreadable_at_tag(e: cactup_ecosystem_common::Error) -> AppError {
+    match e {
+        cactup_ecosystem_common::Error::NewerFormat { .. } => {
+            AppError::Upstream(format!("{e} (this server reads it once it is upgraded)"))
+        }
+        other => AppError::bad(other),
+    }
+}
+
+/// Whether another entry's repo is the same as `url` (compared normalized).
+async fn shares_repo(state: &AppState, entry_id: i64, url: &str) -> AppResult<bool> {
+    let norm = git::normalize_url(url);
+    let others: Vec<String> = sqlx::query_scalar("SELECT url FROM entry_repos WHERE entry_id <> $1")
+        .bind(entry_id)
+        .fetch_all(&state.db)
+        .await?;
+    Ok(others.iter().any(|u| git::normalize_url(u) == norm))
+}
+
 /// Keeps the repo's tag rule in step with a manifest.
 async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResult<()> {
     let (pattern, since) = rule.stored();
@@ -128,10 +162,79 @@ async fn store_rule(state: &AppState, entry_id: i64, rule: &TagRule) -> AppResul
 
 fn version_tags(refs: Vec<RemoteRef>, rule: &TagRule) -> Vec<(RemoteRef, TrackedVersion)> {
     let mut v: Vec<_> = refs.into_iter().filter_map(|r| rule.version(&r.name).map(|t| (r, t))).collect();
-    v.sort_by(|a, b| (&a.1.track, &a.1.version).cmp(&(&b.1.track, &b.1.version)));
-    // Two tags naming one version: the first wins.
+    // Two tags naming one version: the one written the rule's own way wins (see `spelling_rank`),
+    // then the first by name.
+    v.sort_by(|a, b| {
+        (&a.1.track, &a.1.version, spelling_rank(rule, &a.0.name, &a.1), &a.0.name)
+            .cmp(&(&b.1.track, &b.1.version, spelling_rank(rule, &b.0.name, &b.1), &b.0.name))
+    });
     v.dedup_by(|b, a| a.1 == b.1);
     v
+}
+
+/// How a tag spells its version, best first: the spelling a declared pattern itself writes for it
+/// (`rel-1.0` for `rel-{major}.{minor}`, no leading zeros), then the standard `[track/]vX.Y.Z`,
+/// then any other (a bare `X.Y.Z`, say an old upstream tag that predates the repo's manifest, or
+/// `rel-01.0`), so a stray spelling never takes the release's version by name.
+fn spelling_rank(rule: &TagRule, tag: &str, tv: &TrackedVersion) -> u8 {
+    if rule.pattern.as_ref().is_some_and(|p| tag == written_by(p.as_str(), tv)) {
+        0
+    } else if tag == tv.conventional_tag() {
+        1
+    } else {
+        2
+    }
+}
+
+/// The tag a pattern writes for a version: its placeholders filled in, without leading zeros.
+fn written_by(pattern: &str, tv: &TrackedVersion) -> String {
+    pattern
+        .replace("{major}", &tv.version.major.to_string())
+        .replace("{minor}", &tv.version.minor.to_string())
+        .replace("{patch}", &tv.version.patch.to_string())
+}
+
+/// Whether an entry has tags in a range that aren't read yet.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Unread {
+    No,
+    Yes,
+    /// Its repo can't be listed right now: wait rather than freeze.
+    CantTell,
+}
+
+/// Whether an entry has tags in `req` that aren't read yet: waiting ones, or ones its rule picks
+/// with neither a version nor a "not this entry's" record.
+pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosystem_common::version::TrackedReq) -> AppResult<Unread> {
+    let Some(repo) = repo_of(state, entry_id).await? else { return Ok(Unread::No) };
+    let rule = TagRule::of(&repo)?;
+    let in_range = |tag: &str| rule.version(tag).is_some_and(|v| req.matches(&v));
+    let waiting: Vec<String> = sqlx::query_scalar("SELECT tag FROM waiting_tags WHERE entry_id = $1")
+        .bind(entry_id)
+        .fetch_all(&state.db)
+        .await?;
+    if waiting.iter().any(|t| in_range(t)) {
+        return Ok(Unread::Yes);
+    }
+    let Ok(refs) = git::ls_tags(policy(state), &repo.url).await else { return Ok(Unread::CantTell) };
+    let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
+    )
+    .bind(entry_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let has_foreign: bool = sqlx::query_scalar("SELECT to_regclass('foreign_tags') IS NOT NULL").fetch_one(&state.db).await?;
+    let foreign: std::collections::BTreeSet<String> = if has_foreign {
+        sqlx::query_scalar("SELECT tag FROM foreign_tags WHERE entry_id = $1").bind(entry_id).fetch_all(&state.db).await?.into_iter().collect()
+    } else {
+        Default::default()
+    };
+    let any = version_tags(refs, &rule)
+        .iter()
+        .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && !foreign.contains(&r.name));
+    Ok(if any { Unread::Yes } else { Unread::No })
 }
 
 /// What a repo offers, read at its newest version tag.
@@ -269,7 +372,7 @@ pub async fn register(
     for e in &entries {
         // A tag whose commit can't be fetched right now stays unread (kept as the repo's poll
         // error); the poller tries it again.
-        match sync_as(state, e, Some(user)).await {
+        match sync_as(state, e, Some(user), Pace::Now).await {
             Ok(_) | Err(AppError::Upstream(_)) => {}
             Err(err) => return Err(err),
         }
@@ -305,7 +408,7 @@ pub async fn register_curated(
     attach_repo(state, &entry, &url, PACKAGE_FILE, Some(overlay), &TagRule::of_manifest(&m)).await?;
     // The admin vouches for the tags that exist now; later upstream tags are reviewed unless the
     // entry or its owner is trusted. A failure is kept as the repo's poll error.
-    let _ = sync_as(state, &entry, Some(admin)).await;
+    let _ = sync_as(state, &entry, Some(admin), Pace::Now).await;
     Ok(entry)
 }
 
@@ -365,7 +468,7 @@ pub async fn update_curated(
     )
     .await?;
     tx.commit().await?;
-    sync_as(state, entry, Some(admin)).await
+    sync_as(state, entry, Some(admin), Pace::Now).await
 }
 
 /// Admin-only: a curated package whose repo now carries its own cactarium.toml (on its default
@@ -643,7 +746,7 @@ struct Known {
 /// Brings an entry up to date with its repo's tags. Returns how many versions were added. A new
 /// tag is reviewed unless the entry or its owner is trusted (see `publish::release_review`).
 pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
-    sync_as(state, entry, None).await
+    sync_as(state, entry, None, Pace::Now).await
 }
 
 /// Syncs of one entry run one at a time: two at once would both see a tag as new and race to
@@ -688,7 +791,7 @@ pub fn sync_soon(state: AppState, entry_id: i64) {
 /// [`sync`] within [`SYNC_BUDGET`]; a sync stopped for time is recorded as the repo's poll error.
 async fn budgeted_sync(state: &AppState, entry_id: i64) -> AppResult<usize> {
     let entry = model::entry_by_id(state, entry_id).await?;
-    match tokio::time::timeout(SYNC_BUDGET, sync(state, &entry)).await {
+    match tokio::time::timeout(SYNC_BUDGET, sync_as(state, &entry, None, Pace::Background)).await {
         Ok(r) => r,
         Err(_) => {
             let why = format!("reading the repo took over {} minutes and was stopped", SYNC_BUDGET.as_secs() / 60);
@@ -703,7 +806,7 @@ async fn budgeted_sync(state: &AppState, entry_id: i64) -> AppResult<usize> {
 }
 
 /// `sync`, with the tags found counted as published by `actor` (the user registering the repo).
-async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppResult<usize> {
+async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>, pace: Pace) -> AppResult<usize> {
     let lock = entry_sync_lock(entry.id);
     let _one_at_a_time = lock.lock().await;
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
@@ -721,7 +824,7 @@ async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppRe
             .await?;
         return Ok(0);
     }
-    let result = sync_inner(state, entry, &repo, actor).await;
+    let result = sync_inner(state, entry, &repo, actor, pace).await;
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
         .bind(entry.id)
@@ -736,6 +839,7 @@ async fn sync_inner(
     entry: &Entry,
     repo: &RepoRow,
     actor: Option<&User>,
+    pace: Pace,
 ) -> AppResult<usize> {
     let refs = git::ls_tags(policy(state), &repo.url).await.map_err(AppError::bad)?;
     let remote: BTreeMap<String, String> =
@@ -748,11 +852,23 @@ async fn sync_inner(
     .await?;
     let by_tag: BTreeMap<&str, &Known> =
         known.iter().filter_map(|k| k.tag.as_deref().map(|t| (t, k))).collect();
+    // Versions the entry has, by label, whatever tag froze them: another tag naming one of them (a
+    // bare 1.0.0 beside v1.0.0) is no new version, and would only collide.
+    let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
+    )
+    .bind(entry.id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
 
     for k in &known {
         let (Some(tag), Some(frozen)) = (&k.tag, &k.commit) else { continue };
         match remote.get(tag) {
-            Some(now) if now != frozen && k.state != "tag-moved" => {
+            // An invalid version is never served: a tag moving off it changes nothing (it stays
+            // invalid, never "tag-moved", which would make it look like a usable version).
+            Some(now) if now != frozen && k.state != "tag-moved" && k.state != "invalid" => {
                 mark(state, entry, k.id, "tag-moved", tag, frozen, Some(now)).await?;
             }
             None if k.state != "upstream-missing" && k.state != "invalid" => {
@@ -768,25 +884,88 @@ async fn sync_inner(
         }
     }
 
+    // Tags a later release recorded as not this entry's (its foreign_tags table, present after a
+    // rollback from it): left alone while they name the commit they were judged at, as it would.
+    let has_foreign: bool = sqlx::query_scalar("SELECT to_regclass('foreign_tags') IS NOT NULL")
+        .fetch_one(&state.db)
+        .await?;
+    let foreign: BTreeMap<String, String> = if has_foreign {
+        sqlx::query_as::<_, (String, String)>("SELECT tag, commit FROM foreign_tags WHERE entry_id = $1")
+            .bind(entry.id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+
+    // Tags left unread earlier (waiting_tags): tried again after the new ones, with backoff.
+    let waiting = waiting_of(state, entry.id, &remote).await?;
     let mut added = 0;
-    // Tags whose commits couldn't be fetched this time: left unread, so the next sync tries again.
+    // Tags that couldn't be read this time: left unread, so a later sync tries again. They don't
+    // count toward MAX_NEW_PER_SYNC, so tags waiting can't hold up newer ones.
     let mut unfetched: Vec<String> = Vec::new();
-    for (r, tv) in version_tags(refs, &TagRule::of(repo)?) {
-        if by_tag.contains_key(r.name.as_str()) {
-            continue;
-        }
+    let candidates: Vec<(RemoteRef, TrackedVersion)> = version_tags(refs, &TagRule::of(repo)?)
+        .into_iter()
+        .filter(|(r, tv)| {
+            !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) && !have.contains(&tv.to_string())
+        })
+        .collect();
+    let (retry, fresh): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|(r, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
+    // New tags that turn out to wait are capped too, so one sync (a registration's, say) never
+    // tries hundreds of them; the rest are new again at the next sync.
+    let (mut new_waiting, mut new_later) = (0, 0);
+    for (r, tv) in &fresh {
         if added == MAX_NEW_PER_SYNC {
             break;
         }
-        match ingest(state, entry, repo, &r, &tv, actor).await {
-            Ok(()) => added += 1,
-            Err(AppError::Upstream(why)) => unfetched.push(why),
+        if new_waiting == MAX_WAITING_PER_SYNC {
+            new_later += 1;
+            continue;
+        }
+        match ingest(state, entry, repo, r, tv, actor).await {
+            Ok(()) => {
+                added += 1;
+                // A tag that waited at another commit and moved since.
+                done_waiting(state, entry.id, &r.name).await?;
+            }
+            Err(AppError::Upstream(why)) => {
+                new_waiting += 1;
+                unfetched.push(wait(state, entry, r, why).await);
+            }
             Err(e) => return Err(e),
         }
     }
+    if new_later > 0 {
+        unfetched.push(format!("{new_later} more new tag(s) not tried this time (at most {MAX_WAITING_PER_SYNC} new tags wait per check)"));
+    }
+    let (mut tried, mut later) = (0, 0);
+    for (r, tv) in &retry {
+        let w = &waiting[&r.name];
+        if tried == MAX_WAITING_PER_SYNC || (pace == Pace::Background && w.next_try_at > time::OffsetDateTime::now_utc()) {
+            later += 1;
+            continue;
+        }
+        tried += 1;
+        match ingest(state, entry, repo, r, tv, actor).await {
+            Ok(()) => {
+                added += 1;
+                done_waiting(state, entry.id, &r.name).await?;
+            }
+            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await),
+            Err(e) => return Err(e),
+        }
+    }
+    if later > 0 {
+        unfetched.push(format!("{later} more waiting tag(s) not tried this time (each backs off, up to 6 hours apart)"));
+    }
     if added > 0 {
         publish::touch(state, entry.id).await?;
-        // The newest version's manifest says how later tags become versions.
+        // The newest version's manifest may move `since`. It never switches the tag form by
+        // itself: a manifest that dropped or changed its tag-pattern would otherwise move the entry
+        // onto other tags (another kind's, on a repo carrying several entries).
         let newest: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND state <> 'invalid'
              ORDER BY (track = '') DESC, sort_key DESC LIMIT 1",
@@ -796,7 +975,10 @@ async fn sync_inner(
         .await?
         .flatten();
         if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
-            store_rule(state, entry.id, &TagRule::of_manifest(&m)).await?;
+            let rule = TagRule::of_manifest(&m);
+            if rule.stored().0 == repo.tag_pattern {
+                store_rule(state, entry.id, &rule).await?;
+            }
         }
     }
     // What couldn't be fetched is reported (it becomes the repo's poll error) and tried again.
@@ -809,6 +991,77 @@ async fn sync_inner(
         )));
     }
     Ok(added)
+}
+
+/// A tag left unread: when it was last judged, and when the poller may try it again.
+struct Waiting {
+    commit: String,
+    next_try_at: time::OffsetDateTime,
+}
+
+/// The entry's waiting tags, forgetting those deleted upstream.
+async fn waiting_of(state: &AppState, entry_id: i64, remote: &BTreeMap<String, String>) -> AppResult<BTreeMap<String, Waiting>> {
+    let rows: Vec<(String, String, time::OffsetDateTime)> =
+        sqlx::query_as("SELECT tag, commit, next_try_at FROM waiting_tags WHERE entry_id = $1")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?;
+    let gone: Vec<&str> = rows.iter().filter(|(t, _, _)| !remote.contains_key(t)).map(|(t, _, _)| t.as_str()).collect();
+    if !gone.is_empty() {
+        sqlx::query("DELETE FROM waiting_tags WHERE entry_id = $1 AND tag = ANY($2)")
+            .bind(entry_id)
+            .bind(&gone)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|(t, _, _)| remote.contains_key(t))
+        .map(|(t, commit, next_try_at)| (t, Waiting { commit, next_try_at }))
+        .collect())
+}
+
+/// Records that a tag is still waiting: its retry backs off exponentially (5 minutes, doubling, at
+/// most 6 hours apart), starting over when the tag moves. Returns `why` with the next try's time.
+/// Bookkeeping only: if recording fails, that is logged and `why` returned as it is, so the sync
+/// goes on to the other tags.
+async fn wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: String) -> String {
+    match record_wait(state, entry, r, &why).await {
+        Ok(next) => format!("{why} (next automatic try after {})", model::fmt_time(next)),
+        Err(e) => {
+            tracing::error!("recording that {} waits at {}: {e}", entry.slug(), r.name);
+            why
+        }
+    }
+}
+
+async fn record_wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: &str) -> AppResult<time::OffsetDateTime> {
+    let next: time::OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO waiting_tags (entry_id, tag, commit, tries, reason, next_try_at)
+         VALUES ($1, $2, $3, 1, $4, now() + interval '5 minutes')
+         ON CONFLICT (entry_id, tag) DO UPDATE SET
+           tries = CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN LEAST(waiting_tags.tries + 1, 1000) ELSE 1 END,
+           commit = EXCLUDED.commit, reason = EXCLUDED.reason,
+           next_try_at = now() + LEAST(interval '6 hours', interval '5 minutes' *
+             power(2, LEAST(CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN waiting_tags.tries ELSE 0 END, 7)))
+         RETURNING next_try_at",
+    )
+    .bind(entry.id)
+    .bind(&r.name)
+    .bind(&r.commit)
+    .bind(why)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(next)
+}
+
+async fn done_waiting(state: &AppState, entry_id: i64, tag: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM waiting_tags WHERE entry_id = $1 AND tag = $2")
+        .bind(entry_id)
+        .bind(tag)
+        .execute(&state.db)
+        .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -848,8 +1101,14 @@ async fn mark(
     Ok(())
 }
 
+fn short(commit: &str) -> &str {
+    &commit[..10.min(commit.len())]
+}
+
 /// Freezes one tag as a version. A tag whose manifest is missing or wrong still becomes a version,
-/// marked invalid with the reason, so it is not fetched again on every poll.
+/// marked invalid with the reason, so it is not fetched again on every poll. Only facts about the
+/// commit make a version invalid: when `prepare` answers [`AppError::Upstream`] or fails on our
+/// side, nothing is stored and the tag is tried again at the next sync.
 async fn ingest(
     state: &AppState,
     entry: &Entry,
@@ -870,10 +1129,26 @@ async fn ingest(
         // Any other fetch failure (the network, the host) is worth trying again: nothing is
         // stored, so the tag is read again at the next sync.
         Err(e) => {
-            return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, &r.commit[..10.min(r.commit.len())])));
+            return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, short(&r.commit))));
         }
         Ok(co) => match prepare(state, entry, repo, &co, r, tv).await {
             Ok(p) => (None, Some(co.tree.clone()), Some(p)),
+            // Not a fact about the commit (a newer format than this server reads, a pinned package
+            // not public yet, a host that didn't answer): nothing is stored, so the tag is read
+            // again at the next sync.
+            Err(AppError::Upstream(why)) => {
+                return Err(AppError::Upstream(format!("{}: {} ({}): {why}", entry.slug(), r.name, short(&r.commit))));
+            }
+            // Our own failure (the database, say) says nothing about the commit either.
+            Err(AppError::Internal(e)) => {
+                tracing::error!("reading {} at {}: {e:#}", entry.slug(), r.name);
+                return Err(AppError::Upstream(format!(
+                    "{}: {} ({}): an internal error while reading it",
+                    entry.slug(),
+                    r.name,
+                    short(&r.commit)
+                )));
+            }
             Err(e) => (Some(e.to_string()), Some(co.tree.clone()), None),
         },
     };
@@ -997,11 +1272,21 @@ async fn prepare(
 ) -> AppResult<Prepared> {
     let text = match &repo.overlay_manifest {
         Some(o) => o.clone(),
-        None => git::read_in(co, &repo.manifest_file)
-            .map_err(AppError::bad)?
-            .ok_or_else(|| AppError::bad(format!("no {} at this tag", repo.manifest_file)))?,
+        None => match git::read_in(co, &repo.manifest_file).map_err(AppError::bad)? {
+            Some(t) => t,
+            // On a repo that carries other entries too, a tag without this entry's manifest is
+            // most likely another entry's release, not a broken release of this one: left unread
+            // rather than frozen invalid.
+            None if shares_repo(state, entry.id, &repo.url).await? => {
+                return Err(AppError::Upstream(format!(
+                    "no {} at this tag, and the repo carries other entries: probably another entry's release",
+                    repo.manifest_file
+                )));
+            }
+            None => return Err(AppError::bad(format!("no {} at this tag", repo.manifest_file))),
+        },
     };
-    let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(AppError::bad)?;
+    let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(unreadable_at_tag)?;
     if name_of(&m) != entry.name {
         return Err(AppError::bad(format!(
             "the manifest names '{}', not '{}'",
@@ -1143,8 +1428,7 @@ async fn prepare(
         let text = git::read_in(co, &sim.file)
             .map_err(AppError::bad)?
             .ok_or_else(|| AppError::bad(format!("'{}' does not exist at this tag", sim.file)))?;
-        let checked = crate::sims::check(text.as_bytes())?;
-        crate::sims::check_pins(state, &checked.sim).await?;
+        let checked = crate::sims::check_at_tag(text.as_bytes())?;
         // Inputs read from this repo must be files at this tag (inside the repo, not via a link).
         for i in &checked.sim.inputs {
             let Some(f) = &i.repo_file else { continue };
@@ -1159,6 +1443,8 @@ async fn prepare(
                 )));
             }
         }
+        // Last: facts about the commit (above) make it invalid even while a pin can't be checked yet.
+        crate::sims::check_pins_at_tag(state, &checked.sim).await?;
         p.sim = Some((checked, sim.description.clone()));
     }
     let _ = r;

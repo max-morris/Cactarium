@@ -7,7 +7,7 @@
 <p>A version is <code>MAJOR.MINOR.PATCH</code>, optionally with a pre-release suffix such as <code>2.0.0-rc.1</code>, which sorts before <code>2.0.0</code>. Bump the major version for incompatible changes, the minor one for additions, the patch for fixes.</p>
 
 <h2 id="tags">Version tags</h2>
-<p>In a repo, a version is a git tag: <code>v1.2.3</code> (the <code>v</code> is optional) on the default track, or <code>track/v1.2.3</code> on a track. Any other tag is ignored, not an error: <code>ET_2026_05</code>, <code>v1.2</code>, <code>a/b/v1.2.3</code> and <code>Upper/v1.2.3</code> are not versions. If two tags name the same version, the first one wins. A manifest can also choose a different scheme with a <a href="#tag-pattern">tag pattern</a>.</p>
+<p>In a repo, a version is a git tag: <code>v1.2.3</code> (the <code>v</code> is optional) on the default track, or <code>track/v1.2.3</code> on a track. Any other tag is ignored, not an error: <code>ET_2026_05</code>, <code>v1.2</code>, <code>a/b/v1.2.3</code> and <code>Upper/v1.2.3</code> are not versions. If two tags name the same version, the spelling wins in this order: the one a declared <code>tag-pattern</code> itself writes (<code>rel-1.0</code> for <code>rel-{major}.{minor}</code>, no leading zeros), then the standard spelling (<code>v1.2.3</code>, <code>track/v1.2.3</code>), then any other (a bare <code>1.2.3</code>, say an old upstream tag from before the repo had a manifest, or <code>rel-01.0</code>); between equals, the first by name. A manifest can also choose a different scheme with a <a href="#tag-pattern">tag pattern</a>.</p>
 
 <h2 id="tracks">Tracks</h2>
 <p>A repo can carry several independent version lines, called tracks, as tag prefixes. Git refs can't contain a colon, so git writes the track with a slash and the Cactarium and CactUp write it with a colon: the tag <code>mixed-precision/v1.2.3</code> is version <code>1.2.3</code> on track <code>mixed-precision</code>, written <code>owner/pkg@mixed-precision:1.2.3</code>. Unprefixed tags are on the default track.</p>
@@ -48,7 +48,7 @@ since = "2026.5.0"</pre>
 <h2 id="frozen">Frozen commits</h2>
 <p>The first time the Cactarium sees a version tag, it records the commit and tree the tag names, and from then on that version means that commit. Moving a tag afterward changes nothing here:</p>
 <ul>
-  <li>If a tag <strong>moves</strong>, the Cactarium doesn't follow it. The version is marked "tag moved upstream; the frozen commit is still served", and an alert appears on the owner's dashboard and in the admins' <em>Tag alerts</em>.</li>
+  <li>If a tag <strong>moves</strong>, the Cactarium doesn't follow it. The version is marked "tag moved upstream; the frozen commit is still served", and an alert appears on the owner's dashboard and in the admins' <em>Tag alerts</em>. An invalid version stays invalid, and unserved, whatever its tag does.</li>
   <li>If a tag is <strong>deleted</strong>, the version is marked "tag deleted upstream" and keeps its frozen commit. If the tag comes back at the same commit, the mark goes away.</li>
 </ul>
 <p>So don't move or reuse tags: publish a new version instead. Stack releases and sims are frozen the same way when they are published: their content never changes.</p>

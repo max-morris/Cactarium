@@ -131,6 +131,9 @@ fn occupied(path: &Path) -> bool {
 pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[ClaimRec], repo: &Path) -> AppResult<Vec<String>> {
     let Some(pkg) = &m.package else { return Ok(Vec::new()) };
     let mut problems: Vec<String> = Vec::new();
+    // What may become true without a new commit: a target nobody registered yet, or one with no
+    // version in range yet. A version read at a tag waits for these instead of freezing invalid.
+    let mut waiting: Vec<String> = Vec::new();
     let mut smells: Vec<String> = Vec::new();
 
     // Each dependency, with the target version every alternative resolves to.
@@ -155,10 +158,13 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                             "the dependency on {}: that is a {k}; a package depends on packages, whose thorns it names in needs (say works-with for a {k})",
                             alt.target()
                         ),
-                        _ => format!(
-                            "the dependency on {}{at}: the Cactarium has no version of that package in that range; publish it first",
-                            alt.target()
-                        ),
+                        _ => {
+                            waiting.push(format!(
+                                "the dependency on {}{at}: the Cactarium has no version of that package in that range yet; publish it first",
+                                alt.target()
+                            ));
+                            continue;
+                        }
                     });
                 }
                 Some(tv) => {
@@ -195,14 +201,38 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                             alt.target()
                         ));
                     }
-                    for n in alt.needs.iter().filter(|_| !tv.flesh && !tv.library) {
-                        if !tv.thorns.iter().any(|(t, _)| t == n) {
-                            problems.push(format!(
-                                "the dependency on {} needs {n}, which {}@{} doesn't have",
-                                alt.target(),
-                                alt.target(),
-                                tv.label
-                            ));
+                    let missing: Vec<&String> = alt
+                        .needs
+                        .iter()
+                        .filter(|n| !tv.flesh && !tv.library && !tv.thorns.iter().any(|(t, _)| t == *n))
+                        .collect();
+                    if !missing.is_empty() {
+                        // A version of the target in range that isn't read yet (released together
+                        // with this one, say) may have them: then this waits rather than freezing.
+                        let req = match (&alt.sha, &alt.range) {
+                            (Some(_), _) => None,
+                            (None, Some(r)) => r.parse::<TrackedReq>().ok(),
+                            (None, None) => Some(TrackedReq::any()),
+                        };
+                        let target_id: Option<i64> = sqlx::query_scalar("SELECT id FROM entries WHERE owner = $1 AND name = $2")
+                            .bind(&alt.owner)
+                            .bind(&alt.name)
+                            .fetch_optional(&state.db)
+                            .await?;
+                        use crate::tracker::Unread;
+                        let unread = match (req, target_id) {
+                            (Some(req), Some(id)) => crate::tracker::unread_in_range(state, id, &req).await?,
+                            _ => Unread::No,
+                        };
+                        for n in missing {
+                            let said = format!("the dependency on {} needs {n}, which {}@{} doesn't have", alt.target(), alt.target(), tv.label);
+                            match unread {
+                                Unread::Yes => waiting.push(format!("{said}, and a version of it in range isn't read yet")),
+                                Unread::CantTell => waiting.push(format!(
+                                    "{said}, and its repo can't be listed right now to see whether a version in range not read yet has it"
+                                )),
+                                Unread::No => problems.push(said),
+                            }
                         }
                     }
                     resolved.push((alt, tv));
@@ -210,6 +240,16 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
             }
         }
         deps.push((c, resolved));
+    }
+
+    // The CCL can only be checked against what the dependencies resolve to: with one still missing,
+    // the facts found so far decide, else the version waits.
+    if !waiting.is_empty() {
+        if !problems.is_empty() {
+            problems.extend(waiting);
+            return Err(AppError::bad(problems.join("; ")));
+        }
+        return Err(AppError::Upstream(waiting.join("; ")));
     }
 
     // Every hard CCL requirement of every published thorn is met.

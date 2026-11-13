@@ -757,6 +757,427 @@ maxv.post("/max/repo-sim/refresh", {})
 text = page(maxv, "/max/repo-sim?tab=versions")
 check("a tag whose repo-file is missing is invalid, with the reason", "1.1.0" in text and "not a file in the repo" in text, text[text.find("<table"):][:600])
 
+# Only facts about the commit make a version invalid. A file from a newer format than this server
+# reads, a pinned package that isn't public yet, or a repo history that can't be read right now
+# leaves the tag unread: it is read again at the next sync, never frozen.
+def cli_sync(slug):
+    """`just cli sync`: (ok, output). Not rate-limited, unlike the refresh button and API."""
+    run = subprocess.run(["just", "cli", "sync", slug], capture_output=True, text=True)
+    return run.returncode == 0, run.stdout + run.stderr
+def has_version(v, slug, label):
+    return f'href="/{slug}/{label}"' in v.get(f"/{slug}?tab=versions")[1]
+def retag(cwd, bare, tag):
+    """Commit what changed and (re)point `tag` at it, upstream too."""
+    sh("git", "add", "-A", cwd=cwd); sh("git", *ident, "commit", "-q", "--allow-empty", "-m", tag, cwd=cwd)
+    sh("git", "tag", "-f", tag, cwd=cwd)
+    sh("git", "push", "-q", "--force", bare, "master", f"refs/tags/{tag}", cwd=cwd)
+open(os.path.join(srepo, "data", "blob.txt"), "w").write("data\n")
+good_sim = open(os.path.join(srepo, "runs", "qc0.sim")).read()
+open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(good_sim.replace("format = 3", "format = 99", 1))
+retag(srepo, sbare, "v1.2.0")
+ok, out = cli_sync("max/repo-sim")
+check("a .sim from a newer format leaves its tag unread, to be read again",
+      not ok and "format 99" in out and "tried again" in out, out[-400:])
+check("and stores no version for it", not has_version(maxv, "max/repo-sim", "1.2.0"))
+open(os.path.join(srepo, "runs", "qc0.sim"), "w").write(good_sim)
+retag(srepo, sbare, "v1.2.0")
+ok, out = cli_sync("max/repo-sim")
+check("once the tag holds a file this server reads, it becomes a version", ok and "1 new versions" in out, out[-400:])
+manifest_text = open(os.path.join(srepo, "cactarium-sim.toml")).read()
+open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(manifest_text.replace("format = 1", "format = 99", 1))
+retag(srepo, sbare, "v1.3.0")
+ok, out = cli_sync("max/repo-sim")
+check("a manifest from a newer format leaves its tag unread too", not ok and "format 99" in out, out[-400:])
+open(os.path.join(srepo, "cactarium-sim.toml"), "w").write(manifest_text)
+retag(srepo, sbare, "v1.3.0")
+ok, out = cli_sync("max/repo-sim")
+check("and is read once fixed", ok and "1 new versions" in out, out[-400:])
+def tiny_package(name, owner, arr):
+    """A one-thorn package repo with tag v1.0.0 and one untagged commit after it: (dir, bare, tagged, untagged)."""
+    d = os.path.join(work, name)
+    os.makedirs(os.path.join(d, arr + "Thorn"))
+    for f, t in [("interface.ccl", f"IMPLEMENTS: {arr}Thorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+        open(os.path.join(d, arr + "Thorn", f), "w").write(t)
+    open(os.path.join(d, "cactarium.toml"), "w").write(
+        f'format = 1\n\n[package]\nname = "{name}"\nowners = ["{owner}"]\ndescription = "A package sims pin"\narrangement = "{arr}"\n')
+    sh("git", "init", "-q", "-b", "master", cwd=d)
+    sh("git", "add", "-A", cwd=d); sh("git", *ident, "commit", "-q", "-m", name, cwd=d); sh("git", "tag", "v1.0.0", cwd=d)
+    tagged = sh("git", "rev-parse", "HEAD", cwd=d)
+    open(os.path.join(d, "README.md"), "w").write("later\n")
+    sh("git", "add", "-A", cwd=d); sh("git", *ident, "commit", "-q", "-m", "after the tag", cwd=d)
+    untagged = sh("git", "rev-parse", "HEAD", cwd=d)
+    b = ENV["DEMO_REPOS"] + f"/{name}.git"
+    subprocess.run(["rm", "-rf", b], check=True)
+    sh("git", "clone", "-q", "--bare", d, b, cwd=work)
+    return d, b, tagged, untagged
+
+def pin_sim(name, pins):
+    """A fully specified .sim checking out one thorn from each (repo, arrangement, url, commit)."""
+    th = "!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n" + "".join(
+        f"\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {url}\n!REPO_PATH = $2\n!CHECKOUT =\n{arr}/{arr}Thorn\n"
+        for _, arr, url, _ in pins)
+    repos = "".join(f'\n[[repo]]\nname = "{r}"\nurl = "{url}"\ncommit = "{c}"\n' for r, _, url, c in pins)
+    q = "'" * 3
+    return (f'format = 1\n\n[sim]\nname = "{name}"\nsummary = "The {name} run"\nlicense = "CC0-1.0"\nroot = "Cactus"\n\n'
+            f'[thornlist]\nfilename = "{name}.th"\ntext = {q}\n{th}{q}\n\n'
+            f'[parfile]\nfilename = "{name}.par"\nkind = "par"\ntext = {q}\nActiveThorns = "{name}"\n{q}\n{repos}')
+
+pdir, pbare_pkg, ptagged, puntagged = tiny_package("pinpkg", "max", "PinArr")
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/pinpkg.git", "owner": "max"})
+check("register a package that sims pin", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+psim = os.path.join(work, "pinsim")
+os.makedirs(psim)
+psbare = ENV["DEMO_REPOS"] + "/pinsim.git"
+open(os.path.join(psim, "cactarium-sim.toml"), "w").write('format = 1\n\n[sim]\nname = "pinsim"\nowners = ["max"]\nfile = "pin.sim"\n')
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)]))
+sh("git", "init", "-q", "-b", "master", cwd=psim)
+sh("git", "add", "-A", cwd=psim); sh("git", *ident, "commit", "-q", "-m", "pinsim", cwd=psim); sh("git", "tag", "v1.0.0", cwd=psim)
+subprocess.run(["rm", "-rf", psbare], check=True)
+sh("git", "clone", "-q", "--bare", psim, psbare, cwd=work)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": REPOS + "/pinsim.git", "owner": "max"})
+check("register a sim repo pinning a version's commit", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+page(anon, "/max/pinsim/1.0.0")
+# The pinned package's repo goes away for a while, as a host that doesn't answer would.
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", puntagged)]))
+os.rename(pbare_pkg, pbare_pkg + ".away")
+retag(psim, psbare, "v1.1.0")
+ok, out = cli_sync("max/pinsim")
+check("a pin whose repo history can't be read right now leaves the tag unread",
+      not ok and "be checked yet" in out and "max/pinpkg" in out and "tried again" in out, out[-400:])
+check("with no version stored for it", not has_version(maxv, "max/pinsim", "1.1.0"))
+os.rename(pbare_pkg + ".away", pbare_pkg)
+back = time.time()  # a failed history read is remembered for a minute
+# A pinned package that is registered but not public yet: the tag waits for it.
+text = page(maxv, "/admin/users")
+bid = re.search(r'href="/bob">bob</a>.*?action="/admin/users/(\d+)"', text, re.S).group(1)
+maxv.post(f"/admin/users/{bid}", {"action": "untrust"})
+_, qbare, qtagged, _ = tiny_package("pendpkg", "bob", "PendArr")
+bob = Visitor("bob")
+bob.get("/new/repo")
+s, text, _ = bob.post("/new/repo", {"url": REPOS + "/pendpkg.git", "owner": ""})
+check("bob registers a package that waits for review", s == 303, f"{s} {text[text.find('alert'):][:300]}")
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged),
+                                                                   ("pendpkg", "PendArr", REPOS + "/pendpkg.git", qtagged)]))
+retag(psim, psbare, "v1.2.0")
+ok, out = cli_sync("max/pinsim")
+check("a pin to a package awaiting review leaves the tag unread", not ok and "public yet" in out, out[-400:])
+check("approve bob's package", decide("bob/pendpkg", "approve") == 303)
+time.sleep(max(0, 62 - (time.time() - back)))
+ok, out = cli_sync("max/pinsim")
+# (The dev site's poller may have read one of them first.)
+check("once the repo answers and the package is public, both tags are read",
+      ok and has_version(anon, "max/pinsim", "1.1.0") and has_version(anon, "max/pinsim", "1.2.0"), out[-400:])
+page(anon, "/max/pinsim/1.1.0?tab=pins", contains="max/pinpkg")
+page(anon, "/max/pinsim/1.2.0?tab=pins", contains="bob/pendpkg@1.0.0")
+# Facts about the commit still make it invalid: a pin to a repo nobody registered.
+open(os.path.join(psim, "pin.sim"), "w").write(pin_sim("pinsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged),
+                                                                   ("nobody", "NoArr", REPOS + "/nobody.git", ptagged)]))
+retag(psim, psbare, "v1.3.0")
+ok, out = cli_sync("max/pinsim")
+text = page(maxv, "/max/pinsim?tab=versions")
+check("a pin to a repo no package was registered for is an invalid version",
+      ok and 'href="/max/pinsim/1.3.0"' in text and "the repo of any package" in text, out[-300:] + text[text.find('<table'):][:600])
+
+# On a repo carrying several entries, a tag without one entry's manifest is most likely another
+# entry's release: left unread for that entry, never frozen as an invalid version of it.
+sib = os.path.join(work, "sibrepo")
+os.makedirs(os.path.join(sib, "SibArrThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: SibArrThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(sib, "SibArrThorn", f), "w").write(t)
+open(os.path.join(sib, "cactarium.toml"), "w").write(
+    'format = 1\n\n[package]\nname = "sibrepo"\nowners = ["max"]\ndescription = "A package with a sim beside it"\narrangement = "SibArr"\n')
+sh("git", "init", "-q", "-b", "master", cwd=sib)
+sh("git", "add", "-A", cwd=sib); sh("git", *ident, "commit", "-q", "-m", "package", cwd=sib)
+sib_c = sh("git", "rev-parse", "HEAD", cwd=sib)
+open(os.path.join(sib, "run.sim"), "w").write(pin_sim("sibrun", [("sibrepo", "SibArr", REPOS + "/sibrepo.git", sib_c)]))
+open(os.path.join(sib, "cactarium-sim.toml"), "w").write('format = 1\n\n[sim]\nname = "sibrepo-sim"\nowners = ["max"]\nfile = "run.sim"\n')
+sh("git", "add", "-A", cwd=sib); sh("git", *ident, "commit", "-q", "-m", "and a sim", cwd=sib); sh("git", "tag", "v1.0.0", cwd=sib)
+sibbare = ENV["DEMO_REPOS"] + "/sibrepo.git"
+subprocess.run(["rm", "-rf", sibbare], check=True)
+sh("git", "clone", "-q", "--bare", sib, sibbare, cwd=work)
+run = subprocess.run(["just", "cli", "register", "max", REPOS + "/sibrepo.git"], capture_output=True, text=True)
+check("a repo with a package and a sim registers both", run.returncode == 0 and run.stdout.count("Registered") == 2, run.stdout + run.stderr[-300:])
+os.remove(os.path.join(sib, "run.sim")); os.remove(os.path.join(sib, "cactarium-sim.toml"))
+retag(sib, sibbare, "v1.1.0")
+ok, out = cli_sync("max/sibrepo-sim")
+check("a tag without the sim's manifest, on a repo with other entries, is left unread for the sim",
+      not ok and "another entry's release" in out and not has_version(maxv, "max/sibrepo-sim", "1.1.0"), out[-400:])
+ok, out = cli_sync("max/sibrepo")
+check("and is the package's release", ok and has_version(maxv, "max/sibrepo", "1.1.0"), out[-400:])
+
+def versions_page(v, slug):
+    return v.get(f"/{slug}?tab=versions")[1]
+def resolve_q(req):
+    s, body, hdrs = anon.get("/api/v1/resolve?req=" + urllib.parse.quote(req))
+    try:
+        return s, json.loads(body), hdrs
+    except ValueError:
+        return s, {"raw": body}, hdrs
+# A stack tag read while one of its source repos can't be reached waits; it isn't frozen invalid.
+dep = os.path.join(work, "depsrc")
+os.makedirs(os.path.join(dep, "DepArr", "DepThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: DepThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(dep, "DepArr", "DepThorn", f), "w").write(t)
+sh("git", "init", "-q", "-b", "master", cwd=dep)
+sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "dep", cwd=dep)
+depbare = ENV["DEMO_REPOS"] + "/depsrc.git"
+subprocess.run(["rm", "-rf", depbare], check=True)
+sh("git", "clone", "-q", "--bare", dep, depbare, cwd=work)
+stk = os.path.join(work, "flakystack")
+os.makedirs(stk)
+open(os.path.join(stk, "s.th"), "w").write(
+    f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {REPOS}/depsrc.git\n!REPO_PATH = $1/$2\n!CHECKOUT =\nDepArr/DepThorn\n")
+open(os.path.join(stk, "cactarium-stack.toml"), "w").write('format = 1\n\n[stack]\nname = "flakystack"\nowners = ["max"]\nthornlist = "s.th"\n')
+sh("git", "init", "-q", "-b", "master", cwd=stk)
+sh("git", "add", "-A", cwd=stk); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=stk); sh("git", "tag", "v1.0.0", cwd=stk)
+stkbare = ENV["DEMO_REPOS"] + "/flakystack.git"
+subprocess.run(["rm", "-rf", stkbare], check=True)
+sh("git", "clone", "-q", "--bare", stk, stkbare, cwd=work)
+run = subprocess.run(["just", "cli", "register", "max", REPOS + "/flakystack.git"], capture_output=True, text=True)
+check("register a stack built from another repo", run.returncode == 0 and has_version(anon, "max/flakystack", "1.0.0"), run.stdout + run.stderr[-300:])
+os.rename(depbare, depbare + ".away")
+retag(stk, stkbare, "v1.1.0")
+ok, out = cli_sync("max/flakystack")
+check("a stack tag whose source repo can't be reached is left unread, not frozen invalid",
+      not ok and "tried again" in out and not has_version(maxv, "max/flakystack", "1.1.0"), out[-400:])
+os.rename(depbare + ".away", depbare)
+ok, out = cli_sync("max/flakystack")
+check("once the source answers, the stack tag becomes a valid release",
+      ok and has_version(anon, "max/flakystack", "1.1.0") and "invalid" not in versions_page(maxv, "max/flakystack"), out[-400:])
+
+# Waiting tags back off and are tried a few at a time: a dozen tags waiting on the same source.
+os.rename(depbare, depbare + ".away")
+for i in range(1, 13):
+    retag(stk, stkbare, f"v1.2.{i}")
+ok, out = cli_sync("max/flakystack")
+check("new tags that can't be read wait, each with its next automatic try, at most ten per sync",
+      not ok and "next automatic try after" in out and "2 more new tag(s) not tried this time" in out
+      and not has_version(maxv, "max/flakystack", "1.2.1"), out[-300:])
+cli_sync("max/flakystack")  # the ten waiting are tried again, the two new ones now too
+ok, out = cli_sync("max/flakystack")
+check("waiting tags are tried again at most ten per sync", not ok and "2 more waiting tag(s) not tried this time" in out, out[-300:])
+os.rename(depbare + ".away", depbare)
+cli_sync("max/flakystack")
+cli_sync("max/flakystack")
+check("once the source answers they are all read, ten at a time",
+      has_version(anon, "max/flakystack", "1.2.1") and has_version(anon, "max/flakystack", "1.2.12"))
+
+# A stack pinning a tag of a source repo that is pushed a moment after the stack's own tag waits.
+sh("git", "tag", "d-1", cwd=dep); sh("git", "push", "-q", depbare, "--tags", cwd=dep)
+pst = os.path.join(work, "pinstack")
+os.makedirs(pst)
+open(os.path.join(pst, "s.th"), "w").write(open(os.path.join(stk, "s.th")).read())
+pst_toml = lambda t: f'format = 1\n\n[stack]\nname = "pinstack"\nowners = ["max"]\nthornlist = "s.th"\n\n[[stack.pin]]\nname = "depsrc"\ntag = "{t}"\n'
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-1"))
+sh("git", "init", "-q", "-b", "master", cwd=pst)
+sh("git", "add", "-A", cwd=pst); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=pst); sh("git", "tag", "v1.0.0", cwd=pst)
+pstbare = ENV["DEMO_REPOS"] + "/pinstack.git"
+subprocess.run(["rm", "-rf", pstbare], check=True)
+sh("git", "clone", "-q", "--bare", pst, pstbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/pinstack.git"], capture_output=True, text=True)
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-2"))
+retag(pst, pstbare, "v1.1.0")
+ok, out = cli_sync("max/pinstack")
+check("a stack pinning a source tag that isn't pushed yet waits", not ok and "d-2" in out and not has_version(maxv, "max/pinstack", "1.1.0"), out[-300:])
+open(os.path.join(dep, "README"), "w").write("2\n")
+sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "d-2", cwd=dep); sh("git", "tag", "d-2", cwd=dep)
+sh("git", "push", "-q", depbare, "master", "--tags", cwd=dep)
+ok, out = cli_sync("max/pinstack")
+check("and is read once the tag is there", ok and has_version(anon, "max/pinstack", "1.1.0"), out[-300:])
+# A tag that has waited a very long time (its backoff long capped) doesn't break the sync: other
+# waiting tags are still tried and read.
+def psql(sql):
+    here = os.path.dirname(os.path.abspath(__file__))
+    return subprocess.run(["docker", "compose", "--project-directory", here, "-f", here + "/compose.yaml", "-f", here + "/compose.dev.yaml",
+                           "exec", "-T", "db", "psql", "-U", "cactarium", "-d", "cactarium", "-tAc", sql],
+                          check=True, capture_output=True, text=True).stdout.strip()
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("never"))
+retag(pst, pstbare, "v1.2.0")
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-3"))
+retag(pst, pstbare, "v1.3.0")
+ok, out = cli_sync("max/pinstack")
+check("two stack tags wait for source tags", not ok and not has_version(maxv, "max/pinstack", "1.3.0"), out[-300:])
+psql("UPDATE waiting_tags SET tries = 34, next_try_at = now() - interval '1 minute' WHERE tag = 'v1.2.0' AND entry_id = (SELECT id FROM entries WHERE name = 'pinstack')")
+open(os.path.join(dep, "README"), "w").write("3\n")
+sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "d-3", cwd=dep); sh("git", "tag", "d-3", cwd=dep)
+sh("git", "push", "-q", depbare, "master", "--tags", cwd=dep)
+ok, out = cli_sync("max/pinstack")
+check("a tag that waited about a week doesn't break the sync: a later waiting tag is read",
+      "out of range" not in out and has_version(anon, "max/pinstack", "1.3.0"), out[-300:])
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-4"))
+retag(pst, pstbare, "v1.4.0")
+cli_sync("max/pinstack")
+sh("git", "tag", "d-4", cwd=dep); sh("git", "push", "-q", depbare, "--tags", cwd=dep)
+psql("UPDATE waiting_tags SET next_try_at = now() - interval '1 minute'")
+ok, out = cli_sync("max/pinstack")
+check("and the syncs after it keep working", "out of range" not in out and has_version(anon, "max/pinstack", "1.4.0")
+      and int(psql("SELECT tries FROM waiting_tags WHERE tag = 'v1.2.0' AND entry_id = (SELECT id FROM entries WHERE name = 'pinstack')") or 0) >= 35, out[-300:])
+
+# An old bare tag (no manifest) naming the same version as the real v release doesn't take it.
+yb = os.path.join(work, "baretag")
+os.makedirs(yb)
+open(os.path.join(yb, "README"), "w").write("old\n")
+sh("git", "init", "-q", "-b", "master", cwd=yb)
+sh("git", "add", "-A", cwd=yb); sh("git", *ident, "commit", "-q", "-m", "old upstream release", cwd=yb); sh("git", "tag", "1.0.0", cwd=yb)
+os.makedirs(os.path.join(yb, "YbArr", "YbThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: YbThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(yb, "YbArr", "YbThorn", f), "w").write(t)
+open(os.path.join(yb, "cactarium.toml"), "w").write('format = 1\n\n[package]\nname = "baretag"\nowners = ["max"]\ndescription = "x"\n')
+sh("git", "add", "-A", cwd=yb); sh("git", *ident, "commit", "-q", "-m", "release", cwd=yb); sh("git", "tag", "v1.0.0", cwd=yb); sh("git", "tag", "v1.1.0", cwd=yb)
+ybbare = ENV["DEMO_REPOS"] + "/baretag.git"
+subprocess.run(["rm", "-rf", ybbare], check=True)
+sh("git", "clone", "-q", "--bare", yb, ybbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/baretag.git"], capture_output=True, text=True)
+s, r, _ = resolve_q("max/baretag@1.0.0")
+check("v1.0.0, not an old bare 1.0.0, is version 1.0.0", s == 200 and r.get("tag") == "v1.0.0", r)
+
+# A dependency released together with this package: its needed thorn comes in a version tagged but
+# not read yet, so this version waits instead of freezing.
+def tiny(name, thorns, deps=""):
+    d = os.path.join(work, name)
+    for t in thorns:
+        os.makedirs(os.path.join(d, "CoArr", t), exist_ok=True)
+        for f, txt in [("interface.ccl", f"IMPLEMENTS: {t}\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+            open(os.path.join(d, "CoArr", t, f), "w").write(txt)
+    open(os.path.join(d, "cactarium.toml"), "w").write(f'format = 1\n\n[package]\nname = "{name}"\nowners = ["max"]\ndescription = "x"\n{deps}')
+    return d
+cob = tiny("cob", ["CbThorn"])
+sh("git", "init", "-q", "-b", "master", cwd=cob)
+sh("git", "add", "-A", cwd=cob); sh("git", *ident, "commit", "-q", "-m", "cob 2.0", cwd=cob); sh("git", "tag", "v2.0.0", cwd=cob)
+cobbare = ENV["DEMO_REPOS"] + "/cob.git"
+subprocess.run(["rm", "-rf", cobbare], check=True)
+sh("git", "clone", "-q", "--bare", cob, cobbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/cob.git"], capture_output=True, text=True)
+coa = tiny("coa", ["CaThorn"])
+sh("git", "init", "-q", "-b", "master", cwd=coa)
+sh("git", "add", "-A", cwd=coa); sh("git", *ident, "commit", "-q", "-m", "coa 1.0", cwd=coa); sh("git", "tag", "v1.0.0", cwd=coa)
+coabare = ENV["DEMO_REPOS"] + "/coa.git"
+subprocess.run(["rm", "-rf", coabare], check=True)
+sh("git", "clone", "-q", "--bare", coa, coabare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/coa.git"], capture_output=True, text=True)
+tiny("coa", ["CaThorn"], '\n[[dependency]]\ntarget = "max/cob@^2"\nneeds = ["CbThorn", "CbExtra"]\n')
+retag(coa, coabare, "v2.0.0")       # coa 2.0 needs CbExtra, which cob gets in 2.1
+tiny("cob", ["CbThorn", "CbExtra"])
+retag(cob, cobbare, "v2.1.0")       # tagged, not read yet
+ok, out = cli_sync("max/coa")
+check("a dependency whose needed thorn comes in a version not read yet makes the version wait",
+      not ok and "isn't read yet" in out and not has_version(maxv, "max/coa", "2.0.0"), out[-300:])
+cli_sync("max/cob")
+ok, out = cli_sync("max/coa")
+check("once that version is read, it is valid", ok and has_version(anon, "max/coa", "2.0.0") and "invalid" not in versions_page(maxv, "max/coa"), out[-300:])
+
+# When the dependency's repo can't be listed, the wait says so.
+tiny("coa", ["CaThorn"], '\n[[dependency]]\ntarget = "max/cob@^2"\nneeds = ["CbThorn", "CbMore"]\n')
+retag(coa, coabare, "v3.0.0")
+os.rename(cobbare, cobbare + ".away")
+ok, out = cli_sync("max/coa")
+os.rename(cobbare + ".away", cobbare)
+check("a dependency whose repo can't be listed waits, saying so",
+      not ok and "can't be listed right now" in out and not has_version(maxv, "max/coa", "3.0.0"), out[-300:])
+ok, out = cli_sync("max/coa")
+check("once it can be, a needed thorn no version in range has is a fact", "doesn&#39;t have" in versions_page(maxv, "max/coa")
+      and 'href="/max/coa/3.0.0' in versions_page(maxv, "max/coa"), out[-300:])
+
+# With a declared pattern, the spelling the pattern writes wins over another spelling of one version.
+rs = os.path.join(work, "relspell")
+os.makedirs(rs)
+open(os.path.join(rs, "README"), "w").write("old\n")
+sh("git", "init", "-q", "-b", "master", cwd=rs)
+sh("git", "add", "-A", cwd=rs); sh("git", *ident, "commit", "-q", "-m", "old", cwd=rs); sh("git", "tag", "rel-01.0", cwd=rs)
+os.makedirs(os.path.join(rs, "RsArr", "RsThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: RsThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(rs, "RsArr", "RsThorn", f), "w").write(t)
+open(os.path.join(rs, "cactarium.toml"), "w").write('format = 1\n\n[package]\nname = "relspell"\nowners = ["max"]\ndescription = "x"\ntag-pattern = "rel-{major}.{minor}"\n')
+sh("git", "add", "-A", cwd=rs); sh("git", *ident, "commit", "-q", "-m", "release", cwd=rs); sh("git", "tag", "rel-1.0", cwd=rs); sh("git", "tag", "rel-1.1", cwd=rs)
+rsbare = ENV["DEMO_REPOS"] + "/relspell.git"
+subprocess.run(["rm", "-rf", rsbare], check=True)
+sh("git", "clone", "-q", "--bare", rs, rsbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/relspell.git"], capture_output=True, text=True)
+s, r, _ = resolve_q("max/relspell@1.0.0")
+check("rel-1.0, the spelling its pattern writes, is 1.0.0, not an old rel-01.0", s == 200 and r.get("tag") == "rel-1.0", r)
+
+
+
+# A stack override naming a package registered a moment after the stack's tag waits.
+ovp = os.path.join(work, "ovpkg")
+os.makedirs(os.path.join(ovp, "OvArr", "OvThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: OvThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(ovp, "OvArr", "OvThorn", f), "w").write(t)
+open(os.path.join(ovp, "cactarium.toml"), "w").write('format = 1\n\n[package]\nname = "ovpkg"\nowners = ["max"]\ndescription = "x"\n')
+sh("git", "init", "-q", "-b", "master", cwd=ovp)
+sh("git", "add", "-A", cwd=ovp); sh("git", *ident, "commit", "-q", "-m", "ovpkg", cwd=ovp); sh("git", "tag", "v1.0.0", cwd=ovp)
+ovbare = ENV["DEMO_REPOS"] + "/ovpkg.git"
+subprocess.run(["rm", "-rf", ovbare], check=True)
+sh("git", "clone", "-q", "--bare", ovp, ovbare, cwd=work)
+ovs = os.path.join(work, "ovstack")
+os.makedirs(ovs)
+open(os.path.join(ovs, "s.th"), "w").write(
+    f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {REPOS}/ovpkg.git\n!REPO_PATH = $1/$2\n!CHECKOUT =\nOvArr/OvThorn\n")
+ovs_toml = 'format = 1\n\n[stack]\nname = "ovstack"\nowners = ["max"]\nthornlist = "s.th"\n'
+open(os.path.join(ovs, "cactarium-stack.toml"), "w").write(ovs_toml)
+sh("git", "init", "-q", "-b", "master", cwd=ovs)
+sh("git", "add", "-A", cwd=ovs); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=ovs); sh("git", "tag", "v1.0.0", cwd=ovs)
+ovsbare = ENV["DEMO_REPOS"] + "/ovstack.git"
+subprocess.run(["rm", "-rf", ovsbare], check=True)
+sh("git", "clone", "-q", "--bare", ovs, ovsbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/ovstack.git"], capture_output=True, text=True)
+ovt = os.path.join(work, "ovtop")
+os.makedirs(ovt)
+ovt_toml = 'format = 1\n\n[stack]\nname = "ovtop"\nowners = ["max"]\nextends = ["max/ovstack@1.0.0"]\n'
+open(os.path.join(ovt, "cactarium-stack.toml"), "w").write(ovt_toml)
+sh("git", "init", "-q", "-b", "master", cwd=ovt)
+sh("git", "add", "-A", cwd=ovt); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=ovt); sh("git", "tag", "v1.0.0", cwd=ovt)
+ovtbare = ENV["DEMO_REPOS"] + "/ovtop.git"
+subprocess.run(["rm", "-rf", ovtbare], check=True)
+sh("git", "clone", "-q", "--bare", ovt, ovtbare, cwd=work)
+run = subprocess.run(["just", "cli", "register", "max", REPOS + "/ovtop.git"], capture_output=True, text=True)
+check("register a stack extending another", run.returncode == 0 and has_version(anon, "max/ovtop", "1.0.0"), run.stdout + run.stderr[-300:])
+open(os.path.join(ovt, "cactarium-stack.toml"), "w").write(ovt_toml + '\n[[stack.override]]\nrepo = "ovpkg"\npackage = "max/ovpkg@1"\n')
+retag(ovt, ovtbare, "v1.1.0")
+ok, out = cli_sync("max/ovtop")
+check("a stack override naming a package not registered yet waits", not ok and "max/ovpkg" in out and not has_version(maxv, "max/ovtop", "1.1.0"), out[-300:])
+subprocess.run(["just", "cli", "register", "max", REPOS + "/ovpkg.git"], capture_output=True, text=True)
+ok, out = cli_sync("max/ovtop")
+check("and is read once the package is", ok and has_version(anon, "max/ovtop", "1.1.0") and "invalid" not in versions_page(maxv, "max/ovtop"), out[-300:])
+
+# An invalid version whose tag moves stays invalid, and is never served.
+ib = os.path.join(work, "invmove")
+os.makedirs(os.path.join(ib, "InvArr", "InvThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: InvThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(ib, "InvArr", "InvThorn", f), "w").write(t)
+inv_toml = lambda name: f'format = 1\n\n[package]\nname = "{name}"\nowners = ["max"]\ndescription = "x"\n'
+open(os.path.join(ib, "cactarium.toml"), "w").write(inv_toml("invmove"))
+sh("git", "init", "-q", "-b", "master", cwd=ib)
+sh("git", "add", "-A", cwd=ib); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=ib); sh("git", "tag", "v1.0.0", cwd=ib)
+ibare = ENV["DEMO_REPOS"] + "/invmove.git"
+subprocess.run(["rm", "-rf", ibare], check=True)
+sh("git", "clone", "-q", "--bare", ib, ibare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/invmove.git"], capture_output=True, text=True)
+open(os.path.join(ib, "cactarium.toml"), "w").write(inv_toml("wrongname"))
+retag(ib, ibare, "v1.1.0")
+cli_sync("max/invmove")
+check("a tag naming another entry is an invalid version", "the manifest names" in versions_page(maxv, "max/invmove"))
+open(os.path.join(ib, "cactarium.toml"), "w").write(inv_toml("invmove"))
+retag(ib, ibare, "v1.1.0")  # the tag moves onto a fixed commit
+cli_sync("max/invmove")
+text = versions_page(maxv, "max/invmove")
+check("an invalid version whose tag moves stays invalid (not tag-moved)", "the manifest names" in text and "tag moved upstream" not in text, text[text.find("<table"):][:600])
+s, r, _ = resolve_q("max/invmove@1.1.0")
+check("and is never served, even asked for exactly", s == 400, r)
+s, r, _ = resolve_q("max/invmove@^1")
+check("ranges skip it", s == 200 and r.get("slug") == "max/invmove@1.0.0", r)
+# A second tag naming a version the entry already has (bare 1.0.0 beside v1.0.0) is skipped; it
+# doesn't stop the sync with a collision.
+open(os.path.join(ib, "README"), "w").write("dup\n")
+retag(ib, ibare, "1.0.0")
+retag(ib, ibare, "v1.2.0")
+ok, out = cli_sync("max/invmove")
+check("a tag naming a version the entry has is skipped, and later tags are still read",
+      ok and has_version(anon, "max/invmove", "1.2.0"), out[-300:])
+
+
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
 head = git("carpetx", "rev-parse", "master")
