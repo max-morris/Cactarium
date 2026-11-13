@@ -1502,8 +1502,8 @@ check("a sibling's newer-format manifest doesn't hold a tag the package's own ru
 ok, out = cli("sync", "max/brokensib-sims")
 check("while the sims, whose own manifest it is, wait", not ok and "format 99" in out and not has_version(maxv, "max/brokensib-sims", "2026.7.0"), out[-300:])
 
-# --- A broken sibling manifest takes the tags its newest version's rule reads: package and sims
-# share v tags (no pattern), and the sims' manifest is broken at the next v tag.
+# --- A broken sibling manifest claims only as a readable one would: package and sims share v tags
+# (no pattern), and the sims' manifest has a typo at the next v release.
 BS = new_tree("brokenshare")
 BSURL = REPOS + "/brokenshare.git"
 thorn_at(BS, "BsArr")
@@ -1519,14 +1519,73 @@ write(BS, "cactarium-sim.toml", "format = 2\n[sim\n")
 commit_tag(BS, "a broken sims manifest", "v2026.6.0")
 push_all(BS, bsbare)
 cli("sync", "max/brokenshare"); cli("sync", "max/brokenshare-sims")
-bs_page = page(maxv, "/max/brokenshare")
-check("a tag the broken sims manifest's rule reads is no package version: whose it is can't be told",
-      not has_version(maxv, "max/brokenshare", "2026.6.0") and '<span class="mono">v2026.6.0</span>' in bs_page
-      and "so it is taken as max/brokenshare-sims" in bs_page)
-check("nor a sims version", not has_version(maxv, "max/brokenshare-sims", "2026.6.0") and has_version(anon, "max/brokenshare-sims", "2026.5.0"))
+check("the package keeps its v release beside a broken sims manifest sharing its tags",
+      has_version(anon, "max/brokenshare", "2026.6.0") and "invalid" not in versions_of("max/brokenshare"))
+bss_page = page(maxv, "/max/brokenshare-sims")
+check("and the sims don't get it, with the reason",
+      not has_version(maxv, "max/brokenshare-sims", "2026.6.0") and '<span class="mono">v2026.6.0</span>' in bss_page
+      and "max/brokenshare reads v2026.6.0 as its own" in bss_page)
+ok, out = cli("reread", "max", "max/brokenshare-sims", "--tag", "v2026.6.0")
+check("an admin can examine a tag recorded as not a version again (still not, here)", ok and "still not a version (claim)" in out, out[-300:])
+ok, out = cli("reread", "max", "max/brokenshare-sims", "--tag", "no-such-tag")
+check("a tag not recorded so is refused", not ok and "isn't recorded as not a version" in out, out[-300:])
+# Both manifests broken at one v tag: each is taken as the other's, so neither has it ... until the
+# sims switch to sim-v tags: their rule no longer reads it, and the package examines it again.
+write(BS, "cactarium.toml", "format = 1\n[package\n")
+commit_tag(BS, "both broken", "v2026.7.0")
+push_all(BS, bsbare)
+cli("sync", "max/brokenshare"); cli("sync", "max/brokenshare-sims")
+check("both manifests broken at a shared tag: a version of neither, for now",
+      not has_version(maxv, "max/brokenshare", "2026.7.0") and not has_version(maxv, "max/brokenshare-sims", "2026.7.0"))
+write(BS, "cactarium.toml", package_toml("brokenshare", "BsArr"))
+write(BS, "cactarium-sim.toml", sims_toml("brokenshare-sims", {"alpha": "a.sim"}))
+commit_tag(BS, "sims with their own pattern", "sim-v2026.7.1")
+push_all(BS, bsbare)
+cli("sync", "max/brokenshare-sims"); cli("sync", "max/brokenshare")
+check("once the sims follow sim-v, the package's v2026.7.0 is examined again: its own (invalid) version",
+      has_version(anon, "max/brokenshare-sims", "2026.7.1") and has_version(maxv, "max/brokenshare", "2026.7.0") and "is not valid" in versions_of("max/brokenshare"))
+
+# --- Sims following sim-v with no version yet (their first tag waits for a package not registered
+# yet): their broken manifest at the package's v release takes nothing from it.
+_, _, be_dep, _ = tiny_package("beunreg", "max", "BuArr")
+BE = new_tree("brokenearly")
+BEURL = REPOS + "/brokenearly.git"
+thorn_at(BE, "BeArr")
+write(BE, "cactarium.toml", package_toml("brokenearly", "BeArr"))
+commit_tag(BE, "the package", "v2026.5.0")
+bebare = publish_tree(BE, "brokenearly")
+cli("register", "max", BEURL)
+write(BE, "a.sim", pin_sim("alpha", [("beunreg", "BuArr", REPOS + "/beunreg.git", be_dep)]))
+write(BE, "cactarium-sim.toml", sims_toml("brokenearly-sims", {"alpha": "a.sim"}))
+commit_tag(BE, "sims", "sim-v1.0.0")
+write(BE, "cactarium-sim.toml", "format = 2\n[sim\n")
+commit_tag(BE, "broken sims, a package release", "v2026.6.0")
+push_all(BE, bebare)
+ok, out = cli("register", "max", BEURL, "--tag", "sim-v1.0.0")
+check("register sims whose first tag waits", ok and "Registered max/brokenearly-sims" in out and not has_version(maxv, "max/brokenearly-sims", "1.0.0"), out[-400:])
+cli("sync", "max/brokenearly"); cli("sync", "max/brokenearly-sims")
+check("their broken manifest at the package's v release doesn't take it (they follow sim-v)",
+      has_version(anon, "max/brokenearly", "2026.6.0") and not has_version(maxv, "max/brokenearly-sims", "2026.6.0"))
+
+# --- A version with another pattern: tags whose broken manifest no rule read before are examined
+# again under it. rel-2.1 is examined while the newest version is v1.0.0.
+SW = new_tree("switchpat")
+thorn_at(SW, "SwArr")
+write(SW, "cactarium.toml", package_toml("switchpat", "SwArr"))
+commit_tag(SW, "1.0", "v1.0.0")
+swbare = publish_tree(SW, "switchpat")
+cli("register", "max", REPOS + "/switchpat.git")
+write(SW, "cactarium.toml", package_toml("switchpat", "SwArr", 'tag-pattern = "rel-{major}.{minor}"\n'))
+commit_tag(SW, "2.0, with a pattern", "rel-2.0")
+write(SW, "cactarium.toml", "format = 1\n[package\n")
+commit_tag(SW, "broken", "rel-2.1")
+push_all(SW, swbare)
+cli("sync", "max/switchpat")
+check("once rel-2.0 froze, the broken rel-2.1 is read under its pattern: an invalid 2.1.0",
+      has_version(anon, "max/switchpat", "2.0.0") and has_version(maxv, "max/switchpat", "2.1.0") and "is not valid" in versions_of("max/switchpat"))
 
 # --- New sims with their own pattern, whose second tag's manifest is broken: before their first
-# version froze, no rule read sim-v1.1.0; once it has, the tag is examined again under its rule.
+# version froze, the pattern they were registered with reads sim-v1.1.0.
 LS = new_tree("latesims")
 LSURL = REPOS + "/latesims.git"
 thorn_at(LS, "LsArr")
@@ -1542,7 +1601,7 @@ commit_tag(LS, "broken sims", "sim-v1.1.0")
 push_all(LS, lsbare)
 ok, out = cli("register", "max", LSURL, "--tag", "sim-v1.0.0")
 check("register sims with their own pattern beside the package", ok and "Registered max/latesims-sims" in out, out[-400:])
-check("their broken sim-v1.1.0 is read under the rule of their first version: an invalid version",
+check("their broken sim-v1.1.0 is read under their registered pattern: an invalid version",
       has_version(anon, "max/latesims-sims", "1.0.0") and has_version(maxv, "max/latesims-sims", "1.1.0") and "is not valid" in versions_of("max/latesims-sims"))
 
 # --- A new entry's own pattern holds its versions while tags under it are unexamined: rel-01.0 is
@@ -1630,6 +1689,18 @@ s, r, _ = resolve("max/msrepo-sims@1")
 check("old CactUp: owner/name on a multi-sim entry is an error it shows, never a wrong file", s == 400 and r.get("error", {}).get("code") == "bad-request", r)
 s, _, _ = anon.get("/api/v1/sims/max/msrepo-sims/1.2.0/download")
 check("old CactUp: a download without ?sim= is refused, so it can't fetch a sim it didn't name", s == 400, s)
+s, r, _ = resolve("max/msrepo-sims@1")
+check("a bare multi-sim entry: the answer says first that it is a sim entry, not a package or stack",
+      s == 400 and r.get("error", {}).get("message", "").startswith("max/msrepo-sims is a sim entry, not a package or a stack"), r)
+s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote("max/msrepo-sims/alpha@1") + "&kind=package")
+check("with kind=package, a sim entry is refused as a sim before its third segment is read",
+      s == 400 and "max/msrepo-sims is a sim, not a package" in body, body[:300])
+s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote("max/msrepo-sims/alpha@1") + "&kind=sim")
+check("and with kind=sim it resolves", s == 200 and '"sim":"alpha"' in body.replace(" ", ""), body[:300])
+s, r, _ = resolve("max/msrepo/qc0-z4c@1")
+msg = r.get("error", {}).get("message", "")
+check("a package's third segment that can't be a thorn: worded apart from older servers' 'is not a thorn name'",
+      s == 400 and "is a package, not a sim entry" in msg and "is not a thorn name" not in msg, r)
 
 def versions_page(v, slug):
     return v.get(f"/{slug}?tab=versions")[1]

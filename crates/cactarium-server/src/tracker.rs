@@ -622,6 +622,7 @@ impl Plan {
                 tag_pattern,
                 min_version,
                 sim_form: sim_form_of(&p.manifest),
+                generation: 0,
             },
         )
     }
@@ -683,16 +684,6 @@ pub async fn register(
     for (label, p) in plan.prepare_all(state).await? {
         notes.extend(p.deferred.iter().map(|d| format!("{label} waits: {d}")));
     }
-    // The entries already on the repo don't sync while their reads are cleared below: a sync in
-    // flight would write reads judged without the new siblings. Taken in a fixed order, and let go
-    // before the new entries' first syncs.
-    let mut ids: Vec<i64> = plan.existing.iter().map(|(e, _)| e.id).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let mut held = Vec::with_capacity(ids.len());
-    for id in ids {
-        held.push(entry_sync_lock(id).lock_owned().await);
-    }
     let mut tx = state.db.begin().await?;
     let mut entries = Vec::new();
     for p in &plan.new {
@@ -715,6 +706,11 @@ pub async fn register(
     }
     // The entries already on the repo judge their tags again with the new ones as siblings (a new
     // sibling's pattern may claim tags they have read but not frozen).
+    // A sync of one of them in flight (in this process or another, such as `just cli`) stores
+    // nothing more once their repo's generation is bumped: it judged without the new siblings.
+    // The bump waits for a sync's open write to finish (it holds the row), never for the sync.
+    let ids: Vec<i64> = plan.existing.iter().map(|(e, _)| e.id).chain(entries.iter().map(|e| e.id)).collect();
+    sqlx::query("UPDATE entry_repos SET generation = generation + 1 WHERE entry_id = ANY($1)").bind(&ids).execute(&mut *tx).await?;
     for (e, _) in &plan.existing {
         sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1").bind(e.id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 AND kind IN ('claim', 'unreadable')").bind(e.id).execute(&mut *tx).await?;
@@ -733,7 +729,6 @@ pub async fn register(
     )
     .await?;
     tx.commit().await?;
-    drop(held);
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
     // The entries exist now, whatever the first sync says: a problem there is reported, kept as the
     // repo's poll error, and the poller tries again.
@@ -839,7 +834,7 @@ pub async fn check(
                     lines.push(format!("{}@{tv}: would be an invalid version: {err}", e.slug()));
                     continue;
                 }
-                Some(Exam::Not { why, .. }) => {
+                Some(Exam::Not { why, .. } | Exam::Claimed { why, .. }) => {
                     lines.push(format!("{}: {tag} wouldn't be read as a version: {why}", e.slug()));
                     continue;
                 }
@@ -1120,6 +1115,72 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
     Ok((done, left))
 }
 
+/// Admin-only: a tag recorded as not a version of the entry (of any kind) is examined again under
+/// the rules as they are now: its record goes (audited) and the entry is synced, which examines it
+/// like a new tag and freezes it if it is a version now. No "not a version" outcome is final.
+/// Returns what the tag is afterward.
+pub async fn reexamine_tag(state: &AppState, admin: &User, entry: &Entry, tag: &str) -> AppResult<String> {
+    if !admin.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    let tag = tag.trim();
+    repo_of(state, entry.id).await?.ok_or_else(|| AppError::bad(format!("{} isn't released from a repo", entry.slug())))?;
+    {
+        // Not while a sync of this entry (in this process) is between reading and writing.
+        let lock = entry_sync_lock(entry.id);
+        let _one_at_a_time = lock.lock().await;
+        let mut tx = state.db.begin().await?;
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("DELETE FROM foreign_tags WHERE entry_id = $1 AND tag = $2 RETURNING commit, kind, reason")
+                .bind(entry.id)
+                .bind(tag)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((commit, kind, reason)) = row else {
+            return Err(AppError::bad(format!("{tag} isn't recorded as not a version of {}", entry.slug())));
+        };
+        crate::audit::audit_with(
+            &mut tx,
+            Some(admin.id),
+            "tag.reexamine",
+            Some(&entry.slug()),
+            json!({ "tag": tag, "commit": commit, "kind": kind, "reason": reason }),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+    }
+    // Reviewed as the tag would be if pushed now: the admin doesn't vouch for it.
+    let synced = sync_as(state, entry, None, Pace::Now).await;
+    let now: Option<(String, String)> = sqlx::query_as("SELECT kind, reason FROM foreign_tags WHERE entry_id = $1 AND tag = $2")
+        .bind(entry.id)
+        .bind(tag)
+        .fetch_optional(&state.db)
+        .await?;
+    let version: Option<String> = sqlx::query_scalar(
+        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END || CASE WHEN state = 'invalid' THEN ' (invalid)' ELSE '' END
+         FROM versions WHERE entry_id = $1 AND tag = $2",
+    )
+    .bind(entry.id)
+    .bind(tag)
+    .fetch_optional(&state.db)
+    .await?;
+    let read: Option<String> = sqlx::query_scalar("SELECT label FROM tag_reads WHERE entry_id = $1 AND tag = $2")
+        .bind(entry.id)
+        .bind(tag)
+        .fetch_optional(&state.db)
+        .await?;
+    Ok(match (version, now, read) {
+        (Some(v), _, _) => format!("{tag} examined again: it is now {}@{v}", entry.slug()),
+        (None, Some((kind, reason)), _) => format!("{tag} examined again: still not a version ({kind}): {reason}"),
+        (None, None, Some(label)) => format!("{tag} examined again: read as {label}, frozen once the tags that could also be it are read"),
+        (None, None, None) => match synced {
+            Err(e) => format!("{tag}'s record was cleared; it is examined at the next check ({e})"),
+            Ok(_) => format!("{tag}'s record was cleared; it is examined at the next check"),
+        },
+    })
+}
+
 /// Admin-only: reads an invalid version of a repo-released (not curated) entry again, at its frozen
 /// commit, the way a new tag is read now, or from another tag its own manifest reads as exactly that
 /// version. An invalid version was never served, so nothing depended on it (the argument of
@@ -1175,7 +1236,8 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     for (i, (r, exam)) in tags.iter().zip(exams).enumerate() {
         match exam {
             Exam::Version { tv: read, rank, error: None, .. } if read == tv => candidates.push((r.clone(), if i == 0 { -1 } else { rank })),
-            Exam::Not { kind, why } if i == 0 => frozen_foreign = Some((kind, why)),
+            Exam::Not { kind, why } if i == 0 => frozen_foreign = Some((kind, why, None)),
+            Exam::Claimed { by, why } if i == 0 => frozen_foreign = Some(("claim", why, Some(by))),
             Exam::Wait(why) | Exam::Unexamined(why) if i == 0 => return Err(AppError::Upstream(why)),
             _ => {}
         }
@@ -1199,21 +1261,11 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
         }
     }
     let Some((r, co, p)) = found else {
-        if let Some((kind, why)) = frozen_foreign {
+        if let Some((kind, why, by)) = frozen_foreign {
             let mut tx = state.db.begin().await?;
             sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(v.id).execute(&mut *tx).await?;
             forget_duplicates_of(&mut tx, entry.id, &v.label()).await?;
-            sqlx::query(
-                "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind) VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
-            )
-            .bind(entry.id)
-            .bind(&tag)
-            .bind(&commit)
-            .bind(&why)
-            .bind(kind)
-            .execute(&mut *tx)
-            .await?;
+            record_foreign_in(&mut tx, entry.id, &frozen, (kind, &why), by).await?;
             crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread", Some(&entry.slug()), json!({ "version": label, "tag": tag, "now": "not the entry's", "why": why }), None).await?;
             tx.commit().await?;
             return Ok(format!("{tag} isn't {}'s tag ({why}); the invalid version was removed", entry.slug()));
@@ -1394,11 +1446,14 @@ pub struct RepoRow {
     pub min_version: Option<String>,
     /// For a sim entry: `file` or `files`, fixed when it was registered (the address depends on it).
     pub sim_form: Option<String>,
+    /// Bumped when registering another entry on the repo clears this one's records: a sync
+    /// stores nothing once it differs from the value the sync started with.
+    pub generation: i64,
 }
 
 pub async fn repo_of(state: &AppState, entry_id: i64) -> AppResult<Option<RepoRow>> {
     Ok(sqlx::query_as::<_, RepoRow>(
-        "SELECT url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version, sim_form FROM entry_repos WHERE entry_id = $1",
+        "SELECT url, manifest_file, webhook_secret, overlay_manifest, tag_pattern, min_version, sim_form, generation FROM entry_repos WHERE entry_id = $1",
     )
     .bind(entry_id)
     .fetch_optional(&state.db)
@@ -1497,7 +1552,15 @@ async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>, pace: Pa
             .await?;
         return Ok(0);
     }
-    let result = sync_inner(state, entry, &repo, actor, pace).await;
+    let result = match sync_inner(state, entry, &repo, actor, pace).await {
+        // A registration on the repo cleared this entry's records meanwhile: nothing more was
+        // stored, and the next sync reads the rest.
+        Err(AppError::Conflict(m)) if m == STALE_SYNC => {
+            tracing::info!("sync of {} stopped: {m}", entry.slug());
+            Ok(0)
+        }
+        other => other,
+    };
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
         .bind(entry.id)
@@ -1795,6 +1858,10 @@ enum Exam {
     Version { tv: TrackedVersion, rank: i32, error: Option<String>, note: Option<String>, pattern: Option<String> },
     /// Not a version of this entry: a kind (for `foreign_tags`) and why.
     Not { kind: &'static str, why: String },
+    /// Not a version of this entry: taken as the sibling `by`'s, whose manifest at that commit
+    /// can't be read, by that sibling's rule as it is now (a `claim`, examined again once that rule
+    /// no longer reads the tag).
+    Claimed { by: i64, why: String },
     /// A fact about the tag that can't be judged by this server yet (a newer format, its own or a
     /// sibling's at that commit): recorded as waiting, tried again with backoff.
     Wait(String),
@@ -1833,9 +1900,10 @@ impl Read {
     }
 }
 
-/// A sibling entry's manifest at a tag's commit, for [`judge`]: its slug, its file, the file as
-/// read, and the rule of the sibling's newest version (for when the file can't be read).
+/// A sibling entry's manifest at a tag's commit, for [`judge`]: its id and slug, its file, the file
+/// as read, and the rule it is taken to have when the file can't be read ([`unreadable_rule`]).
 struct Sib<'a> {
+    id: i64,
     slug: String,
     file: &'a str,
     read: Read,
@@ -1845,11 +1913,19 @@ struct Sib<'a> {
 /// The rank of a version read from an unreadable manifest: any readable one wins over it.
 const UNREADABLE_RANK: i32 = 9;
 
-/// The rule an entry's unreadable manifest is taken to have: its newest version's (the standard
-/// form when it has none). Never the standard form when the newest version follows a pattern of its
-/// own.
+/// The rule an entry's unreadable manifest is taken to have, given [`unreadable_rule`]'s answer.
 fn rule_for_unreadable(newest: Option<&TagRule>) -> TagRule {
     newest.cloned().unwrap_or_default()
+}
+
+/// The rule an entry's manifest that can't be read is taken to have: its newest version's, else
+/// the rule stored with its repo (its registration's manifest's while it has no version), else the
+/// standard form. Never the standard form when the entry follows a pattern of its own.
+async fn unreadable_rule(state: &AppState, entry_id: i64) -> AppResult<TagRule> {
+    if let Some(n) = newest_rule(state, entry_id).await? {
+        return Ok(n);
+    }
+    Ok(repo_of(state, entry_id).await?.and_then(|r| TagRule::of(&r).ok()).unwrap_or_default())
 }
 
 /// What the entry's manifest at a tag's commit makes of the tag (see the publishing docs): a tag
@@ -1866,8 +1942,8 @@ fn rule_for_unreadable(newest: Option<&TagRule>) -> TagRule {
 /// may claim it.
 fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, sibs: &[Sib], newest: Option<&TagRule>) -> Exam {
     let mut sib_rules: Vec<(&str, TagRule)> = Vec::new();
-    // Siblings whose manifest here can't be read: why, and the rule they are taken to have.
-    let mut broken: Vec<(&str, String, TagRule)> = Vec::new();
+    // Siblings whose manifest here can't be read: id, slug, why, and the rule they are taken to have.
+    let mut broken: Vec<(i64, &str, String, TagRule)> = Vec::new();
     let mut newer: Option<String> = None;
     for s in sibs {
         let why = match &s.read {
@@ -1885,15 +1961,24 @@ fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, s
                 Err(e) => e.to_string(),
             },
         };
-        broken.push((s.slug.as_str(), format!("{}'s {} at this commit can't be read ({why})", s.slug, s.file), rule_for_unreadable(s.newest.as_ref())));
+        broken.push((s.id, s.slug.as_str(), format!("{}'s {} at this commit can't be read ({why})", s.slug, s.file), rule_for_unreadable(s.newest.as_ref())));
     }
-    // A broken sibling manifest whose newest version's rule reads the tag takes it; the others
-    // claim nothing, and that is noted for reviewers.
-    let broken_claim = broken.iter().find(|(_, _, r)| r.version(tag).is_some()).map(|(slug, why, r)| Exam::Not {
-        kind: "claim",
-        why: format!("{why}, and the rule of its newest version ({}) reads {tag}, so it is taken as {slug}'s", r.describe_with_since()),
-    });
-    let notes: Vec<String> = broken.iter().map(|(_, why, _)| format!("{why}, so it claims nothing here")).collect();
+    // A broken sibling manifest is taken to follow its entry's rule. Against a manifest here that
+    // can't be read either, it takes the tag when that rule reads it at all; against a readable one,
+    // only as a readable one would: with a distinct pattern this one doesn't share.
+    let broken_claim = |own: Option<&TagRule>| {
+        broken
+            .iter()
+            .find_map(|(id, slug, why, r)| {
+                let claims = match own {
+                    None => r.version(tag).map(|_| format!("the rule it follows ({}) reads {tag}", r.describe_with_since())),
+                    Some(own) => claimed_by(tag, own, r).map(|w| format!("by the rule it follows, {w}")),
+                };
+                claims.map(|c| (*id, format!("{why}, and {c}, so it is taken as {slug}'s")))
+            })
+            .map(|(by, why)| Exam::Claimed { by, why })
+    };
+    let notes: Vec<String> = broken.iter().map(|(_, _, why, _)| format!("{why}, so it claims nothing here")).collect();
     let note = (!notes.is_empty()).then(|| notes.join("; "));
     let unreadable = |error: String| {
         let rule = rule_for_unreadable(newest);
@@ -1909,7 +1994,7 @@ fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, s
         if let Some((slug, _)) = sib_rules.iter().find(|(_, r)| r.version(tag).is_some()) {
             return Exam::Not { kind: "claim", why: format!("{error}; and {slug} reads {tag} as its own, so it isn't taken as this entry's") };
         }
-        if let Some(claim) = broken_claim.clone() {
+        if let Some(claim) = broken_claim(None) {
             return claim;
         }
         Exam::Version { tv, rank: UNREADABLE_RANK, error: Some(error), note: note.clone(), pattern: None }
@@ -1952,7 +2037,7 @@ fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, s
             return Exam::Not { kind: "claim", why: format!("it is {slug}'s release: {why}") };
         }
     }
-    if let Some(claim) = broken_claim {
+    if let Some(claim) = broken_claim(Some(&rule)) {
         return claim;
     }
     let rank = i32::from(spelling_rank(&rule, tag, &tv));
@@ -1971,7 +2056,7 @@ async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[Remote
     let sibs: Vec<(Entry, String)> = entries_on(state, &repo.url).await?.into_iter().filter(|(e, _)| e.id != entry.id).collect();
     let mut sib_newest: Vec<Option<TagRule>> = Vec::with_capacity(sibs.len());
     for (e, _) in &sibs {
-        sib_newest.push(newest_rule(state, e.id).await?);
+        sib_newest.push(Some(unreadable_rule(state, e.id).await?));
     }
     let files: Vec<String> = std::iter::once(repo.manifest_file.clone()).chain(sibs.iter().map(|(_, f)| f.clone())).collect();
     let wants: Vec<(String, String)> = tags.iter().flat_map(|r| files.iter().map(|f| (r.commit.clone(), f.clone()))).collect();
@@ -1982,7 +2067,7 @@ async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[Remote
             return Ok(tags.iter().map(|_| Exam::Unexamined(why.clone())).collect());
         }
     };
-    let newest = newest_rule(state, entry.id).await?;
+    let newest = Some(unreadable_rule(state, entry.id).await?);
     let mut out = Vec::with_capacity(tags.len());
     for (i, r) in tags.iter().enumerate() {
         let chunk: Vec<git::FileAt> = got[i * files.len()..(i + 1) * files.len()].to_vec();
@@ -2032,7 +2117,7 @@ async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[Remote
             .iter()
             .zip(&sib_newest)
             .zip(reads.iter().skip(1))
-            .map(|(((e, f), n), rd)| Sib { slug: e.slug(), file: f.as_str(), read: rd.clone(), newest: n.clone() })
+            .map(|(((e, f), n), rd)| Sib { id: e.id, slug: e.slug(), file: f.as_str(), read: rd.clone(), newest: n.clone() })
             .collect();
         out.push(judge(entry, &repo.manifest_file, fixed_form(entry, repo), &r.name, &reads[0], &theirs, newest.as_ref()));
     }
@@ -2139,7 +2224,8 @@ async fn examine_and_ingest(
     // The rule of the newest version as it is now may read tags whose unreadable manifest's
     // version wasn't one under the rule before: they are examined again, now if this sync still
     // may, else at the next.
-    let again = unreadable_now_read(state, entry, &refs).await?;
+    let mut again = unreadable_now_read(state, entry, &refs).await?;
+    again.extend(claims_released(state, entry, repo, &refs).await?);
     if !again.is_empty() {
         let now: Vec<RemoteRef> = again.iter().take(budget.examine).cloned().collect();
         budget.examine -= now.len();
@@ -2192,6 +2278,11 @@ async fn examine_and_record(
 ) -> AppResult<()> {
     for group in tags.chunks(EXAMINE_GROUP) {
         let exams = examine(state, entry, repo, group, &mut budget.checkouts).await?;
+        // The group's outcomes land together, and only while no registration on the repo has
+        // cleared this entry's records since the sync started.
+        let mut tx = state.db.begin().await?;
+        still_current(&mut tx, entry.id, repo.generation).await?;
+        let mut waits = Vec::new();
         for (r, exam) in group.iter().zip(exams) {
             match exam {
                 Exam::Version { tv, rank, error, note, pattern } => {
@@ -2208,16 +2299,20 @@ async fn examine_and_record(
                     .bind(&error)
                     .bind(&note)
                     .bind(&pattern)
-                    .execute(&state.db)
+                    .execute(&mut *tx)
                     .await?;
-                    done_waiting(state, entry.id, &r.name).await?;
+                    done_waiting_in(&mut tx, entry.id, &r.name).await?;
                 }
                 Exam::Not { kind, why } => {
-                    record_foreign(state, entry, r, (kind, &why)).await?;
-                    done_waiting(state, entry.id, &r.name).await?;
+                    record_foreign_in(&mut tx, entry.id, r, (kind, &why), None).await?;
+                    done_waiting_in(&mut tx, entry.id, &r.name).await?;
+                }
+                Exam::Claimed { by, why } => {
+                    record_foreign_in(&mut tx, entry.id, r, ("claim", &why), Some(by)).await?;
+                    done_waiting_in(&mut tx, entry.id, &r.name).await?;
                 }
                 Exam::Wait(why) => {
-                    run.unfetched.push(wait(state, entry, r, why).await);
+                    waits.push((r, why));
                     pending.push(r.clone());
                 }
                 Exam::Unexamined(why) => {
@@ -2230,16 +2325,87 @@ async fn examine_and_record(
                 }
             }
         }
+        tx.commit().await?;
+        for (r, why) in waits {
+            run.unfetched.push(wait(state, entry, r, why).await);
+        }
     }
     Ok(())
 }
 
+/// Why a sync stops quietly: registering another entry on the repo cleared this entry's records
+/// meanwhile, so what it judged without the new sibling isn't stored; the next sync goes on.
+const STALE_SYNC: &str = "another entry was registered on the repo while this sync ran";
+
+/// Locks the entry's repo row for the rest of `tx` (against a registration clearing its records)
+/// and checks that its generation is still `generation`: else [`STALE_SYNC`].
+async fn still_current(tx: &mut sqlx::PgConnection, entry_id: i64, generation: i64) -> AppResult<()> {
+    let now: Option<i64> = sqlx::query_scalar("SELECT generation FROM entry_repos WHERE entry_id = $1 FOR SHARE")
+        .bind(entry_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if now != Some(generation) {
+        return Err(AppError::Conflict(STALE_SYNC.into()));
+    }
+    Ok(())
+}
+
+/// Forgets the entry's "not a version" records of tags taken as a sibling's whose manifest at that
+/// commit couldn't be read, when that sibling's rule no longer reads them (its first version
+/// frozen, say, or a version with another pattern), or it is no longer on the repo: those tags are
+/// to be examined again, so "neither entry's" never lasts once the rule behind it changed. Returns
+/// them.
+async fn claims_released(state: &AppState, entry: &Entry, repo: &RepoRow, refs: &[RemoteRef]) -> AppResult<Vec<RemoteRef>> {
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT tag, commit, claimed_by FROM foreign_tags WHERE entry_id = $1 AND kind = 'claim' AND claimed_by IS NOT NULL")
+            .bind(entry.id)
+            .fetch_all(&state.db)
+            .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let on_repo: std::collections::BTreeSet<i64> = entries_on(state, &repo.url).await?.into_iter().map(|(e, _)| e.id).collect();
+    let remote: BTreeMap<&str, &str> = refs.iter().map(|r| (r.name.as_str(), r.commit.as_str())).collect();
+    let mut rules: BTreeMap<i64, TagRule> = BTreeMap::new();
+    let mut again = Vec::new();
+    for (tag, commit, by) in rows {
+        if remote.get(tag.as_str()) != Some(&commit.as_str()) {
+            continue;
+        }
+        let still = if on_repo.contains(&by) && by != entry.id {
+            let rule = match rules.get(&by) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = unreadable_rule(state, by).await?;
+                    rules.insert(by, r.clone());
+                    r
+                }
+            };
+            rule.version(&tag).is_some()
+        } else {
+            false
+        };
+        if !still {
+            again.push(RemoteRef { name: tag, commit });
+        }
+    }
+    if !again.is_empty() {
+        let tags: Vec<&str> = again.iter().map(|r| r.name.as_str()).collect();
+        sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 AND kind = 'claim' AND claimed_by IS NOT NULL AND tag = ANY($2)")
+            .bind(entry.id)
+            .bind(&tags)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(again)
+}
+
 /// Forgets the entry's "not a version" records of tags whose manifest was unreadable and whose
-/// version, under the rule of the entry's newest version then, wasn't one, when the rule of its
-/// newest version now reads them (its first version frozen, say, or a version with another
-/// pattern): those tags are to be examined again. Returns them.
+/// version, under the entry's rule then ([`unreadable_rule`]), wasn't one, when its rule now reads
+/// them (its first version frozen, say, or a version with another pattern): those tags are to be
+/// examined again. Returns them.
 async fn unreadable_now_read(state: &AppState, entry: &Entry, refs: &[RemoteRef]) -> AppResult<Vec<RemoteRef>> {
-    let rule = rule_for_unreadable(newest_rule(state, entry.id).await?.as_ref());
+    let rule = unreadable_rule(state, entry.id).await?;
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT tag, commit FROM foreign_tags WHERE entry_id = $1 AND kind = 'unreadable'")
         .bind(entry.id)
         .fetch_all(&state.db)
@@ -2280,8 +2446,8 @@ async fn freeze(
     let rules = known_rules(state, entry.id).await?;
     let blocked: std::collections::BTreeSet<String> =
         pending.iter().flat_map(|r| rules.iter().filter_map(|rule| rule.version(&r.name).map(|tv| tv.to_string()))).collect();
-    // An unreadable manifest's version follows the newest version's rule as it is now.
-    let newest = newest_rule(state, entry.id).await?;
+    // An unreadable manifest's version follows the entry's rule as it is now.
+    let newest = Some(unreadable_rule(state, entry.id).await?);
     let mut reads = reads_of(state, entry.id, refs).await?;
     let rejudged: Vec<(String, TagRead)> = reads.iter().filter(|(_, t)| t.error.is_some()).map(|(k, t)| (k.clone(), t.clone())).collect();
     for (tag, read) in rejudged {
@@ -2454,10 +2620,15 @@ async fn record_wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: &str) 
 }
 
 async fn done_waiting(state: &AppState, entry_id: i64, tag: &str) -> AppResult<()> {
+    let mut c = state.db.acquire().await?;
+    done_waiting_in(&mut c, entry_id, tag).await
+}
+
+async fn done_waiting_in(db: &mut sqlx::PgConnection, entry_id: i64, tag: &str) -> AppResult<()> {
     sqlx::query("DELETE FROM waiting_tags WHERE entry_id = $1 AND tag = $2")
         .bind(entry_id)
         .bind(tag)
-        .execute(&state.db)
+        .execute(&mut *db)
         .await?;
     Ok(())
 }
@@ -2550,18 +2721,28 @@ async fn clear_foreign_on(db: &mut sqlx::PgConnection, entry_id: i64) -> AppResu
 /// Records `r` as not a version of `entry`, with a kind and why (replacing an earlier judgment of
 /// the same tag).
 async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, (kind, why): (&str, &str)) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    record_foreign_in(&mut tx, entry.id, r, (kind, why), None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`record_foreign`] in a transaction; `by` is the sibling a `claim` depends on the rule of.
+async fn record_foreign_in(db: &mut sqlx::PgConnection, entry_id: i64, r: &RemoteRef, (kind, why): (&str, &str), by: Option<i64>) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
+        "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind, claimed_by) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind,
+           claimed_by = EXCLUDED.claimed_by, seen_at = now()",
     )
-    .bind(entry.id)
+    .bind(entry_id)
     .bind(&r.name)
     .bind(&r.commit)
     .bind(why)
     .bind(kind)
-    .execute(&state.db)
+    .bind(by)
+    .execute(&mut *db)
     .await?;
-    sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = $2").bind(entry.id).bind(&r.name).execute(&state.db).await?;
+    sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = $2").bind(entry_id).bind(&r.name).execute(&mut *db).await?;
     Ok(())
 }
 
@@ -2657,6 +2838,7 @@ async fn ingest(
     // The version and everything stored with it land together or not at all: a version is never
     // redone once its row exists, so a half-stored one would stay half-stored.
     let mut tx = state.db.begin().await?;
+    still_current(&mut tx, entry.id, repo.generation).await?;
     let vid: i64 = sqlx::query_scalar(
         "INSERT INTO versions (entry_id, track, version, sort_key, tag, commit, tree, state, invalid_reason, manifest, readme_html, review)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
@@ -3468,12 +3650,12 @@ mod tests {
     }
 
     fn sib(file: &'static str, read: Read, newest: Option<TagRule>) -> Sib<'static> {
-        Sib { slug: "max/p".to_owned(), file, read, newest }
+        Sib { id: 2, slug: "max/p".to_owned(), file, read, newest }
     }
 
-    /// An unreadable manifest never takes a tag a sibling reads, a broken sibling manifest takes
-    /// the tags its newest version's rule reads, and a sibling manifest that can't be told yet
-    /// makes a tag the entry would take wait.
+    /// An unreadable manifest never takes a tag a sibling reads, a broken sibling manifest claims
+    /// tags by its entry's rule (as a readable one would, against a readable manifest), and a
+    /// sibling manifest that can't be told yet makes a tag the entry would take wait.
     #[test]
     fn siblings_keep_their_tags() {
         let e = entry("s");
@@ -3492,14 +3674,21 @@ mod tests {
         let sim_rule = rule(pat);
         assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &newer, Some(&sim_rule)), Exam::Not { kind: "unreadable", .. }));
         assert!(matches!(judge(&e, SIM_FILE, None, "sim-v2.0.0", &broken, &newer, Some(&sim_rule)), Exam::Wait(_)));
-        // A broken sibling manifest takes the tags the rule of its newest version (else the
-        // standard form) reads ...
+        // A broken sibling manifest is taken to follow its entry's rule (its newest version's, else
+        // its registration's). Against a readable manifest it claims only as a readable one would,
+        // with a distinct pattern: sharing v tags, the package keeps v2.0.0 ...
         let bad = Read::Text("format = 1\n[package\n".into());
-        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &sims_manifest(None), &[sib(PACKAGE_FILE, bad.clone(), None)], None), Exam::Not { kind: "claim", .. }));
-        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &[sib(PACKAGE_FILE, bad.clone(), None)], None), Exam::Not { kind: "claim", .. }));
-        // ... and claims nothing else; that is noted for reviewers.
-        let rel = vec![sib(PACKAGE_FILE, bad, Some(rule(Some("rel-{major}.{minor}"))))];
-        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &sims_manifest(None), &rel, None), Exam::Version { note: Some(_), .. }));
+        let shared = vec![sib(PACKAGE_FILE, bad.clone(), None)];
+        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &sims_manifest(None), &shared, None), Exam::Version { note: Some(_), .. }));
+        // ... and a sibling following sim-v (no version yet: its registration's rule) never takes it.
+        let simv = vec![sib(PACKAGE_FILE, bad.clone(), Some(rule(Some("sim-v{major}.{minor}.{patch}"))))];
+        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &sims_manifest(None), &simv, None), Exam::Version { note: Some(_), .. }));
+        // A distinct pattern of its own that reads the tag takes it, as it would readable.
+        let bare = vec![sib(PACKAGE_FILE, bad.clone(), Some(rule(Some("{major}.{minor}.{patch}"))))];
+        assert!(matches!(judge(&e, SIM_FILE, None, "2.0.0", &sims_manifest(None), &bare, None), Exam::Claimed { by: 2, .. }));
+        // Against a manifest here that can't be read either, it takes what its rule reads at all.
+        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &shared, None), Exam::Claimed { by: 2, .. }));
+        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &simv, None), Exam::Version { error: Some(_), .. }));
     }
 
     /// Among tags read as one version, the spelling the manifest's pattern writes wins, then the

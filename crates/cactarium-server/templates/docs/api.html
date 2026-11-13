@@ -25,8 +25,9 @@
 
 <h2 id="reads">Read endpoints</h2>
 
-<h3 id="resolve"><code>GET /resolve?req=owner/name[/sim]@range</code></h3>
+<h3 id="resolve"><code>GET /resolve?req=owner/name[/sim]@range[&amp;kind=package|stack|sim]</code></h3>
 <p>The best version of a package, stack or sim matching a <a href="/docs/versions#ranges">reference</a>: the highest published, non-yanked, valid version in the range, on the track the range names. An exact request such as <code>@1.2.3</code> also reaches a yanked version, which the response marks <code>"yanked": true</code>. For a package, <code>@head</code> and <code>@master</code> resolve to its default branch's tip, with the unpinned headers; for a stack they are refused (fetch <code>releases/head</code> instead).</p>
+<p>With <code>kind</code>, an entry of another kind is a 400 saying what it is (<code>owner/name is a sim, not a package</code>), before anything else about the reference is read; a client that only takes one kind can send it. Without it, a bare <code>owner/name</code> of a multi-sim entry is a 400 that says it is a sim entry and lists its sims.</p>
 <p>Response: <code>Resolved</code>. <code>slug</code> is the exact reference chosen, <code>kind</code> is <code>package</code>, <code>stack</code> or <code>sim</code>, <code>url</code> is the repo to fetch from (for an entry registered from a repo), <code>contact</code> is the version's declared contact or the repo, and the fields of <code>VersionInfo</code> follow inline.</p>
 <pre class="code">curl -G {{ doc.base_url }}/api/v1/resolve --data-urlencode 'req=max-morris/carpetx@mixed-precision:^1'</pre>
 <pre class="code">{

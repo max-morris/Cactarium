@@ -46,7 +46,7 @@ migrates and restarts.
 Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>]`, `check <url> --tag <tag>
-[--commit <ref>]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>`, `move-repo`, `reapply`, `token`. Create the `et`
+[--commit <ref>]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`), `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
 - `register` reads each new entry at its newest tag (or exactly `--tag`) before writing anything,
@@ -57,7 +57,8 @@ organization with `just cli org create et <your-username> --display-name "Einste
   `[track/]vX.Y.Z`, and its `since`): a manifest change applies to the tags carrying it, with no
   admin step. `reread` reads an invalid version of a non-curated repo entry again (valid if it
   reads cleanly now, or from another tag naming that version; removed if the tag isn't a version
-  of the entry at all).
+  of the entry at all); with `--tag`, it examines a tag recorded as not a version again under the
+  current rules.
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
   uses 25): after deploying, the first polls examine the existing tags of big repos over a few
   checks; a version is frozen once no unexamined or waiting tag could also be it. Each tag's

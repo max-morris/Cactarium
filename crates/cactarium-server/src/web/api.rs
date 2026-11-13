@@ -231,6 +231,9 @@ async fn version_at_commit(state: &AppState, e: &Entry, commit: &str) -> ApiResu
 #[derive(Deserialize)]
 pub struct ResolveQ {
     req: String,
+    /// The kind the client expects (`package`, `stack` or `sim`): an entry of another kind is
+    /// refused saying so, before anything else about the reference.
+    kind: Option<String>,
 }
 
 /// `owner/name@[track:]range` → the highest usable matching version, with its frozen commit.
@@ -242,6 +245,16 @@ pub async fn resolve(
 ) -> ApiResult<Response> {
     let slug: Slug = q.req.parse().map_err(AppError::bad)?;
     let e = entry_for(&state, slug.owner.as_str(), slug.name.as_str(), None, &reviewer).await?;
+    // The kind first: `cactup add` on a sim entry learns it is a sim, not what its third
+    // segment would mean.
+    if let Some(want) = q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        if !matches!(want, "package" | "stack" | "sim") {
+            return Err(AppError::bad(format!("kind '{want}' is none of package, stack or sim")).into());
+        }
+        if want != e.kind {
+            return Err(AppError::bad(format!("{} is a {}, not a {want}", e.slug(), e.kind)).into());
+        }
+    }
     let sim = third_segment(&state, &e, &slug, &reviewer).await?;
     if let Some(tip) = slug.tip() {
         if e.kind != "package" {
@@ -366,7 +379,16 @@ pub async fn resolve(
 /// sim named, if any.
 async fn third_segment(state: &AppState, e: &Entry, slug: &Slug, reviewer: &Reviewer) -> ApiResult<Option<String>> {
     if e.kind != "sim" {
-        slug.as_thorn().map_err(AppError::bad)?;
+        // Worded apart from older servers' "is not a Cactarium reference: ... is not a thorn
+        // name", which CactUp reads as a server that predates multi-sim entries.
+        if let (Err(_), Some(x)) = (slug.as_thorn(), &slug.thorn) {
+            return Err(AppError::bad(format!(
+                "{} is a {}, not a sim entry: a third segment names one of its thorns, and '{x}' can't be a thorn's",
+                e.slug(),
+                e.kind
+            ))
+            .into());
+        }
         return Ok(None);
     }
     let multi = model::multi_sim(state, e.id).await?;
@@ -379,7 +401,7 @@ async fn third_segment(state: &AppState, e: &Entry, slug: &Slug, reviewer: &Revi
                 .max_by(|a, b| a.sort_key.cmp(&b.sort_key))
                 .map(|v| v.id);
             Err(AppError::bad(format!(
-                "{} holds several sims, each named: {}; name one, as owner/name/sim[@range]",
+                "{} is a sim entry, not a package or a stack, and it holds several sims, each named: {}; name one, as owner/name/sim[@range]",
                 e.slug(),
                 sims_list(state, e, newest).await?
             ))

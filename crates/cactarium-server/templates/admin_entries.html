@@ -29,6 +29,11 @@
       <label class="sr-only" for="nu{{ e.id }}">New repo URL</label><input id="nu{{ e.id }}" name="new_url" class="mono" placeholder="new URL, e.g. after a GitHub transfer">
       <button class="button small ghost" name="action" value="move-repo" title="Moves every entry on this repo, only if the new URL holds each one's tags at the same commits">Move repo</button>
     </form>
+    <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap small">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label class="sr-only" for="rt{{ e.id }}">Tag not read as a version</label><input id="rt{{ e.id }}" name="tag" class="small-input mono" placeholder="tag not a version">
+      <button class="button small ghost" name="action" value="reexamine-tag" title="Forget why a tag was found not to be a version of this entry, and examine it again under the rules as they are now">Examine tag again</button>
+    </form>
     {% if !e.curated %}
     <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap small">
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">

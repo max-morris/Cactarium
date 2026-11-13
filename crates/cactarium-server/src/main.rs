@@ -81,8 +81,15 @@ enum Command {
     },
     /// Re-read an invalid version of a (non-curated) repo entry at its frozen commit, as an admin:
     /// it becomes valid if it reads cleanly now (also from another tag of that version), or is
-    /// removed if its tag isn't a version of the entry at all.
-    Reread { username: String, slug: String, version: String },
+    /// removed if its tag isn't a version of the entry at all. With `--tag` instead of a version: a
+    /// tag recorded as not a version of the entry is examined again under the rules as they are now.
+    Reread {
+        username: String,
+        slug: String,
+        version: Option<String>,
+        #[arg(long, conflicts_with = "version")]
+        tag: Option<String>,
+    },
     /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
     /// as the given admin.
     Curate { username: String, file: std::path::PathBuf },
@@ -244,7 +251,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(clean, "{tag} would not be read cleanly");
             Ok(())
         }
-        Command::Reread { username, slug, version } => {
+        Command::Reread { username, slug, version, tag } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
             let (owner, name) = slug.split_once('/').context("give owner/name")?;
@@ -252,7 +259,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .context("no such entry")?;
-            let said = tracker::reread_invalid(&state, &user, &e, &version).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let said = match (version, tag) {
+                (Some(version), None) => tracker::reread_invalid(&state, &user, &e, &version).await,
+                (None, Some(tag)) => tracker::reexamine_tag(&state, &user, &e, &tag).await,
+                _ => anyhow::bail!("give an invalid version, or --tag <tag>"),
+            }
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{said}");
             Ok(())
         }

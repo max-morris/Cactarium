@@ -457,6 +457,8 @@ pub struct EntryAction {
     new_url: Option<String>,
     /// For "reread-version": the invalid version to read again.
     version: Option<String>,
+    /// For "reexamine-tag": the tag recorded as not a version, to examine again.
+    tag: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -508,6 +510,17 @@ pub async fn entry_action(
         "reread-version" => {
             let v = f.version.as_deref().unwrap_or("").trim().to_owned();
             return match tracker::reread_invalid(&state, &a.user, &e, &v).await {
+                Ok(m) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
+                Err(AppError::BadRequest(m) | AppError::Upstream(m) | AppError::Conflict(m)) => {
+                    entries_page(&state, &a, e.name.clone(), Some(m)).await
+                }
+                Err(err) => Err(err),
+            };
+        }
+        // A tag recorded as not a version, examined again under the rules as they are now.
+        "reexamine-tag" => {
+            let t = f.tag.as_deref().unwrap_or("").trim().to_owned();
+            return match tracker::reexamine_tag(&state, &a.user, &e, &t).await {
                 Ok(m) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
                 Err(AppError::BadRequest(m) | AppError::Upstream(m) | AppError::Conflict(m)) => {
                     entries_page(&state, &a, e.name.clone(), Some(m)).await
