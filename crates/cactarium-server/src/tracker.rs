@@ -763,7 +763,7 @@ pub async fn check(
         let Some(r) = &r else { continue };
         let via = commit.filter(|_| r.name == tag && !remote_has_tag).unwrap_or(tag);
         let co = git::checkout(policy(state), &repo.url, &r.commit, Some(via)).await.map_err(AppError::bad)?;
-        if let Some(why) = foreign_reason(state, e, &repo, &co, r, &tv).await? {
+        if let Some((_, why)) = foreign_reason(state, e, &repo, &co, r, &tv).await? {
             lines.push(format!("{}: {tag} would be recorded as not its own: {why}", e.slug()));
             continue;
         }
@@ -875,8 +875,9 @@ pub async fn update_curated(
     )
     .await?;
     // The rule may have changed: the repo's "not this entry's" judgments are made again.
-    clear_foreign_on(&mut tx, state, &current).await?;
-    clear_foreign_on(&mut tx, state, &url).await?;
+    // The entry's own judgments, and claims on the repo it now reads; the old URL's other entries
+    // are left alone.
+    clear_foreign_on(&mut tx, state, entry.id, &url).await?;
     tx.commit().await?;
     drop(one_at_a_time);
     sync_as(state, entry, Some(admin), Pace::Now).await
@@ -933,7 +934,7 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
     crate::audit::audit_with(&mut tx, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
         .await?;
     // The rule is the repo manifest's now: the repo's "not this entry's" judgments are made again.
-    clear_foreign_on(&mut tx, state, &repo.url).await?;
+    clear_foreign_on(&mut tx, state, entry.id, &repo.url).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1099,7 +1100,7 @@ pub async fn reread_rule(state: &AppState, user: &User, entry: &Entry, tag: Opti
         .bind(&since)
         .execute(&mut *tx)
         .await?;
-    clear_foreign_on(&mut tx, state, &repo.url).await?;
+    clear_foreign_on(&mut tx, state, entry.id, &repo.url).await?;
     crate::audit::audit_with(
         &mut tx,
         Some(user.id),
@@ -1148,33 +1149,68 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
         return Err(AppError::bad(format!("{}@{label} has no tag and commit to read", entry.slug())));
     };
     let tv: TrackedVersion = v.label().parse().map_err(AppError::bad)?;
-    let r = RemoteRef { name: tag.clone(), commit: commit.clone() };
-    let co = git::checkout(policy(state), &repo.url, &commit, Some(&tag))
+    // The frozen tag first; then any other tag naming exactly this version under the entry's rule
+    // (say, the real v1.0.0 beside an old bare 1.0.0 that took the version), best spelling first.
+    let rule = TagRule::of(&repo)?;
+    let mut candidates = vec![RemoteRef { name: tag.clone(), commit: commit.clone() }];
+    let others = git::ls_tags(policy(state), &repo.url)
         .await
-        .map_err(|e| AppError::Upstream(format!("cannot fetch {commit}: {e:#}")))?;
-    if let Some(why) = foreign_reason(state, entry, &repo, &co, &r, &tv).await? {
-        let mut tx = state.db.begin().await?;
-        sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(v.id).execute(&mut *tx).await?;
-        sqlx::query(
-            "INSERT INTO foreign_tags (entry_id, tag, commit, reason) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, seen_at = now()",
-        )
-        .bind(entry.id)
-        .bind(&tag)
-        .bind(&commit)
-        .bind(&why)
-        .execute(&mut *tx)
-        .await?;
-        crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread", Some(&entry.slug()), json!({ "version": label, "tag": tag, "now": "not the entry's", "why": why }), None).await?;
-        tx.commit().await?;
-        return Ok(format!("{tag} isn't {}'s tag ({why}); the invalid version was removed", entry.slug()));
+        .map_err(|e| AppError::Upstream(format!("cannot list the repo's tags: {e:#}")))?;
+    let mut others: Vec<RemoteRef> =
+        others.into_iter().filter(|o| o.name != tag && rule.version(&o.name).as_ref() == Some(&tv)).collect();
+    others.sort_by_key(|o| (spelling_rank(&rule, &o.name, &tv), o.name.clone()));
+    candidates.extend(others);
+    let (mut frozen_foreign, mut first_error) = (None, None);
+    let mut found = None;
+    for (i, r) in candidates.iter().enumerate() {
+        let co = git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name))
+            .await
+            .map_err(|e| AppError::Upstream(format!("cannot fetch {}: {e:#}", r.commit)))?;
+        if let Some(judged) = foreign_reason(state, entry, &repo, &co, r, &tv).await? {
+            if i == 0 {
+                frozen_foreign = Some(judged);
+            }
+            continue;
+        }
+        match prepare(state, entry, &repo, &co, r, &tv, &PrepOpts::default()).await {
+            Ok(p) => {
+                found = Some((r.clone(), co, p));
+                break;
+            }
+            Err(AppError::BadRequest(m)) => {
+                first_error.get_or_insert(AppError::BadRequest(if i == 0 { m } else { format!("{} also fails: {m}", r.name) }));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts::default()).await?;
+    let Some((r, co, p)) = found else {
+        if let Some((kind, why)) = frozen_foreign {
+            let mut tx = state.db.begin().await?;
+            sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(v.id).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind) VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
+            )
+            .bind(entry.id)
+            .bind(&tag)
+            .bind(&commit)
+            .bind(&why)
+            .bind(kind)
+            .execute(&mut *tx)
+            .await?;
+            crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread", Some(&entry.slug()), json!({ "version": label, "tag": tag, "now": "not the entry's", "why": why }), None).await?;
+            tx.commit().await?;
+            return Ok(format!("{tag} isn't {}'s tag ({why}); the invalid version was removed", entry.slug()));
+        }
+        return Err(first_error.unwrap_or_else(|| AppError::bad(format!("{}@{label} still isn't readable", entry.slug()))));
+    };
     // Reviewed as the tag would be if pushed now: the admin re-reading it doesn't vouch for it.
     let review = publish::release_review(state, entry, None).await?;
     let mut tx = state.db.begin().await?;
+    // Possibly another tag of the same version: never served, so nothing depended on the old one.
     let n = sqlx::query(
-        "UPDATE versions SET state = 'ok', invalid_reason = NULL, manifest = $2, readme_html = $3, tree = $4, review = $5
+        "UPDATE versions SET state = 'ok', invalid_reason = NULL, manifest = $2, readme_html = $3, tree = $4, review = $5,
+                tag = $6, commit = $7
          WHERE id = $1 AND state = 'invalid'",
     )
     .bind(v.id)
@@ -1182,6 +1218,8 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     .bind(&p.readme_html)
     .bind(&co.tree)
     .bind(review)
+    .bind(&r.name)
+    .bind(&r.commit)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -1190,10 +1228,11 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     }
     store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
     publish::submit_release(&mut tx, entry, v.id, review, None).await?;
-    crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread", Some(&entry.slug()), json!({ "version": label, "tag": tag, "now": "valid", "review": review }), None).await?;
+    crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread", Some(&entry.slug()), json!({ "version": label, "tag": r.name, "was": tag, "now": "valid", "review": review }), None).await?;
     tx.commit().await?;
     publish::touch(state, entry.id).await?;
-    Ok(format!("{}@{label} reads cleanly now{}", entry.slug(), if review == "pending" { "; it awaits review" } else { "" }))
+    let from = if r.name == tag { String::new() } else { format!(", from {} (instead of {tag})", r.name) };
+    Ok(format!("{}@{label} reads cleanly now{from}{}", entry.slug(), if review == "pending" { "; it awaits review" } else { "" }))
 }
 
 /// Checks that `url` holds the history the entry's published versions froze: every tagged version
@@ -1519,7 +1558,7 @@ async fn sync_inner(
         match claim {
             Some(why) if own_rule.version(&r.name).is_some() => {
                 if !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) {
-                    record_foreign(state, entry, &r, &why, repo.tag_pattern.as_deref()).await?;
+                    record_foreign(state, entry, &r, ("claim", &why), repo.tag_pattern.as_deref()).await?;
                 }
             }
             _ => refs_left.push(r),
@@ -1757,7 +1796,7 @@ async fn foreign_reason(
     co: &git::Checkout,
     r: &RemoteRef,
     tv: &TrackedVersion,
-) -> AppResult<Option<String>> {
+) -> AppResult<Option<(&'static str, String)>> {
     if repo.overlay_manifest.is_some() {
         return Ok(None);
     }
@@ -1770,7 +1809,7 @@ async fn foreign_reason(
         for sib in &sibs {
             let Some(theirs) = repo_of(state, sib.id).await? else { continue };
             if let Some(why) = claimed_by(&r.name, &own, &TagRule::of(&theirs)?) {
-                return Ok(Some(format!("it is {}'s release: {why}", sib.slug())));
+                return Ok(Some(("claim", format!("it is {}'s release: {why}", sib.slug()))));
             }
         }
     }
@@ -1780,9 +1819,9 @@ async fn foreign_reason(
         if sibs.is_empty() {
             return Ok(None);
         }
-        return Ok(Some(format!(
-            "it has no {} (a release of another entry on this repo, or from before this one's manifest)",
-            repo.manifest_file
+        return Ok(Some((
+            "backstop",
+            format!("it has no {} (a release of another entry on this repo, or from before this one's manifest)", repo.manifest_file),
         )));
     };
     let Ok(m) = Manifest::from_repo_file(&repo.manifest_file, &text) else { return Ok(None) };
@@ -1791,14 +1830,17 @@ async fn foreign_reason(
     if let (Some(fixed), Some(here)) = (fixed_form(entry, repo), sim_form_of(&m))
         && fixed != here
     {
-        return Ok(Some(format!(
-            "its {} uses {}, but this entry publishes {} (fixed when it was registered)",
-            repo.manifest_file,
-            form_words(&here),
-            form_words(fixed)
+        return Ok(Some((
+            "form",
+            format!(
+                "its {} uses {}, but this entry publishes {} (fixed when it was registered)",
+                repo.manifest_file,
+                form_words(&here),
+                form_words(fixed)
+            ),
         )));
     }
-    Ok(inconsistent(&TagRule::of_manifest(&m), &repo.manifest_file, &r.name, tv))
+    Ok(inconsistent(&TagRule::of_manifest(&m), &repo.manifest_file, &r.name, tv).map(|why| ("consistency", why)))
 }
 
 /// Whether `tag` belongs to a sibling with its own tag-pattern, rather than to an entry following
@@ -1843,12 +1885,17 @@ fn inconsistent(own: &TagRule, file: &str, tag: &str, tv: &TrackedVersion) -> Op
     }
 }
 
-/// Forgets every "not this entry's" judgment on a repo (every entry on its normalized URL): after a
-/// rule changes, this entry's own and those its old pattern claimed from siblings may no longer
-/// hold. Each is judged again at its entry's next sync.
-async fn clear_foreign_on(db: &mut sqlx::PgConnection, state: &AppState, url: &str) -> AppResult<()> {
+/// After `entry_id`'s tag rule changes: forgets its own "not this entry's" judgments, and, on the
+/// repo at `url`, the siblings' that are claims by a tag-pattern (which its old pattern may have
+/// made). Each is judged again at its entry's next sync. The siblings' other judgments (no manifest
+/// for them, another form, their own manifest's rule) don't depend on this entry's rule and stay.
+async fn clear_foreign_on(db: &mut sqlx::PgConnection, state: &AppState, entry_id: i64, url: &str) -> AppResult<()> {
     let ids: Vec<i64> = entries_on(state, url).await?.into_iter().map(|(e, _)| e.id).collect();
-    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = ANY($1)").bind(&ids).execute(&mut *db).await?;
+    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 OR (entry_id = ANY($2) AND kind = 'claim')")
+        .bind(entry_id)
+        .bind(&ids)
+        .execute(&mut *db)
+        .await?;
     Ok(())
 }
 
@@ -1856,18 +1903,19 @@ async fn clear_foreign_on(db: &mut sqlx::PgConnection, state: &AppState, url: &s
 /// Only while the entry's tag rule is still `pattern`, the one the caller judged under: a re-read
 /// of the rule (which clears these records) in between makes the judgment stale, and nothing is
 /// written.
-async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, why: &str, pattern: Option<&str>) -> AppResult<()> {
+async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, (kind, why): (&str, &str), pattern: Option<&str>) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO foreign_tags (entry_id, tag, commit, reason)
-         SELECT $1, $2, $3, $4 WHERE EXISTS
+        "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind)
+         SELECT $1, $2, $3, $4, $6 WHERE EXISTS
            (SELECT 1 FROM entry_repos WHERE entry_id = $1 AND tag_pattern IS NOT DISTINCT FROM $5)
-         ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, seen_at = now()",
+         ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
     )
     .bind(entry.id)
     .bind(&r.name)
     .bind(&r.commit)
     .bind(why)
     .bind(pattern)
+    .bind(kind)
     .execute(&state.db)
     .await?;
     Ok(())
@@ -1902,7 +1950,7 @@ async fn ingest(
         // recorded as not this entry's (judged again if the tag moves) rather than frozen here.
         Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
             if repo.overlay_manifest.is_none() && !siblings(state, entry.id, &repo.url).await?.is_empty() {
-                record_foreign(state, entry, r, &format!("{e:#}, so whose release it is can't be read"), repo.tag_pattern.as_deref()).await?;
+                record_foreign(state, entry, r, ("large", &format!("{e:#}, so whose release it is can't be read")), repo.tag_pattern.as_deref()).await?;
                 return Ok(Ingested::Foreign);
             }
             (Some(format!("cannot index the tagged commit: {e:#}")), None, None)
@@ -1913,8 +1961,8 @@ async fn ingest(
             return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, short(&r.commit))));
         }
         Ok(co) => {
-            if let Some(why) = foreign_reason(state, entry, repo, &co, r, tv).await? {
-                record_foreign(state, entry, r, &why, repo.tag_pattern.as_deref()).await?;
+            if let Some((kind, why)) = foreign_reason(state, entry, repo, &co, r, tv).await? {
+                record_foreign(state, entry, r, (kind, &why), repo.tag_pattern.as_deref()).await?;
                 return Ok(Ingested::Foreign);
             }
             match prepare(state, entry, repo, &co, r, tv, &PrepOpts::default()).await {

@@ -1384,6 +1384,33 @@ cli("sync", "max/repo-sim")
 check("a sim entry with no stored form is a one-file entry: a [sim.files] tag isn't its release",
       not has_version(maxv, "max/repo-sim", "1.4.0") and "one sim (file)" in page(maxv, "/max/repo-sim"))
 
+# --- A re-read of one entry's rule keeps a sibling's judgments that don't depend on it (no manifest
+# for the sibling at that tag).
+ok, out = cli("reread-rule", "max", "max/sibrepo")
+check("re-read the package's rule beside a sim with a tag it has no manifest at", ok, out[-300:])
+check("the sim's 'no manifest' record stays", '<span class="mono">v1.1.0</span>: it has no cactarium-sim.toml' in page(maxv, "/max/sibrepo-sim"))
+
+# --- An invalid version frozen from one tag is re-read from another tag naming exactly that version.
+RB = new_tree("rebare")
+thorn_at(RB, "RbArr")
+write(RB, "cactarium.toml", package_toml("rebare", "RbArr"))
+commit_tag(RB, "0.5", "v0.5.0")
+rbbare = publish_tree(RB, "rebare")
+cli("register", "max", REPOS + "/rebare.git")
+os.remove(os.path.join(RB, "cactarium.toml"))
+commit_tag(RB, "an upstream release without the manifest", "1.0.0")
+push_all(RB, rbbare)
+cli("sync", "max/rebare")
+check("a bare 1.0.0 without the manifest is an invalid 1.0.0", "no cactarium.toml" in versions_of("max/rebare"))
+write(RB, "cactarium.toml", package_toml("rebare", "RbArr"))
+commit_tag(RB, "the real release", "v1.0.0")
+push_all(RB, rbbare)
+cli("sync", "max/rebare")
+ok, out = cli("reread", "max", "max/rebare", "1.0.0")
+check("re-read invalid version reads it from the other tag naming 1.0.0", ok and "from v1.0.0" in out, out[-300:])
+s, r, _ = resolve("max/rebare@1.0.0")
+check("and 1.0.0 is now the real release", s == 200 and r.get("tag") == "v1.0.0", r)
+
 # --- The seeded multi-sim entry, registered with --tag beside its package.
 page(anon, "/max/bbh-demo-sims", contains="Sims in this version")
 page(anon, "/max/bbh-demo-sims/1.0.0?sim=tov&tab=thornlist", contains="BBHDemoArr/BBHDemo")

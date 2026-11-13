@@ -26,6 +26,10 @@ CREATE TABLE foreign_tags (
     tag        TEXT NOT NULL,
     commit     TEXT NOT NULL,
     reason     TEXT NOT NULL,
+    -- Why, as a kind: claim (a sibling's tag-pattern reads it), consistency (the manifest inside
+    -- reads it otherwise), backstop (no manifest for this entry, with siblings), form (the other sim
+    -- form), large (too large to read, with siblings). A rule change clears only what it can affect.
+    kind       TEXT NOT NULL DEFAULT 'consistency' CHECK (kind IN ('claim', 'consistency', 'backstop', 'form', 'large')),
     seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entry_id, tag)
 );
