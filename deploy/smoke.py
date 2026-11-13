@@ -1491,6 +1491,73 @@ cli("sync", "max/brokensib"); cli("sync", "max/brokensib-sims")
 check("the package's v tag is its version", has_version(anon, "max/brokensib", "2026.6.0"))
 check("and the sims' broken manifest there doesn't make it an invalid sims version",
       not has_version(maxv, "max/brokensib-sims", "2026.6.0") and '<span class="mono">v2026.6.0</span>' in page(maxv, "/max/brokensib-sims"))
+# A sibling manifest of a newer format doesn't hold up a tag the entry settles alone: the package's
+# rule doesn't read sim-v2026.7.0, so it isn't the package's, whatever the sims' manifest says.
+write(BR, "cactarium-sim.toml", "format = 99\n")
+commit_tag(BR, "sims manifest of a newer format", "sim-v2026.7.0")
+push_all(BR, brbare)
+ok, out = cli("sync", "max/brokensib")
+check("a sibling's newer-format manifest doesn't hold a tag the package's own rule doesn't read",
+      ok and "can't be told yet" not in out and '<span class="mono">sim-v2026.7.0</span>' in page(maxv, "/max/brokensib"), out[-300:])
+ok, out = cli("sync", "max/brokensib-sims")
+check("while the sims, whose own manifest it is, wait", not ok and "format 99" in out and not has_version(maxv, "max/brokensib-sims", "2026.7.0"), out[-300:])
+
+# --- A broken sibling manifest takes the tags its newest version's rule reads: package and sims
+# share v tags (no pattern), and the sims' manifest is broken at the next v tag.
+BS = new_tree("brokenshare")
+BSURL = REPOS + "/brokenshare.git"
+thorn_at(BS, "BsArr")
+write(BS, "cactarium.toml", package_toml("brokenshare", "BsArr"))
+bs_c = commit_tag(BS, "the package")
+write(BS, "a.sim", pin_sim("alpha", [("brokenshare", "BsArr", BSURL, bs_c)]))
+write(BS, "cactarium-sim.toml", sims_toml("brokenshare-sims", {"alpha": "a.sim"}, pattern=None))
+commit_tag(BS, "sims beside it", "v2026.5.0")
+bsbare = publish_tree(BS, "brokenshare")
+ok, out = cli("register", "max", BSURL)
+check("register a package and sims sharing v tags", ok and out.count("Registered") == 2, out[-400:])
+write(BS, "cactarium-sim.toml", "format = 2\n[sim\n")
+commit_tag(BS, "a broken sims manifest", "v2026.6.0")
+push_all(BS, bsbare)
+cli("sync", "max/brokenshare"); cli("sync", "max/brokenshare-sims")
+bs_page = page(maxv, "/max/brokenshare")
+check("a tag the broken sims manifest's rule reads is no package version: whose it is can't be told",
+      not has_version(maxv, "max/brokenshare", "2026.6.0") and '<span class="mono">v2026.6.0</span>' in bs_page
+      and "so it is taken as max/brokenshare-sims" in bs_page)
+check("nor a sims version", not has_version(maxv, "max/brokenshare-sims", "2026.6.0") and has_version(anon, "max/brokenshare-sims", "2026.5.0"))
+
+# --- New sims with their own pattern, whose second tag's manifest is broken: before their first
+# version froze, no rule read sim-v1.1.0; once it has, the tag is examined again under its rule.
+LS = new_tree("latesims")
+LSURL = REPOS + "/latesims.git"
+thorn_at(LS, "LsArr")
+write(LS, "cactarium.toml", package_toml("latesims", "LsArr"))
+ls_c = commit_tag(LS, "the package", "v1.0.0")
+lsbare = publish_tree(LS, "latesims")
+cli("register", "max", LSURL)
+write(LS, "a.sim", pin_sim("alpha", [("latesims", "LsArr", LSURL, ls_c)]))
+write(LS, "cactarium-sim.toml", sims_toml("latesims-sims", {"alpha": "a.sim"}))
+commit_tag(LS, "sims", "sim-v1.0.0")
+write(LS, "cactarium-sim.toml", "format = 2\n[sim\n")
+commit_tag(LS, "broken sims", "sim-v1.1.0")
+push_all(LS, lsbare)
+ok, out = cli("register", "max", LSURL, "--tag", "sim-v1.0.0")
+check("register sims with their own pattern beside the package", ok and "Registered max/latesims-sims" in out, out[-400:])
+check("their broken sim-v1.1.0 is read under the rule of their first version: an invalid version",
+      has_version(anon, "max/latesims-sims", "1.0.0") and has_version(maxv, "max/latesims-sims", "1.1.0") and "is not valid" in versions_of("max/latesims-sims"))
+
+# --- A new entry's own pattern holds its versions while tags under it are unexamined: rel-01.0 is
+# examined in the first check, rel-1.0 (the pattern's own spelling) only in the next.
+HP = new_tree("heldpat")
+thorn_at(HP, "HpArr")
+write(HP, "cactarium.toml", package_toml("heldpat", "HpArr", 'tag-pattern = "rel-{major}.{minor}"\n'))
+commit_tag(HP, "release", "rel-01.0", "rel-1.0", *[f"rel-0pad-{i:02}" for i in range(26)])
+publish_tree(HP, "heldpat")
+ok, out = cli("register", "max", REPOS + "/heldpat.git", "--tag", "rel-1.0")
+check("a version is held while a tag its registered pattern reads is unexamined",
+      ok and "held until" in out and not has_version(maxv, "max/heldpat", "1.0.0"), out[-400:])
+cli("sync", "max/heldpat")
+s, r, _ = resolve("max/heldpat@1.0.0")
+check("then the pattern's own spelling is the version", s == 200 and r.get("tag") == "rel-1.0", r)
 
 # --- A manifest that is a symbolic link inside the repo is read through it, as before.
 SL = new_tree("symlinked")
@@ -1513,6 +1580,16 @@ push_all(SL, slbare)
 ok, out = cli("sync", "max/symlinked")
 check("a tag naming a tree is listed as not a version, and the next tag is read",
       ok and has_version(anon, "max/symlinked", "1.2.0") and "treetag</span>: treetag names a tree" in page(maxv, "/max/symlinked"), out[-300:])
+# Each tag's outcome is stored as it is examined: a check reads at most so many manifests from a
+# checkout (1 on the dev site), freezes what it could, and the next check goes on from there.
+commit_tag(SL, "1.3", "v1.3.0")
+commit_tag(SL, "1.4", "v1.4.0")
+push_all(SL, slbare)
+ok, out = cli("sync", "max/symlinked")
+check("a check reads at most its share of manifests from a checkout, and keeps what it read",
+      not ok and "need a checkout" in out and has_version(anon, "max/symlinked", "1.3.0") and not has_version(maxv, "max/symlinked", "1.4.0"), out[-300:])
+ok, out = cli("sync", "max/symlinked")
+check("the next check goes on from there", ok and has_version(anon, "max/symlinked", "1.4.0"), out[-300:])
 
 # --- An invalid version whose tag is deleted upstream goes, and the version's other tag is read.
 DL = new_tree("delinvalid")

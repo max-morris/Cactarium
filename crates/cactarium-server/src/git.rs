@@ -720,7 +720,10 @@ async fn read_blob(policy: GitPolicy, home: &Path, key: &str, dir: &Path, oid: &
         let mut c = git(policy, home);
         c.arg("-C").arg(&repo).args(["cat-file", "blob", oid]);
         return match exec_raw(c, None, "reading a file", TIMEOUT, None).await {
-            Ok(bytes) => FileAt::Content(bytes),
+            Ok(bytes) => {
+                keep_blob(policy, home, dir, oid, &bytes, scratch.path()).await;
+                FileAt::Content(bytes)
+            }
             Err(_) => FileAt::NeedsCheckout,
         };
     }
@@ -732,6 +735,29 @@ async fn read_blob(policy: GitPolicy, home: &Path, key: &str, dir: &Path, oid: &
     match exec_raw(c, None, "reading a file", TIMEOUT, None).await {
         Ok(bytes) => FileAt::Content(bytes),
         Err(_) => FileAt::NeedsCheckout,
+    }
+}
+
+/// Keeps a blob fetched by id (and within [`MAX_FILE_AT`]) in the mirror, so later reads of it
+/// (a sibling's, a re-read) are local. Written by content, so only a blob with exactly this id is
+/// kept; under the mirror's lock, so never into a mirror being replaced. Best effort: a blob not
+/// kept is only fetched again.
+async fn keep_blob(policy: GitPolicy, home: &Path, dir: &Path, oid: &str, bytes: &[u8], scratch: &Path) {
+    let file = scratch.join("blob");
+    if std::fs::write(&file, bytes).is_err() {
+        return;
+    }
+    let lock = mirror_lock(dir);
+    let _held = lock.lock().await;
+    if !mirror_complete(dir).await {
+        return;
+    }
+    let mut c = git(policy, home);
+    c.arg("-C").arg(dir).args(["hash-object", "-w", "--no-filters", "-t", "blob", "--"]).arg(&file);
+    match run(c, "keeping a file").await {
+        Ok(id) if id.trim() == oid => {}
+        Ok(id) => tracing::warn!("keeping blob {oid} in a mirror wrote {}", id.trim()),
+        Err(e) => tracing::warn!("keeping blob {oid} in a mirror: {e:#}"),
     }
 }
 
@@ -1185,6 +1211,20 @@ mod tests {
         assert!(matches!(got[2], FileAt::NeedsCheckout), "{:?}", got[2]);
         assert!(matches!(got[3], FileAt::TooLarge(_)), "{:?}", got[3]);
         assert!(matches!(got[4], FileAt::NotCommit), "{:?}", got[4]);
+        // The blob fetched by id was kept in the mirror: read again with the repo gone, it is local.
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        let oid = sh(&up, &["rev-parse", "HEAD:cactarium.toml"]);
+        let other = sh(&up, &["rev-parse", "HEAD:big.bin"]);
+        let has = |id: &str| {
+            let mut c = std::process::Command::new("git");
+            c.env("GIT_NO_LAZY_FETCH", "1").arg("-C").arg(&dir).args(["cat-file", "-e", id]);
+            c.status().unwrap().success()
+        };
+        assert!(has(&oid), "the blob is kept");
+        assert!(!has(&other), "the large blob isn't kept");
+        std::fs::remove_dir_all(&up).unwrap();
+        let again = read_files_at(policy, &url, &wants[..1]).await.unwrap();
+        assert!(matches!(&again[0], FileAt::Content(b) if b.as_slice() == b"format = 1\n"), "{:?}", again[0]);
     }
 
     #[test]
