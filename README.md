@@ -76,8 +76,11 @@ organization with `just cli org create et <your-username> --display-name "Einste
   tags (default 100; the dev site uses 40), at most `CACTARIUM_PREVIEW_CHECKOUTS` of them from a
   checkout (default 5); when not every tag could be read, each manifest needs a tag named. A
   preview of a repo with no entries uses a temporary mirror, deleted afterward, cloned on a slot of
-  its own (never one of syncing's three). Previews are limited to `CACTARIUM_PREVIEWS_PER_HOUR` per
-  user (default 20) and 60 a minute per address. Mirror clones stop past 1 GB.
+  its own (never one of syncing's three), given up (its git killed) once the request goes away,
+  and stopped past 1 GB; leftovers of a process that died are swept at startup and hourly. Kept
+  mirrors have no size limit. Previews and confirms together are limited to
+  `CACTARIUM_PREVIEWS_PER_HOUR` per user (default 20); previews also to 60 a minute per address,
+  confirms to 10.
 - Upgrading from master to this release, by design but worth knowing:
   - a newer manifest's `since` no longer excludes older tags: each tag is read by the manifest in
     its commit, so an old tag whose manifest had no `since` becomes a version on the first sync if

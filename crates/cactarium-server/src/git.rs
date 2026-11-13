@@ -457,9 +457,33 @@ static MIRROR_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 /// never takes one of the slots syncing uses.
 static PREVIEW_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
-/// The most a mirror's clone may download (it has no file contents, only commits and trees): a
-/// clone that outgrows it is stopped.
-const MAX_MIRROR_BYTES: u64 = 1024 * 1024 * 1024;
+/// The most a registration preview's temporary mirror may download (it has no file contents, only
+/// commits and trees): a clone that outgrows it is stopped. Kept mirrors, of registered repos, have
+/// no such limit, beyond the clone's time limit.
+const MAX_PREVIEW_MIRROR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Temporary mirror roots are named so; one older than this is a leftover of a process that died.
+const TEMP_MIRROR_PREFIX: &str = "cactarium-preview-";
+const STALE_TEMP_MIRROR: Duration = Duration::from_secs(3600);
+
+/// Removes temporary preview mirrors left behind by a process that died before dropping them (at
+/// startup, and now and then). Only old ones: a younger one may be a running preview's, here or in
+/// another process (`just cli check`). Blocking work.
+pub fn sweep_temp_mirrors() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in rd.flatten() {
+        let stale = e.file_name().to_string_lossy().starts_with(TEMP_MIRROR_PREFIX)
+            && e.file_type().is_ok_and(|t| t.is_dir())
+            && e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMP_MIRROR);
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
 
 /// Where a repo's history mirror lives: with the others, kept and reused, or for a registration
 /// preview of a repo nobody registered yet, in a temporary directory of its own, deleted once the
@@ -479,7 +503,7 @@ pub struct TempMirrors {
 impl Mirrors {
     /// A new temporary mirror root, private to this process.
     pub fn temp() -> anyhow::Result<Mirrors> {
-        let root = tempfile::Builder::new().prefix("cactarium-preview-").tempdir()?;
+        let root = tempfile::Builder::new().prefix(TEMP_MIRROR_PREFIX).tempdir()?;
         Ok(Mirrors::Temp(std::sync::Arc::new(TempMirrors { root: Some(root) })))
     }
 
@@ -844,7 +868,9 @@ async fn update_mirror(
 /// just listed, so they exist) aren't in the mirror yet, once the lock is held: a tag pushed a
 /// moment after the last update is read at once, and concurrent callers fetch once.
 /// Among `mirrors`: a temporary mirror is updated on [`PREVIEW_UPDATES`], and the update holds its
-/// root, so it is deleted only after the update ends, even when the request has gone away.
+/// root, so it is deleted only after the update ends. Once no request holds it anymore (the
+/// client went away), the update is given up: a queued one never takes the slot, and a running
+/// clone is stopped (its git killed).
 #[allow(clippy::too_many_arguments)]
 async fn update_mirror_in(
     policy: GitPolicy,
@@ -870,7 +896,11 @@ async fn update_mirror_in(
         if !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH) {
             return state.error.clone();
         }
-        let result = async {
+        let limit = match &held {
+            Mirrors::Shared => None,
+            Mirrors::Temp(_) => Some(MAX_PREVIEW_MIRROR_BYTES),
+        };
+        let work = async {
             let _permit = slots.acquire().await?;
             let t = check(policy, &url).await?;
             let home = tempfile::tempdir()?;
@@ -880,10 +910,24 @@ async fn update_mirror_in(
             if mirror_complete(&dir).await {
                 fetch_mirror(policy, home.path(), &t, &dir).await
             } else {
-                clone_mirror(policy, home.path(), &t, &root, &dir).await
+                clone_mirror(policy, home.path(), &t, &root, &dir, limit).await
             }
-        }
-        .await;
+        };
+        // Only this task holds a temporary mirror once its requests are gone.
+        let watched = match &held {
+            Mirrors::Shared => None,
+            Mirrors::Temp(t) => Some(std::sync::Arc::downgrade(t)),
+        };
+        let abandoned = async move {
+            let Some(w) = watched else { return std::future::pending().await };
+            while w.strong_count() > 1 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        };
+        let result = tokio::select! {
+            r = work => r,
+            () = abandoned => Err(anyhow!("the preview this mirror was for went away")),
+        };
         state.finished = Some(std::time::Instant::now());
         state.error = result.err().map(|e| {
             tracing::warn!("updating the mirror of {url} failed: {e:#}");
@@ -973,6 +1017,7 @@ async fn clone_mirror(
     t: &Target,
     root: &Path,
     dir: &Path,
+    limit: Option<u64>,
 ) -> anyhow::Result<()> {
     let r = root.to_path_buf();
     let scratch = tokio::task::spawn_blocking(move || {
@@ -987,8 +1032,9 @@ async fn clone_mirror(
     let mut c = git_to(policy, home, t);
     c.args(["clone", "--quiet", "--bare", "--filter=blob:none", "--", &t.url])
         .arg(&repo);
-    // The download is watched, like a checkout's: a history that outgrows the limit is stopped.
-    let cloned = exec(c, None, "mirroring the repo's history", CLONE_TIMEOUT, Some((scratch.path(), MAX_MIRROR_BYTES))).await;
+    // With a limit (a preview's temporary mirror), the download is watched, like a checkout's: a
+    // history that outgrows it is stopped.
+    let cloned = exec(c, None, "mirroring the repo's history", CLONE_TIMEOUT, limit.map(|l| (scratch.path(), l))).await;
     // The rename and the scratch directory's removal happen together, off the async threads.
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1324,6 +1370,40 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!root.exists(), "the temporary mirror is gone");
+    }
+
+    /// A preview's clone queued for the slot is given up once its request goes away: the temporary
+    /// mirror is deleted while the slot is still taken, without waiting for it.
+    #[tokio::test]
+    async fn abandoned_previews_give_up_their_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        std::fs::write(up.join("cactarium.toml"), "format = 1\n").unwrap();
+        sh(&up, &["add", "-A"]);
+        sh(&up, &["commit", "-q", "-m", "files"]);
+        let c = sh(&up, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", up.display());
+        let policy = GitPolicy { allow_local: true };
+        let busy = PREVIEW_UPDATES.acquire().await.unwrap();
+        let mirrors = Mirrors::temp().unwrap();
+        let root = mirrors.temp_path().unwrap();
+        let request = {
+            let m = mirrors.clone();
+            tokio::spawn(async move { read_files_in(policy, &m, &url, &[(c, "cactarium.toml".to_owned())]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        request.abort();
+        drop(mirrors);
+        for _ in 0..100 {
+            if !root.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!root.exists(), "the abandoned preview's mirror is gone while the slot is still busy");
+        drop(busy);
     }
 
     #[test]

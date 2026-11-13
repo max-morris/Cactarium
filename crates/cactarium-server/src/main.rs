@@ -651,6 +651,8 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
             let _ = sqlx::query("DELETE FROM sessions WHERE expires_at < now()")
                 .execute(&sweeper.db)
                 .await;
+            // Registration previews' temporary mirrors left by a process that died.
+            let _ = tokio::task::spawn_blocking(git::sweep_temp_mirrors).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

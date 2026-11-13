@@ -127,11 +127,11 @@ pub async fn new_repo(State(state): State<AppState>, s: SignedIn, ip: ClientIp, 
         }
     }
     s.session.check_csrf(&csrf)?;
+    // A preview reads the repo as registering does, and a confirm reads it again before writing:
+    // both count against the user's hourly budget, beside the per-address limits.
+    state.limiter.check_user("register-preview", s.user.id, state.cfg.previews_per_hour, std::time::Duration::from_secs(3600))?;
     if !confirm {
-        // A preview reads the repo as registering does, but writes nothing: limited per address
-        // and, over an hour, per user.
         state.limiter.check("register-preview", ip.0, 60)?;
-        state.limiter.check_user("register-preview", s.user.id, state.cfg.previews_per_hour, std::time::Duration::from_secs(3600))?;
         let at = if tag.is_empty() { tracker::At::Newest } else { tracker::At::Tag(&tag) };
         let result = async {
             let who = tracker::registrant_owner(&state, &s.user, Some(&owner)).await?;

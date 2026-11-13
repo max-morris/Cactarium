@@ -1848,11 +1848,14 @@ ok, out = cli("register", "max", R3URL)
 check("registering both starts the package at v2.5.0 and the sims at 3.0.0",
       ok and "from cactarium.toml at v2.5.0" in out and "from cactarium-sim.toml at 3.0.0" in out, out[-400:])
 
-# --- Previews are limited per user over an hour (20), beside the per-address limit.
+# --- Previews and confirms are limited per user over an hour (20; 30 on the dev site), beside the
+# per-address limits.
 carol = Visitor("carol")
 carol.get("/new/repo")
-codes = [carol.post("/new/repo", {"url": REPOS + "/nowhere.git"})[0] for _ in range(21)]
-check("the 21st preview within the hour is refused for the user", codes[:20] == [200] * 20 and codes[20] == 429, codes)
+codes = [carol.post("/new/repo", {"url": REPOS + "/nowhere.git"})[0] for _ in range(31)]
+check("the 31st preview within the hour is refused for the user (30 on the dev site)", codes[:30] == [200] * 30 and codes[30] == 429, codes)
+s, _, _ = carol.post("/new/repo", {"url": REPOS + "/nowhere.git", "confirm": "1", "only": "cactarium.toml"})
+check("and so is a confirm: it counts against the same budget", s == 429, s)
 
 # --- The seeded multi-sim entry, found at its tag and registered beside its package.
 page(anon, "/max/bbh-demo-sims", contains="Sims in this version")
