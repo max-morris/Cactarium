@@ -538,37 +538,62 @@ async fn mirror_of(url: &str) -> anyhow::Result<(PathBuf, String, PathBuf)> {
     Ok((root, key, dir))
 }
 
+/// What the mirror holds for each of `commits` (after peeling, as `ls-remote` gives them): its
+/// object type ("commit", "tree", ...), or `None` when it is missing (or the mirror is).
+async fn object_types(policy: GitPolicy, dir: &Path, commits: &[String]) -> Vec<Option<String>> {
+    if !mirror_complete(dir).await {
+        return vec![None; commits.len()];
+    }
+    let Ok(home) = tempfile::tempdir() else { return vec![None; commits.len()] };
+    let mut c = git(policy, home.path());
+    c.arg("-C").arg(dir).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
+    let input: String = commits.iter().map(|c| format!("{c}\n")).collect();
+    let Ok(out) = run_with_input(c, input, "looking up the tagged commits").await else { return vec![None; commits.len()] };
+    // One line per input, in order: "<id> <type>", or "<input> missing".
+    out.lines()
+        .map(|l| {
+            let mut p = l.split_whitespace();
+            match (p.next(), p.next()) {
+                (Some(_), Some("missing")) | (_, None) => None,
+                (Some(_), Some(kind)) => Some(kind.to_owned()),
+                _ => None,
+            }
+        })
+        .chain(std::iter::repeat(None))
+        .take(commits.len())
+        .collect()
+}
+
 /// Whether the mirror is missing (or lacks any of) `commits`.
 async fn lacks_commits(policy: GitPolicy, dir: &Path, commits: &[String]) -> bool {
-    if !mirror_complete(dir).await {
-        return true;
-    }
-    let Ok(home) = tempfile::tempdir() else { return true };
-    let mut c = git(policy, home.path());
-    c.arg("-C").arg(dir).args(["cat-file", "--batch-check=%(objecttype)"]);
-    let input: String = commits.iter().map(|c| format!("{c}\n")).collect();
-    match run_with_input(c, input, "looking up the tagged commits").await {
-        Ok(out) => out.lines().any(|l| l.trim() != "commit"),
-        Err(_) => true,
-    }
+    object_types(policy, dir, commits).await.iter().any(Option::is_none)
 }
 
 /// A file as a commit has it.
+#[derive(Clone, Debug)]
 pub enum FileAt {
-    /// The commit has no such file.
+    /// The commit has no such file (or it is a folder or a submodule).
     Absent,
-    /// Larger than [`MAX_FILE_AT`]: its size.
-    TooLarge(u64),
+    /// Larger than [`MAX_FILE_AT`] (its size, when known before downloading it).
+    TooLarge(Option<u64>),
     Content(Vec<u8>),
+    /// Not a plain file in the mirror (a symbolic link, which a checkout follows inside the repo),
+    /// or its content couldn't be fetched by id: read it from a checkout (`read_in`) instead.
+    NeedsCheckout,
+    /// The tag names a tree or a blob, not a commit: a fact about the tag.
+    NotCommit,
+    /// The commit isn't in the repo's history (as far as the mirror knows): try again later.
+    Unavailable,
 }
 
 /// The largest file [`read_files_at`] returns, like [`read_in`].
 pub const MAX_FILE_AT: u64 = 4 * 1024 * 1024;
 
 /// Reads files at commits from the repo's history mirror, without checking anything out: the
-/// mirror is fetched when a commit isn't in it (at most once per [`MIRROR_REFRESH`]), and the
-/// blobs it lacks (it is blobless) are fetched by id, together, from the repo. For deciding what a
-/// tag is before reading it in full. An error means the repo couldn't be read right now.
+/// mirror is fetched when a commit isn't in it, and each blob it lacks (it is blobless) is fetched
+/// by id on its own, the download stopped once it outgrows [`MAX_FILE_AT`]. Each file's outcome
+/// stands alone ([`FileAt`]); an error means the repo couldn't be read at all right now (the mirror
+/// couldn't be updated), and says nothing about any tag.
 pub async fn read_files_at(policy: GitPolicy, url: &str, wants: &[(String, String)]) -> anyhow::Result<Vec<FileAt>> {
     if wants.is_empty() {
         return Ok(Vec::new());
@@ -578,76 +603,136 @@ pub async fn read_files_at(policy: GitPolicy, url: &str, wants: &[(String, Strin
     let mut commits: Vec<String> = wants.iter().map(|(c, _)| c.clone()).collect();
     commits.sort_unstable();
     commits.dedup();
-    if lacks_commits(policy, &dir, &commits).await {
+    let mut types = object_types(policy, &dir, &commits).await;
+    if types.iter().any(Option::is_none) {
         let error = update_mirror_if(policy, key.clone(), root, dir.clone(), false, Some(commits.clone())).await;
-        if lacks_commits(policy, &dir, &commits).await {
-            bail!("{}", error.unwrap_or_else(|| "the tagged commits aren't in the repo's history yet".into()));
+        if let Some(e) = error {
+            bail!("{e}");
         }
+        if !mirror_complete(&dir).await {
+            bail!("the repo's history isn't available yet");
+        }
+        types = object_types(policy, &dir, &commits).await;
     }
-    // Each file's blob id, or none.
-    let mut oids: Vec<Option<String>> = Vec::with_capacity(wants.len());
+    let kind_of: std::collections::HashMap<&str, Option<&str>> =
+        commits.iter().map(String::as_str).zip(types.iter().map(Option::as_deref)).collect();
+    // Each file: its blob id, or what it is instead.
+    let mut out: Vec<FileAt> = Vec::with_capacity(wants.len());
+    let mut blob_of: Vec<Option<String>> = Vec::with_capacity(wants.len());
     for (commit, path) in wants {
+        match kind_of.get(commit.as_str()).copied().flatten() {
+            None => {
+                out.push(FileAt::Unavailable);
+                blob_of.push(None);
+                continue;
+            }
+            Some("commit") => {}
+            Some(_) => {
+                out.push(FileAt::NotCommit);
+                blob_of.push(None);
+                continue;
+            }
+        }
         let mut c = git(policy, home.path());
         c.arg("-C").arg(&dir).args(["ls-tree", commit, "--", path]);
-        let out = run(c, "listing the commit's files").await?;
-        oids.push(out.lines().find_map(|l| {
+        let listed = run(c, "listing the commit's files").await?;
+        let entry = listed.lines().find_map(|l| {
             let (meta, _) = l.split_once('\t')?;
             let mut parts = meta.split_whitespace();
-            let (_, kind, oid) = (parts.next()?, parts.next()?, parts.next()?);
-            (kind == "blob").then(|| oid.to_owned())
-        }));
-    }
-    let mut unique: Vec<&str> = oids.iter().flatten().map(String::as_str).collect();
-    unique.sort_unstable();
-    unique.dedup();
-    let sizes = |dir: PathBuf, unique: Vec<String>| {
-        let home = home.path().to_path_buf();
-        async move {
-            let mut c = git(policy, &home);
-            c.arg("-C").arg(&dir).args(["cat-file", "--batch-check=%(objectname) %(objectsize)"]);
-            let input: String = unique.iter().map(|o| format!("{o}\n")).collect();
-            let out = run_with_input(c, input, "looking up the files").await?;
-            let mut found = std::collections::HashMap::new();
-            for l in out.lines() {
-                let mut p = l.split_whitespace();
-                if let (Some(oid), Some(size)) = (p.next(), p.next())
-                    && let Ok(n) = size.parse::<u64>()
-                {
-                    found.insert(oid.to_owned(), n);
-                }
+            Some((parts.next()?.to_owned(), parts.next()?.to_owned(), parts.next()?.to_owned()))
+        });
+        match entry {
+            Some((mode, kind, oid)) if kind == "blob" && (mode == "100644" || mode == "100755") => {
+                out.push(FileAt::Absent); // replaced below
+                blob_of.push(Some(oid));
             }
-            Ok::<_, anyhow::Error>(found)
+            // A symbolic link (or another kind of blob): a checkout reads it as master did.
+            Some((_, kind, _)) if kind == "blob" => {
+                out.push(FileAt::NeedsCheckout);
+                blob_of.push(None);
+            }
+            _ => {
+                out.push(FileAt::Absent);
+                blob_of.push(None);
+            }
         }
-    };
-    let unique: Vec<String> = unique.into_iter().map(str::to_owned).collect();
-    let mut found = sizes(dir.clone(), unique.clone()).await?;
-    let absent: Vec<&String> = unique.iter().filter(|o| !found.contains_key(*o)).collect();
-    if !absent.is_empty() {
-        let t = check(policy, &key).await?;
-        for chunk in absent.chunks(200) {
-            let mut c = git_to(policy, home.path(), &t);
-            c.arg("-C").arg(&dir).args(["fetch", "--quiet", "--no-write-fetch-head", "--", &t.url]);
-            c.args(chunk.iter().map(|o| o.as_str()));
-            run(c, "fetching the files").await?;
-        }
-        found = sizes(dir.clone(), unique.clone()).await?;
     }
-    let mut out = Vec::with_capacity(wants.len());
-    for oid in oids {
-        let Some(oid) = oid else {
-            out.push(FileAt::Absent);
-            continue;
-        };
-        let size = *found.get(&oid).ok_or_else(|| anyhow!("the repo didn't send file {oid}"))?;
-        if size > MAX_FILE_AT {
-            out.push(FileAt::TooLarge(size));
+    // The blobs' contents, each fetched on its own (with its download bounded) when the mirror
+    // lacks it.
+    let mut contents: std::collections::HashMap<String, FileAt> = std::collections::HashMap::new();
+    for oid in blob_of.iter().flatten() {
+        if contents.contains_key(oid) {
             continue;
         }
-        let mut c = git(policy, home.path());
-        c.arg("-C").arg(&dir).args(["cat-file", "blob", &oid]);
-        out.push(FileAt::Content(exec_raw(c, None, "reading a file", TIMEOUT, None).await?));
+        let got = read_blob(policy, home.path(), &key, &dir, oid).await;
+        contents.insert(oid.clone(), got);
+    }
+    for (i, oid) in blob_of.into_iter().enumerate() {
+        if let Some(oid) = oid {
+            out[i] = contents.get(&oid).cloned().unwrap_or(FileAt::NeedsCheckout);
+        }
     }
     Ok(out)
+}
+
+/// One blob's content from the mirror, fetching it by id first when the mirror lacks it. A fetch
+/// that fails (the host refuses wants by id, say) answers [`FileAt::NeedsCheckout`]; one that
+/// grows past [`MAX_FILE_AT`] is stopped and answers [`FileAt::TooLarge`].
+async fn read_blob(policy: GitPolicy, home: &Path, key: &str, dir: &Path, oid: &str) -> FileAt {
+    let size = |home: &Path| {
+        let mut c = git(policy, home);
+        c.arg("-C").arg(dir).args(["cat-file", "-s", oid]);
+        c
+    };
+    let known = run(size(home), "sizing a file").await.ok().and_then(|s| s.trim().parse::<u64>().ok());
+    if known.is_none() {
+        // Into a scratch repo that borrows the mirror's objects, so the download can be watched
+        // on its own and dropped whatever happens.
+        let Ok(t) = check(policy, key).await else { return FileAt::NeedsCheckout };
+        let Ok(scratch) = tempfile::tempdir() else { return FileAt::NeedsCheckout };
+        let repo = scratch.path().join("r.git");
+        let mut c = git(policy, home);
+        c.args(["init", "-q", "--bare"]).arg(&repo);
+        if run(c, "preparing a fetch").await.is_err() {
+            return FileAt::NeedsCheckout;
+        }
+        let alternates = repo.join("objects/info/alternates");
+        if std::fs::write(&alternates, format!("{}\n", dir.join("objects").display())).is_err() {
+            return FileAt::NeedsCheckout;
+        }
+        let mut c = git_to(policy, home, &t);
+        c.arg("-C").arg(&repo).args(["fetch", "--quiet", "--no-write-fetch-head", "--", &t.url, oid]);
+        let fetched = exec(c, None, "fetching a file", TIMEOUT, Some((repo.as_path(), MAX_FILE_AT + 1024 * 1024))).await;
+        if let Err(e) = fetched {
+            if e.to_string().contains("was stopped") || dir_size(&repo) > MAX_FILE_AT {
+                return FileAt::TooLarge(None);
+            }
+            return FileAt::NeedsCheckout;
+        }
+        let mut c = git(policy, home);
+        c.arg("-C").arg(&repo).args(["cat-file", "-s", oid]);
+        let Some(n) = run(c, "sizing a file").await.ok().and_then(|s| s.trim().parse::<u64>().ok()) else {
+            return FileAt::NeedsCheckout;
+        };
+        if n > MAX_FILE_AT {
+            return FileAt::TooLarge(Some(n));
+        }
+        let mut c = git(policy, home);
+        c.arg("-C").arg(&repo).args(["cat-file", "blob", oid]);
+        return match exec_raw(c, None, "reading a file", TIMEOUT, None).await {
+            Ok(bytes) => FileAt::Content(bytes),
+            Err(_) => FileAt::NeedsCheckout,
+        };
+    }
+    if known.is_some_and(|n| n > MAX_FILE_AT) {
+        return FileAt::TooLarge(known);
+    }
+    let mut c = git(policy, home);
+    c.arg("-C").arg(dir).args(["cat-file", "blob", oid]);
+    match exec_raw(c, None, "reading a file", TIMEOUT, None).await {
+        Ok(bytes) => FileAt::Content(bytes),
+        Err(_) => FileAt::NeedsCheckout,
+    }
 }
 
 fn classify(mut found: Vec<String>) -> PrefixMatch {
@@ -1069,6 +1154,37 @@ mod tests {
         for m in misses {
             assert!(matches!(m.await.unwrap().unwrap(), PrefixMatch::None));
         }
+    }
+
+    /// Files at commits from a blobless mirror: blobs fetched by id, a symbolic link left to a
+    /// checkout, a file over the limit refused, a tree that a tag might name told apart.
+    #[tokio::test]
+    async fn files_at_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        sh(&up, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(up.join("cactarium.toml"), "format = 1\n").unwrap();
+        std::fs::write(up.join("big.bin"), vec![b'x'; (MAX_FILE_AT + 1) as usize]).unwrap();
+        std::os::unix::fs::symlink("cactarium.toml", up.join("link.toml")).unwrap();
+        sh(&up, &["add", "-A"]);
+        sh(&up, &["commit", "-q", "-m", "files"]);
+        let c = sh(&up, &["rev-parse", "HEAD"]);
+        let tree = sh(&up, &["rev-parse", "HEAD^{tree}"]);
+        let url = format!("file://{}", up.display());
+        let policy = GitPolicy { allow_local: true };
+        let wants: Vec<(String, String)> = ["cactarium.toml", "missing.toml", "link.toml", "big.bin"]
+            .iter()
+            .map(|f| (c.clone(), f.to_string()))
+            .chain(std::iter::once((tree.clone(), "cactarium.toml".to_owned())))
+            .collect();
+        let got = read_files_at(policy, &url, &wants).await.unwrap();
+        assert!(matches!(&got[0], FileAt::Content(b) if b.as_slice() == b"format = 1\n"), "{:?}", got[0]);
+        assert!(matches!(got[1], FileAt::Absent));
+        assert!(matches!(got[2], FileAt::NeedsCheckout), "{:?}", got[2]);
+        assert!(matches!(got[3], FileAt::TooLarge(_)), "{:?}", got[3]);
+        assert!(matches!(got[4], FileAt::NotCommit), "{:?}", got[4]);
     }
 
     #[test]

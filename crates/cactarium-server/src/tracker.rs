@@ -256,8 +256,10 @@ pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosy
             .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && foreign.get(&r.name) != Some(&r.commit));
         return Ok(if any { Unread::Yes } else { Unread::No });
     }
-    // A repo entry: a tag read as a version in range and not frozen yet, or one not examined yet (or
-    // waiting), which could be any version, counts as unread.
+    // A repo entry: a tag read as a version in range and not frozen yet counts; so does a tag not
+    // examined yet (it could be any version, and is examined soon); a waiting one counts only if the
+    // standard form or a pattern the entry is known to use reads it into the range; a tag recorded
+    // as not a version never does.
     let reads: BTreeMap<String, (String, String)> =
         sqlx::query_as::<_, (String, String, String)>("SELECT tag, commit, label FROM tag_reads WHERE entry_id = $1")
             .bind(entry_id)
@@ -266,13 +268,26 @@ pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosy
             .into_iter()
             .map(|(t, c, l)| (t, (c, l)))
             .collect();
+    let waiting: BTreeMap<String, String> =
+        sqlx::query_as::<_, (String, String)>("SELECT tag, commit FROM waiting_tags WHERE entry_id = $1")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect();
+    let rules = known_rules(state, entry_id).await?;
     for (tag, commit) in &remote {
         if by_tag.contains(tag) || foreign.get(tag) == Some(commit) {
             continue;
         }
-        match reads.get(tag) {
-            Some((c, label)) if c == commit => {
+        match (reads.get(tag), waiting.get(tag)) {
+            (Some((c, label)), _) if c == commit => {
                 if label.parse::<TrackedVersion>().is_ok_and(|v| req.matches(&v)) && !have.contains(label) {
+                    return Ok(Unread::Yes);
+                }
+            }
+            (_, Some(c)) if c == commit => {
+                if rules.iter().any(|r| r.version(tag).is_some_and(|v| req.matches(&v) && !have.contains(&v.to_string()))) {
                     return Ok(Unread::Yes);
                 }
             }
@@ -691,6 +706,12 @@ pub async fn register(
         attach_repo(&mut tx, &entry, &plan.url, p.file, None, &p.rule, sim_form_of(&p.manifest).as_deref()).await?;
         entries.push(entry);
     }
+    // The entries already on the repo judge their tags again with the new ones as siblings (a new
+    // sibling's pattern may claim tags they have read but not frozen).
+    for (e, _) in &plan.existing {
+        sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1").bind(e.id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 AND kind IN ('claim', 'unreadable')").bind(e.id).execute(&mut *tx).await?;
+    }
     crate::audit::audit_with(
         &mut tx,
         Some(user.id),
@@ -813,7 +834,7 @@ pub async fn check(
                     lines.push(format!("{}: {tag} wouldn't be read as a version: {why}", e.slug()));
                     continue;
                 }
-                Some(Exam::Wait(why)) => {
+                Some(Exam::Wait(why) | Exam::Unexamined(why)) => {
                     lines.push(format!("{}: {tag} would wait (left unread, tried again): {why}", e.slug()));
                     continue;
                 }
@@ -1130,9 +1151,9 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     let mut frozen_foreign = None;
     for (i, (r, exam)) in tags.iter().zip(exams).enumerate() {
         match exam {
-            Exam::Version { tv: read, rank, error: None } if read == tv => candidates.push((r.clone(), if i == 0 { -1 } else { rank })),
+            Exam::Version { tv: read, rank, error: None, .. } if read == tv => candidates.push((r.clone(), if i == 0 { -1 } else { rank })),
             Exam::Not { kind, why } if i == 0 => frozen_foreign = Some((kind, why)),
-            Exam::Wait(why) if i == 0 => return Err(AppError::Upstream(why)),
+            Exam::Wait(why) | Exam::Unexamined(why) if i == 0 => return Err(AppError::Upstream(why)),
             _ => {}
         }
     }
@@ -1158,6 +1179,7 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
         if let Some((kind, why)) = frozen_foreign {
             let mut tx = state.db.begin().await?;
             sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(v.id).execute(&mut *tx).await?;
+            forget_duplicates_of(&mut tx, entry.id, &v.label()).await?;
             sqlx::query(
                 "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind) VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
@@ -1366,6 +1388,7 @@ struct Known {
     tag: Option<String>,
     commit: Option<String>,
     state: String,
+    label: String,
 }
 
 /// Brings an entry up to date with its repo's tags. Returns how many versions were added. A new
@@ -1434,6 +1457,8 @@ async fn budgeted_sync(state: &AppState, entry_id: i64) -> AppResult<usize> {
 async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>, pace: Pace) -> AppResult<usize> {
     let lock = entry_sync_lock(entry.id);
     let _one_at_a_time = lock.lock().await;
+    // As it is now, under the lock: a hand-over or a transfer may have changed it meanwhile.
+    let entry = &model::entry_by_id(state, entry.id).await?;
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
     let banned: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1 AND banned)")
@@ -1477,7 +1502,13 @@ async fn sync_inner(
             // An invalid version was never served: when its tag moves, the tag is read again at its
             // new commit (the invalid row goes, recorded in the audit log).
             Some(now) if now != frozen && k.state == "invalid" => {
-                forget_invalid(state, entry, k.id, tag, frozen, now).await?;
+                forget_invalid(state, entry, k, tag, frozen, Some(now)).await?;
+                forgot = true;
+            }
+            // Deleted upstream: an invalid version (never served) goes; the version's other tags,
+            // if any, are examined again.
+            None if k.state == "invalid" => {
+                forget_invalid(state, entry, k, tag, frozen, None).await?;
                 forgot = true;
             }
             Some(now) if now != frozen && k.state != "tag-moved" => {
@@ -1510,12 +1541,12 @@ async fn sync_inner(
     let mut run = Run::default();
     if repo.overlay_manifest.is_some() {
         // A curated entry: its overlay manifest is read at every tag, so its stored rule decides.
-        let candidates: Vec<(RemoteRef, TrackedVersion, Option<String>)> = version_tags(refs, &TagRule::of(repo)?)
+        let candidates: Vec<Candidate> = version_tags(refs, &TagRule::of(repo)?)
             .into_iter()
             .filter(|(r, tv)| {
                 !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) && !have.contains(&tv.to_string())
             })
-            .map(|(r, tv)| (r, tv, None))
+            .map(|(r, tv)| Candidate { r, tv, preset: None, note: None })
             .collect();
         ingest_all(state, entry, repo, actor, pace, candidates, &waiting, &mut run).await?;
     } else {
@@ -1561,7 +1592,10 @@ struct Run {
 }
 
 async fn known_versions(state: &AppState, entry_id: i64) -> AppResult<Vec<Known>> {
-    Ok(sqlx::query_as("SELECT id, tag, commit, state FROM versions WHERE entry_id = $1 AND NOT is_virtual")
+    Ok(sqlx::query_as(
+        "SELECT id, tag, commit, state, CASE WHEN track = '' THEN version ELSE track || ':' || version END AS label
+         FROM versions WHERE entry_id = $1 AND NOT is_virtual",
+    )
         .bind(entry_id)
         .fetch_all(&state.db)
         .await?)
@@ -1611,22 +1645,48 @@ async fn foreign_of(state: &AppState, entry_id: i64, remote: &BTreeMap<String, S
     Ok(foreign.into_iter().filter(|(t, _)| remote.contains_key(t)).collect())
 }
 
-/// An invalid version whose tag moved: it was never served, so the row goes and the tag is read
-/// again at its new commit, like a new tag. Audited.
-async fn forget_invalid(state: &AppState, entry: &Entry, version_id: i64, tag: &str, frozen: &str, now: &str) -> AppResult<()> {
+/// An invalid version whose tag moved (`now`) or was deleted upstream (`None`): it was never
+/// served, so the row goes, and the tag (if it is still there) is read again at its new commit like
+/// a new tag. Tags set aside as duplicates of its version are examined again too. Audited.
+async fn forget_invalid(state: &AppState, entry: &Entry, k: &Known, tag: &str, frozen: &str, now: Option<&String>) -> AppResult<()> {
     let mut tx = state.db.begin().await?;
-    sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(version_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(k.id).execute(&mut *tx).await?;
+    forget_duplicates_of(&mut tx, entry.id, &k.label).await?;
+    let (action, then) = match now {
+        Some(_) => ("version.invalid-tag-moved", "read again at the new commit"),
+        None => ("version.invalid-tag-deleted", "removed; its version's other tags are examined again"),
+    };
     crate::audit::audit_with(
         &mut tx,
         None,
-        "version.invalid-tag-moved",
+        action,
         Some(&entry.slug()),
-        json!({ "tag": tag, "frozen": frozen, "now": now, "then": "read again at the new commit" }),
+        json!({ "tag": tag, "version": k.label, "frozen": frozen, "now": now, "then": then }),
         None,
     )
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Forgets the records of tags set aside because `label` was another tag's: that version is gone,
+/// so they are examined again.
+async fn forget_duplicates_of(db: &mut sqlx::PgConnection, entry_id: i64, label: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 AND kind = 'duplicate' AND reason = $2")
+        .bind(entry_id)
+        .bind(format!("version {label} is already another tag's"))
+        .execute(&mut *db)
+        .await?;
+    Ok(())
+}
+
+/// A tag to freeze as a version: with `preset`, invalid with that reason, without reading the
+/// commit; `note` goes to reviewers.
+struct Candidate {
+    r: RemoteRef,
+    tv: TrackedVersion,
+    preset: Option<String>,
+    note: Option<String>,
 }
 
 /// Ingests candidate tags: new ones first (at most [`MAX_NEW_PER_SYNC`] concluded, and at most
@@ -1640,16 +1700,16 @@ async fn ingest_all(
     repo: &RepoRow,
     actor: Option<&User>,
     pace: Pace,
-    candidates: Vec<(RemoteRef, TrackedVersion, Option<String>)>,
+    candidates: Vec<Candidate>,
     waiting: &BTreeMap<String, Waiting>,
     run: &mut Run,
 ) -> AppResult<()> {
     let (retry, fresh): (Vec<_>, Vec<_>) =
-        candidates.into_iter().partition(|(r, _, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
+        candidates.into_iter().partition(|c| waiting.get(&c.r.name).is_some_and(|w| w.commit == c.r.commit));
     // New tags that turn out to wait are capped too, so one sync (a registration's, say) never
     // tries hundreds of them; the rest are new again at the next sync.
     let (mut new_waiting, mut new_later) = (0, 0);
-    for (r, tv, preset) in &fresh {
+    for Candidate { r, tv, preset, note } in &fresh {
         if run.read == MAX_NEW_PER_SYNC {
             break;
         }
@@ -1657,7 +1717,7 @@ async fn ingest_all(
             new_later += 1;
             continue;
         }
-        match ingest(state, entry, repo, r, tv, actor, preset.as_deref()).await {
+        match ingest(state, entry, repo, r, tv, actor, preset.as_deref(), note.as_deref()).await {
             Ok(outcome) => {
                 run.read += 1;
                 if matches!(outcome, Ingested::Version) {
@@ -1677,14 +1737,14 @@ async fn ingest_all(
         run.unfetched.push(format!("{new_later} more new tag(s) not tried this time (at most {MAX_WAITING_PER_SYNC} new tags wait per check)"));
     }
     let (mut tried, mut later) = (0, 0);
-    for (r, tv, preset) in &retry {
+    for Candidate { r, tv, preset, note } in &retry {
         let w = &waiting[&r.name];
         if tried == MAX_WAITING_PER_SYNC || (pace == Pace::Background && w.next_try_at > time::OffsetDateTime::now_utc()) {
             later += 1;
             continue;
         }
         tried += 1;
-        match ingest(state, entry, repo, r, tv, actor, preset.as_deref()).await {
+        match ingest(state, entry, repo, r, tv, actor, preset.as_deref(), note.as_deref()).await {
             Ok(outcome) => {
                 if matches!(outcome, Ingested::Version) {
                     run.added += 1;
@@ -1706,51 +1766,100 @@ async fn ingest_all(
 #[derive(Clone, Debug, PartialEq)]
 enum Exam {
     /// A version, `tv`, spelled with this rank ([`spelling_rank`] under the manifest's own rule).
-    /// With `error`, the manifest is unreadable and the version is frozen invalid with it.
-    Version { tv: TrackedVersion, rank: i32, error: Option<String> },
+    /// With `error`, the manifest is unreadable and the version is frozen invalid with it. `note`
+    /// is for reviewers (a sibling manifest there that couldn't be read).
+    Version { tv: TrackedVersion, rank: i32, error: Option<String>, note: Option<String> },
     /// Not a version of this entry: a kind (for `foreign_tags`) and why.
     Not { kind: &'static str, why: String },
-    /// Can't be told now (a newer format, the repo unreadable): tried again later.
+    /// A fact about the tag that can't be judged by this server yet (a newer format, its own or a
+    /// sibling's at that commit): recorded as waiting, tried again with backoff.
     Wait(String),
+    /// The repo couldn't be read right now: nothing is recorded, and the tag is examined again at
+    /// the next sync.
+    Unexamined(String),
+}
+
+/// A manifest file as examining reads it.
+#[derive(Clone, Debug)]
+enum Read {
+    Absent,
+    Text(String),
+    /// There, but not readable as text: why.
+    Unreadable(String),
+}
+
+impl Read {
+    fn of(file: &str, f: git::FileAt) -> Read {
+        match f {
+            git::FileAt::Absent => Read::Absent,
+            git::FileAt::TooLarge(Some(n)) => Read::Unreadable(format!("{file} is larger than 4 MB ({n} bytes)")),
+            git::FileAt::TooLarge(None) => Read::Unreadable(format!("{file} is larger than 4 MB")),
+            git::FileAt::Content(bytes) => match String::from_utf8(bytes) {
+                Ok(t) => Read::Text(t),
+                Err(_) => Read::Unreadable(format!("'{file}' is not UTF-8 text")),
+            },
+            // Resolved by the caller; never judged.
+            git::FileAt::NeedsCheckout | git::FileAt::NotCommit | git::FileAt::Unavailable => {
+                Read::Unreadable(format!("{file} couldn't be read"))
+            }
+        }
+    }
 }
 
 /// The rank of a version read from an unreadable manifest: any readable one wins over it.
 const UNREADABLE_RANK: i32 = 9;
 
+/// The rule an entry's unreadable manifest is taken to have: its newest version's (the standard
+/// form when it has none). Never the standard form when the newest version follows a pattern of its
+/// own.
+fn rule_for_unreadable(newest: Option<&TagRule>) -> TagRule {
+    newest.cloned().unwrap_or_default()
+}
+
 /// What the entry's manifest at a tag's commit makes of the tag (see the publishing docs): a tag
 /// is a version exactly when the entry's manifest file is in its commit and that manifest's own
 /// rule (`tag-pattern`, else `[track/]vX.Y.Z`, and its own `since`) reads it as one, the manifest
 /// names the entry and lists its owner, the sims' form is the entry's, and no sibling's manifest at
-/// that commit claims the tag with its own pattern. A manifest there that can't be read is still a
-/// version (invalid, with the error) when the standard form, or the rule of the entry's newest
-/// version, reads the tag; otherwise it isn't one.
+/// that commit claims the tag with its own pattern. A manifest there that can't be read is a
+/// version (invalid, with the error) when the rule of the entry's newest version (the standard
+/// form when it has none) reads the tag and no sibling's manifest there reads it; otherwise it
+/// isn't one. A sibling manifest there of a newer format makes the tag wait (it may claim it); a
+/// broken one claims nothing, and that is noted for reviewers.
 #[allow(clippy::too_many_arguments)]
-fn judge(
-    entry: &Entry,
-    file: &str,
-    form: Option<&str>,
-    tag: &str,
-    own: &git::FileAt,
-    sibs: &[(String, &str, &git::FileAt)],
-    newest: Option<&TagRule>,
-) -> Exam {
-    let unreadable = |error: String| {
-        let tv = TagRule::default().version(tag).or_else(|| newest.and_then(|n| n.version(tag)));
-        match tv {
-            Some(tv) => Exam::Version { tv, rank: UNREADABLE_RANK, error: Some(error) },
-            None => Exam::Not {
-                kind: "unreadable",
-                why: format!("{error}; {tag} isn't a version under the standard form or the newest version's rule"),
+fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, sibs: &[(String, &str, Read)], newest: Option<&TagRule>) -> Exam {
+    let mut sib_rules: Vec<(&str, TagRule)> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for (slug, sib_file, read) in sibs {
+        match read {
+            Read::Absent => {}
+            Read::Unreadable(why) => notes.push(format!("{slug}'s {sib_file} at this commit can't be read ({why}), so it claims nothing here")),
+            Read::Text(text) => match Manifest::from_repo_file(sib_file, text) {
+                Ok(m) => sib_rules.push((slug.as_str(), TagRule::of_manifest(&m))),
+                Err(e @ cactup_ecosystem_common::Error::NewerFormat { .. }) => {
+                    return Exam::Wait(format!("{slug}'s {sib_file} at {tag}: {e}, so whether it claims {tag} can't be told yet"));
+                }
+                Err(e) => notes.push(format!("{slug}'s {sib_file} at this commit can't be read ({e}), so it claims nothing here")),
             },
         }
+    }
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
+    let unreadable = |error: String| {
+        let rule = rule_for_unreadable(newest);
+        let Some(tv) = rule.version(tag) else {
+            return Exam::Not {
+                kind: "unreadable",
+                why: format!("{error}; {tag} isn't a version under the rule of the newest version ({})", rule.describe_with_since()),
+            };
+        };
+        if let Some((slug, _)) = sib_rules.iter().find(|(_, r)| r.version(tag).is_some()) {
+            return Exam::Not { kind: "unreadable", why: format!("{error}; and {slug} reads {tag} as its own, so it isn't taken as this entry's") };
+        }
+        Exam::Version { tv, rank: UNREADABLE_RANK, error: Some(error), note: note.clone() }
     };
     let text = match own {
-        git::FileAt::Absent => return Exam::Not { kind: "absent", why: format!("no {file}") },
-        git::FileAt::TooLarge(n) => return unreadable(format!("{file} is larger than 4 MB ({n} bytes)")),
-        git::FileAt::Content(bytes) => match std::str::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(_) => return unreadable(format!("'{file}' is not UTF-8 text")),
-        },
+        Read::Absent => return Exam::Not { kind: "absent", why: format!("no {file}") },
+        Read::Unreadable(why) => return unreadable(why.clone()),
+        Read::Text(t) => t,
     };
     let m = match Manifest::from_repo_file(file, text) {
         Ok(m) => m,
@@ -1777,58 +1886,107 @@ fn judge(
             why: format!("its {file} uses {}, but this entry publishes {} (fixed when it was registered)", form_words(&here), form_words(fixed)),
         };
     }
-    for (slug, sib_file, content) in sibs {
-        let git::FileAt::Content(bytes) = content else { continue };
-        let Ok(text) = std::str::from_utf8(bytes) else { continue };
-        let Ok(theirs) = Manifest::from_repo_file(sib_file, text) else { continue };
-        if let Some(why) = claimed_by(tag, &rule, &TagRule::of_manifest(&theirs)) {
+    for (slug, theirs) in &sib_rules {
+        if let Some(why) = claimed_by(tag, &rule, theirs) {
             return Exam::Not { kind: "claim", why: format!("it is {slug}'s release: {why}") };
         }
     }
     let rank = i32::from(spelling_rank(&rule, tag, &tv));
-    Exam::Version { tv, rank, error: None }
+    Exam::Version { tv, rank, error: None, note }
 }
 
 /// Examines tags for an entry, reading its manifest (and its siblings', for claims) at each commit
-/// from the repo's history mirror, without checking anything out.
+/// from the repo's history mirror; a file the mirror can't give as plain content (a symbolic link,
+/// or a host that refuses blobs by id) is read from a checkout, with `read_in`'s containment rules.
+/// Each tag's outcome stands alone; when the repo can't be read at all, every tag is
+/// [`Exam::Unexamined`].
 async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[RemoteRef]) -> AppResult<Vec<Exam>> {
     if tags.is_empty() {
         return Ok(Vec::new());
     }
     let sibs: Vec<(Entry, String)> = entries_on(state, &repo.url).await?.into_iter().filter(|(e, _)| e.id != entry.id).collect();
-    let mut wants = Vec::new();
-    for r in tags {
-        wants.push((r.commit.clone(), repo.manifest_file.clone()));
-        for (_, f) in &sibs {
-            wants.push((r.commit.clone(), f.clone()));
-        }
-    }
-    let files = match git::read_files_at(policy(state), &repo.url, &wants).await {
+    let files: Vec<String> = std::iter::once(repo.manifest_file.clone()).chain(sibs.iter().map(|(_, f)| f.clone())).collect();
+    let wants: Vec<(String, String)> = tags.iter().flat_map(|r| files.iter().map(|f| (r.commit.clone(), f.clone()))).collect();
+    let got = match git::read_files_at(policy(state), &repo.url, &wants).await {
         Ok(f) => f,
         Err(e) => {
             let why = format!("cannot read the repo's manifests right now: {e:#}");
-            return Ok(tags.iter().map(|_| Exam::Wait(why.clone())).collect());
+            return Ok(tags.iter().map(|_| Exam::Unexamined(why.clone())).collect());
         }
     };
     let newest = newest_rule(state, entry.id).await?;
-    let per = 1 + sibs.len();
-    Ok(tags
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let chunk = &files[i * per..(i + 1) * per];
-            let theirs: Vec<(String, &str, &git::FileAt)> =
-                sibs.iter().zip(&chunk[1..]).map(|((e, f), c)| (e.slug(), f.as_str(), c)).collect();
-            judge(entry, &repo.manifest_file, fixed_form(entry, repo), &r.name, &chunk[0], &theirs, newest.as_ref())
-        })
-        .collect())
+    let mut out = Vec::with_capacity(tags.len());
+    for (i, r) in tags.iter().enumerate() {
+        let chunk: Vec<git::FileAt> = got[i * files.len()..(i + 1) * files.len()].to_vec();
+        if chunk.iter().any(|f| matches!(f, git::FileAt::NotCommit)) {
+            out.push(Exam::Not { kind: "not-commit", why: format!("{} names a tree or a file, not a commit", r.name) });
+            continue;
+        }
+        if chunk.iter().any(|f| matches!(f, git::FileAt::Unavailable)) {
+            out.push(Exam::Unexamined(format!("{}: its commit isn't in the repo's history yet", r.name)));
+            continue;
+        }
+        let mut reads: Vec<Read> = Vec::with_capacity(files.len());
+        let needs_checkout = chunk.iter().any(|f| matches!(f, git::FileAt::NeedsCheckout));
+        let co = if needs_checkout {
+            match git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await {
+                Ok(co) => Some(Ok(co)),
+                Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => Some(Err(format!("{e:#}"))),
+                Err(e) => {
+                    out.push(Exam::Unexamined(format!("{}: cannot fetch it ({e:#})", r.name)));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        for (f, file) in chunk.into_iter().zip(&files) {
+            reads.push(match (f, &co) {
+                (git::FileAt::NeedsCheckout, Some(Ok(co))) => match git::read_in(co, file) {
+                    Ok(Some(text)) => Read::Text(text),
+                    Ok(None) => Read::Absent,
+                    Err(e) => Read::Unreadable(format!("{e:#}")),
+                },
+                (git::FileAt::NeedsCheckout, Some(Err(too_large))) => Read::Unreadable(format!("the commit is too large to read {file} from: {too_large}")),
+                (other, _) => Read::of(file, other),
+            });
+        }
+        let theirs: Vec<(String, &str, Read)> =
+            sibs.iter().zip(reads.iter().skip(1)).map(|((e, f), rd)| (e.slug(), f.as_str(), rd.clone())).collect();
+        out.push(judge(entry, &repo.manifest_file, fixed_form(entry, repo), &r.name, &reads[0], &theirs, newest.as_ref()));
+    }
+    Ok(out)
+}
+
+/// Every rule a tag of the entry might be read by, for telling which versions an unexamined tag
+/// could turn out to be: the standard form, the newest version's rule, and the pattern of every
+/// version's manifest.
+async fn known_rules(state: &AppState, entry_id: i64) -> AppResult<Vec<TagRule>> {
+    let mut rules = vec![TagRule::default()];
+    if let Some(n) = newest_rule(state, entry_id).await? {
+        rules.push(n);
+    }
+    let patterns: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT DISTINCT COALESCE(manifest->'package'->>'tag-pattern', manifest->'stack'->>'tag-pattern', manifest->'sim'->>'tag-pattern')
+         FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL",
+    )
+    .bind(entry_id)
+    .fetch_all(&state.db)
+    .await?;
+    for p in patterns.into_iter().flatten() {
+        if let Ok(pattern) = p.parse() {
+            rules.push(TagRule { pattern: Some(pattern), since: None });
+        }
+    }
+    Ok(rules)
 }
 
 /// A repo entry's tags, read per commit: new tags are examined (at most the configured number per
-/// sync, standard spellings first, then by name), recording each outcome; once every tag has been
-/// examined, the tags read as versions are frozen, one per version: the best spelling under its own
-/// manifest's rule, then the first by name. Freezing waits for the whole repo to be examined, so
-/// which tag becomes a version doesn't depend on how the examining was paged across syncs.
+/// sync, standard spellings first, then by name), recording each outcome; then the tags read as
+/// versions are frozen, one per version: the best spelling under its own manifest's rule, then the
+/// first by name. A version is not frozen while a tag that could be read as it (under the standard
+/// form or a pattern the entry is known to use) is still unexamined or waiting, so which tag wins
+/// doesn't depend on how the examining was paged or delayed.
 #[allow(clippy::too_many_arguments)]
 async fn examine_and_ingest(
     state: &AppState,
@@ -1849,11 +2007,10 @@ async fn examine_and_ingest(
         .filter(|r| {
             !by_tag.contains_key(r.name.as_str())
                 && foreign.get(&r.name) != Some(&r.commit)
-                && reads.get(&r.name).map(|(c, _, _, _)| c) != Some(&r.commit)
+                && reads.get(&r.name).map(|x| &x.commit) != Some(&r.commit)
         })
         .collect();
-    // Tags whose examining waits (a newer format, the repo unreadable) are retried with backoff;
-    // they don't hold up the others.
+    // Tags whose examining waits (a newer format) are retried with backoff.
     let (mut retry, mut fresh): (Vec<&RemoteRef>, Vec<&RemoteRef>) =
         open.into_iter().partition(|r| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
     let standard_first = |r: &&RemoteRef| {
@@ -1864,23 +2021,25 @@ async fn examine_and_ingest(
     retry.sort_by_key(standard_first);
     let cap = state.cfg.examine_per_sync;
     let now = time::OffsetDateTime::now_utc();
-    let retry_now: Vec<RemoteRef> = retry
-        .iter()
-        .filter(|r| pace == Pace::Now || waiting[&r.name].next_try_at <= now)
-        .take(MAX_WAITING_PER_SYNC)
-        .map(|r| (*r).clone())
-        .collect();
+    let (retry_now, retry_later): (Vec<&RemoteRef>, Vec<&RemoteRef>) =
+        retry.iter().partition(|r| pace == Pace::Now || waiting[&r.name].next_try_at <= now);
+    let retry_skipped: Vec<&RemoteRef> = retry_later.into_iter().chain(retry_now.iter().skip(MAX_WAITING_PER_SYNC).copied()).collect();
+    let retry_now: Vec<RemoteRef> = retry_now.into_iter().take(MAX_WAITING_PER_SYNC).cloned().collect();
     let batch: Vec<RemoteRef> = fresh.iter().take(cap).map(|r| (*r).clone()).collect();
+    // Tags that might yet be read as some version: not examined (beyond the cap, or the repo
+    // unreadable), or waiting.
+    let mut pending: Vec<RemoteRef> = fresh.iter().skip(cap).map(|r| (*r).clone()).chain(retry_skipped.into_iter().cloned()).collect();
     let unexamined = fresh.len() - batch.len();
     let all: Vec<RemoteRef> = batch.into_iter().chain(retry_now).collect();
     let exams = examine(state, entry, repo, &all).await?;
+    let mut env: Option<String> = None;
     for (r, exam) in all.iter().zip(exams) {
         match exam {
-            Exam::Version { tv, rank, error } => {
+            Exam::Version { tv, rank, error, note } => {
                 sqlx::query(
-                    "INSERT INTO tag_reads (entry_id, tag, commit, label, rank, error) VALUES ($1, $2, $3, $4, $5, $6)
+                    "INSERT INTO tag_reads (entry_id, tag, commit, label, rank, error, note) VALUES ($1, $2, $3, $4, $5, $6, $7)
                      ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, label = EXCLUDED.label,
-                       rank = EXCLUDED.rank, error = EXCLUDED.error, seen_at = now()",
+                       rank = EXCLUDED.rank, error = EXCLUDED.error, note = EXCLUDED.note, seen_at = now()",
                 )
                 .bind(entry.id)
                 .bind(&r.name)
@@ -1888,6 +2047,7 @@ async fn examine_and_ingest(
                 .bind(tv.to_string())
                 .bind(rank)
                 .bind(&error)
+                .bind(&note)
                 .execute(&state.db)
                 .await?;
                 done_waiting(state, entry.id, &r.name).await?;
@@ -1896,50 +2056,103 @@ async fn examine_and_ingest(
                 record_foreign(state, entry, r, (kind, &why)).await?;
                 done_waiting(state, entry.id, &r.name).await?;
             }
-            Exam::Wait(why) => run.unfetched.push(wait(state, entry, r, why).await),
+            Exam::Wait(why) => {
+                run.unfetched.push(wait(state, entry, r, why).await);
+                pending.push(r.clone());
+            }
+            Exam::Unexamined(why) => {
+                env.get_or_insert(why);
+                pending.push(r.clone());
+            }
         }
+    }
+    if let Some(why) = env {
+        run.unfetched.push(format!("{why} (those tags are examined again at the next check)"));
     }
     if unexamined > 0 {
-        run.unfetched.push(format!(
-            "{unexamined} tag(s) not examined yet (at most {cap} per check); new versions are frozen once every tag has been read"
-        ));
-        return Ok(());
+        run.unfetched.push(format!("{unexamined} tag(s) not examined yet (at most {cap} per check)"));
     }
-    // Every tag examined: freeze one tag per version.
-    let reads = reads_of(state, entry.id, &refs).await?;
-    let mut by_label: BTreeMap<String, Vec<(String, String, i32, Option<String>)>> = BTreeMap::new();
-    for (tag, (commit, label, rank, error)) in reads {
-        by_label.entry(label).or_default().push((tag, commit, rank, error));
+    // The versions an unexamined or waiting tag might turn out to be: not frozen yet.
+    let rules = known_rules(state, entry.id).await?;
+    let blocked: std::collections::BTreeSet<String> =
+        pending.iter().flat_map(|r| rules.iter().filter_map(|rule| rule.version(&r.name).map(|tv| tv.to_string()))).collect();
+    // An unreadable manifest's version follows the newest version's rule as it is now.
+    let newest = newest_rule(state, entry.id).await?;
+    let mut reads = reads_of(state, entry.id, &refs).await?;
+    let rejudged: Vec<(String, TagRead)> = reads.iter().filter(|(_, t)| t.error.is_some()).map(|(k, t)| (k.clone(), t.clone())).collect();
+    for (tag, read) in rejudged {
+        let rule = rule_for_unreadable(newest.as_ref());
+        match rule.version(&tag) {
+            Some(tv) if tv.to_string() == read.label => {}
+            Some(tv) => {
+                sqlx::query("UPDATE tag_reads SET label = $3 WHERE entry_id = $1 AND tag = $2")
+                    .bind(entry.id)
+                    .bind(&tag)
+                    .bind(tv.to_string())
+                    .execute(&state.db)
+                    .await?;
+                if let Some(t) = reads.get_mut(&tag) {
+                    t.label = tv.to_string();
+                }
+            }
+            None => {
+                let why = format!(
+                    "{}; {tag} isn't a version under the rule of the newest version ({})",
+                    read.error.clone().unwrap_or_default(),
+                    rule.describe_with_since()
+                );
+                record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit: read.commit.clone() }, ("unreadable", &why)).await?;
+                reads.remove(&tag);
+            }
+        }
+    }
+    let mut by_label: BTreeMap<String, Vec<(String, TagRead)>> = BTreeMap::new();
+    for (tag, read) in reads {
+        by_label.entry(read.label.clone()).or_default().push((tag, read));
     }
     let mut candidates = Vec::new();
+    let mut held = 0;
     for (label, mut tags) in by_label {
-        tags.sort_by(|a, b| (a.2, &a.0).cmp(&(b.2, &b.0)));
         if have.contains(&label) {
-            for (tag, commit, _, _) in &tags {
+            for (tag, read) in &tags {
                 let why = format!("version {label} is already another tag's");
-                record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit: commit.clone() }, ("duplicate", &why)).await?;
+                record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit: read.commit.clone() }, ("duplicate", &why)).await?;
             }
-            sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND label = $2").bind(entry.id).bind(&label).execute(&state.db).await?;
             continue;
         }
-        let (tag, commit, _, error) = tags.swap_remove(0);
+        if blocked.contains(&label) {
+            held += 1;
+            continue;
+        }
+        tags.sort_by(|a, b| (a.1.rank, &a.0).cmp(&(b.1.rank, &b.0)));
+        let (tag, read) = tags.swap_remove(0);
         let tv: TrackedVersion = label.parse().map_err(AppError::bad)?;
-        candidates.push((RemoteRef { name: tag, commit }, tv, error));
+        candidates.push(Candidate { r: RemoteRef { name: tag, commit: read.commit }, tv, preset: read.error, note: read.note });
+    }
+    if held > 0 {
+        run.unfetched.push(format!("{held} version(s) held until the tags that could also be them have been read"));
     }
     ingest_all(state, entry, repo, actor, pace, candidates, waiting, run).await?;
     // The versions frozen now settle the other tags read as the same versions.
     let have = version_labels(state, entry.id).await?;
     let reads = reads_of(state, entry.id, &refs).await?;
-    for (tag, (commit, label, _, _)) in reads {
-        if have.contains(&label) {
-            if !by_tag.contains_key(tag.as_str()) && !version_tag_is(state, entry.id, &tag).await? {
-                let why = format!("version {label} is already another tag's");
-                record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit }, ("duplicate", &why)).await?;
-            }
-            sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = $2").bind(entry.id).bind(&tag).execute(&state.db).await?;
+    for (tag, read) in reads {
+        if have.contains(&read.label) && !version_tag_is(state, entry.id, &tag).await? {
+            let why = format!("version {} is already another tag's", read.label);
+            record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit: read.commit }, ("duplicate", &why)).await?;
         }
     }
     Ok(())
+}
+
+/// A tag read as a version and not frozen yet.
+#[derive(Clone, Debug)]
+struct TagRead {
+    commit: String,
+    label: String,
+    rank: i32,
+    error: Option<String>,
+    note: Option<String>,
 }
 
 async fn version_tag_is(state: &AppState, entry_id: i64, tag: &str) -> AppResult<bool> {
@@ -1950,17 +2163,19 @@ async fn version_tag_is(state: &AppState, entry_id: i64, tag: &str) -> AppResult
         .await?)
 }
 
-/// The entry's tags read as versions and not frozen yet (tag → commit, label, rank, error),
-/// forgetting those deleted or moved upstream (a moved tag is examined again).
-async fn reads_of(state: &AppState, entry_id: i64, refs: &[RemoteRef]) -> AppResult<BTreeMap<String, (String, String, i32, Option<String>)>> {
-    let rows: Vec<(String, String, String, i32, Option<String>)> =
-        sqlx::query_as("SELECT tag, commit, label, rank, error FROM tag_reads WHERE entry_id = $1")
-            .bind(entry_id)
-            .fetch_all(&state.db)
-            .await?;
+/// The entry's tags read as versions and not frozen yet, forgetting those deleted or moved upstream
+/// (a moved tag is examined again) and those recorded as not versions since.
+async fn reads_of(state: &AppState, entry_id: i64, refs: &[RemoteRef]) -> AppResult<BTreeMap<String, TagRead>> {
+    let rows: Vec<(String, String, String, i32, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT r.tag, r.commit, r.label, r.rank, r.error, r.note FROM tag_reads r
+         WHERE r.entry_id = $1 AND NOT EXISTS (SELECT 1 FROM foreign_tags f WHERE f.entry_id = r.entry_id AND f.tag = r.tag AND f.commit = r.commit)",
+    )
+    .bind(entry_id)
+    .fetch_all(&state.db)
+    .await?;
     let remote: BTreeMap<&str, &str> = refs.iter().map(|r| (r.name.as_str(), r.commit.as_str())).collect();
     let stale: Vec<&str> =
-        rows.iter().filter(|(t, c, _, _, _)| remote.get(t.as_str()) != Some(&c.as_str())).map(|(t, _, _, _, _)| t.as_str()).collect();
+        rows.iter().filter(|(t, c, ..)| remote.get(t.as_str()) != Some(&c.as_str())).map(|(t, ..)| t.as_str()).collect();
     if !stale.is_empty() {
         sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = ANY($2)")
             .bind(entry_id)
@@ -1970,8 +2185,8 @@ async fn reads_of(state: &AppState, entry_id: i64, refs: &[RemoteRef]) -> AppRes
     }
     Ok(rows
         .into_iter()
-        .filter(|(t, c, _, _, _)| remote.get(t.as_str()) == Some(&c.as_str()))
-        .map(|(t, c, l, r, e)| (t, (c, l, r, e)))
+        .filter(|(t, c, ..)| remote.get(t.as_str()) == Some(&c.as_str()))
+        .map(|(t, commit, label, rank, error, note)| (t, TagRead { commit, label, rank, error, note }))
         .collect())
 }
 
@@ -2145,6 +2360,7 @@ async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, (kind, w
     .bind(kind)
     .execute(&state.db)
     .await?;
+    sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = $2").bind(entry.id).bind(&r.name).execute(&state.db).await?;
     Ok(())
 }
 
@@ -2170,6 +2386,7 @@ async fn ingest(
     tv: &TrackedVersion,
     actor: Option<&User>,
     preset: Option<&str>,
+    note: Option<&str>,
 ) -> AppResult<Ingested> {
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
     // A version whose manifest was found unreadable when examined: frozen invalid with that error,
@@ -2183,9 +2400,11 @@ async fn ingest(
         // Too large is a fact about the commit: the version is stored invalid, as for a bad manifest.
         // On a repo carrying several entries, though, whose release it is can't be read, so it is
         // recorded as not this entry's (judged again if the tag moves) rather than frozen here.
+        // For a repo entry it is recorded as not a version instead (the tag isn't fetched again
+        // until it moves), and another tag of the same version, if any, gets its turn.
         Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
-            if repo.overlay_manifest.is_none() && !siblings(state, entry.id, &repo.url).await?.is_empty() {
-                record_foreign(state, entry, r, ("large", &format!("{e:#}, so whose release it is can't be read"))).await?;
+            if repo.overlay_manifest.is_none() {
+                record_foreign(state, entry, r, ("large", &format!("the tagged commit is too large to read: {e:#}"))).await?;
                 return Ok(Ingested::Foreign);
             }
             (Some(format!("cannot index the tagged commit: {e:#}")), None, None)
@@ -2219,10 +2438,13 @@ async fn ingest(
         }
     };
     let mut prepared = prepared;
-    if let Some(p) = prepared.as_mut()
-        && let Some(warning) = sorts_below_another_form(state, entry, &track, tv, &r.name).await?
-    {
-        p.smells.push(warning);
+    if let Some(p) = prepared.as_mut() {
+        if let Some(warning) = sorts_below_another_form(state, entry, &track, tv, &r.name).await? {
+            p.smells.push(warning);
+        }
+        if let Some(n) = note {
+            p.smells.push(n.to_owned());
+        }
     }
     let manifest_json = prepared.as_ref().map(|p| p.manifest_json.clone());
     let readme = prepared.as_ref().and_then(|p| p.readme_html.clone());
@@ -3000,16 +3222,21 @@ mod tests {
         }
     }
 
-    fn sims_manifest(pattern: Option<&str>) -> git::FileAt {
+    fn sims_manifest(pattern: Option<&str>) -> Read {
         let pat = pattern.map(|p| format!("tag-pattern = \"{p}\"\n")).unwrap_or_default();
-        git::FileAt::Content(format!("format = 1\n\n[sim]\nname = \"s\"\nowners = [\"max\"]\nfile = \"a.sim\"\n{pat}").into_bytes())
+        Read::Text(format!("format = 1\n\n[sim]\nname = \"s\"\nowners = [\"max\"]\nfile = \"a.sim\"\n{pat}"))
+    }
+
+    fn package_manifest(pattern: Option<&str>) -> Read {
+        let pat = pattern.map(|p| format!("tag-pattern = \"{p}\"\n")).unwrap_or_default();
+        Read::Text(format!("format = 1\n\n[package]\nname = \"p\"\nowners = [\"max\"]\n{pat}"))
     }
 
     /// Each tag is read by the manifest in its own commit.
     #[test]
     fn a_tag_is_read_by_the_manifest_in_its_commit() {
         let e = entry("s");
-        let judge1 = |tag: &str, own: &git::FileAt| judge(&e, SIM_FILE, Some("file"), tag, own, &[], None);
+        let judge1 = |tag: &str, own: &Read| judge(&e, SIM_FILE, Some("file"), tag, own, &[], None);
         // No pattern: the standard form.
         assert!(matches!(judge1("v1.0.0", &sims_manifest(None)), Exam::Version { error: None, .. }));
         assert!(matches!(judge1("sim-v1.0.0", &sims_manifest(None)), Exam::Not { kind: "rule", .. }));
@@ -3017,25 +3244,41 @@ mod tests {
         assert!(matches!(judge1("sim-v2.0.0", &sims_manifest(Some("sim-v{major}.{minor}.{patch}"))), Exam::Version { .. }));
         assert!(matches!(judge1("v2.0.0", &sims_manifest(Some("sim-v{major}.{minor}.{patch}"))), Exam::Not { kind: "rule", .. }));
         // No manifest: never a version, whatever the repo.
-        assert!(matches!(judge1("v1.0.0", &git::FileAt::Absent), Exam::Not { kind: "absent", .. }));
-        // Unreadable: invalid when the standard form reads the tag, else not a version.
-        let broken = git::FileAt::Content(b"format = 1\n[sim\n".to_vec());
+        assert!(matches!(judge1("v1.0.0", &Read::Absent), Exam::Not { kind: "absent", .. }));
+        // Unreadable: invalid when the newest version's rule (else the standard form) reads the tag.
+        let broken = Read::Text("format = 1\n[sim\n".into());
         assert!(matches!(judge1("v1.1.0", &broken), Exam::Version { error: Some(_), .. }));
         assert!(matches!(judge1("sim-v1.1.0", &broken), Exam::Not { kind: "unreadable", .. }));
         let newest = rule(Some("sim-v{major}.{minor}.{patch}"));
         assert!(matches!(judge(&e, SIM_FILE, Some("file"), "sim-v1.1.0", &broken, &[], Some(&newest)), Exam::Version { error: Some(_), .. }));
+        // ... and never the standard form when the newest version follows a pattern of its own.
+        assert!(matches!(judge(&e, SIM_FILE, Some("file"), "v2026.6.0", &broken, &[], Some(&newest)), Exam::Not { kind: "unreadable", .. }));
         // A newer format waits.
-        let newer = git::FileAt::Content(b"format = 99\n".to_vec());
+        let newer = Read::Text("format = 99\n".into());
         assert!(matches!(judge1("v1.0.0", &newer), Exam::Wait(_)));
         // Another entry's name is not a version of this one.
         assert!(matches!(judge(&entry("other"), SIM_FILE, None, "v1.0.0", &sims_manifest(None), &[], None), Exam::Not { kind: "identity", .. }));
         // A sibling's own pattern at the same commit claims what the standard form would read.
-        let pkg = git::FileAt::Content(
-            b"format = 1\n\n[package]\nname = \"p\"\nowners = [\"max\"]\ntag-pattern = \"{major}.{minor}.{patch}\"\n".to_vec(),
-        );
-        let sibs = [("max/p".to_owned(), PACKAGE_FILE, &pkg)];
+        let sibs = vec![("max/p".to_owned(), PACKAGE_FILE, package_manifest(Some("{major}.{minor}.{patch}")))];
         assert!(matches!(judge(&e, SIM_FILE, None, "2.0.0", &sims_manifest(None), &sibs, None), Exam::Not { kind: "claim", .. }));
         assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &sims_manifest(None), &sibs, None), Exam::Version { .. }));
+    }
+
+    /// An unreadable manifest never takes a tag a sibling reads, and a sibling manifest that can't
+    /// be told yet makes the tag wait.
+    #[test]
+    fn siblings_keep_their_tags() {
+        let e = entry("s");
+        let broken = Read::Text("format = 1\n[sim\n".into());
+        let pkg = vec![("max/p".to_owned(), PACKAGE_FILE, package_manifest(None))];
+        // The package reads v2026.6.0; the sims' broken manifest there doesn't take it.
+        assert!(matches!(judge(&e, SIM_FILE, None, "v2026.6.0", &broken, &pkg, None), Exam::Not { kind: "unreadable", .. }));
+        // A sibling manifest of a newer format may claim the tag: wait.
+        let newer = vec![("max/p".to_owned(), PACKAGE_FILE, Read::Text("format = 99\n".into()))];
+        assert!(matches!(judge(&e, SIM_FILE, None, "2.0.0", &sims_manifest(None), &newer, None), Exam::Wait(_)));
+        // A broken sibling manifest claims nothing; that is noted for reviewers.
+        let bad = vec![("max/p".to_owned(), PACKAGE_FILE, Read::Text("format = 1\n[package\n".into()))];
+        assert!(matches!(judge(&e, SIM_FILE, None, "2.0.0", &sims_manifest(None), &bad, None), Exam::Version { note: Some(_), .. }));
     }
 
     /// Among tags read as one version, the spelling the manifest's pattern writes wins, then the

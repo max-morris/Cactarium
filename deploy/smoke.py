@@ -1470,6 +1470,72 @@ check("the next check examines the rest and freezes every version",
 ok, out = cli("sync", "max/pageuser")
 check("then the dependency is read, valid", ok and has_version(anon, "max/pageuser", "1.1.0"), out[-300:])
 
+# --- A broken manifest never takes a sibling's tag: the sims (pattern sim-v) have a broken manifest
+# at the package's v release.
+BR = new_tree("brokensib")
+BRURL = REPOS + "/brokensib.git"
+thorn_at(BR, "BrArr")
+write(BR, "cactarium.toml", package_toml("brokensib", "BrArr"))
+br_c = commit_tag(BR, "the package")
+write(BR, "a.sim", pin_sim("alpha", [("brokensib", "BrArr", BRURL, br_c)]))
+write(BR, "cactarium-sim.toml", sims_toml("brokensib-sims", {"alpha": "a.sim"}).replace("format = 2", "format = 2", 1))
+commit_tag(BR, "sims", "v2026.5.0", "sim-v2026.5.0")
+brbare = publish_tree(BR, "brokensib")
+ok, out = cli("register", "max", BRURL)
+check("register a package and sims with their own pattern", ok and out.count("Registered") == 2, out[-400:])
+cli("sync", "max/brokensib-sims")
+write(BR, "cactarium-sim.toml", "format = 2\n[sim\n")
+commit_tag(BR, "a broken sims manifest, a package release", "v2026.6.0")
+push_all(BR, brbare)
+cli("sync", "max/brokensib"); cli("sync", "max/brokensib-sims")
+check("the package's v tag is its version", has_version(anon, "max/brokensib", "2026.6.0"))
+check("and the sims' broken manifest there doesn't make it an invalid sims version",
+      not has_version(maxv, "max/brokensib-sims", "2026.6.0") and '<span class="mono">v2026.6.0</span>' in page(maxv, "/max/brokensib-sims"))
+
+# --- A manifest that is a symbolic link inside the repo is read through it, as before.
+SL = new_tree("symlinked")
+thorn_at(SL, "SlArr")
+write(SL, "meta/manifest.toml", package_toml("symlinked", "SlArr"))
+os.symlink("meta/manifest.toml", os.path.join(SL, "cactarium.toml"))
+commit_tag(SL, "linked manifest", "v1.0.0")
+slbare = publish_tree(SL, "symlinked")
+ok, out = cli("register", "max", REPOS + "/symlinked.git")
+check("a symlinked manifest registers", ok, out[-300:])
+commit_tag(SL, "1.1", "v1.1.0")
+push_all(SL, slbare)
+cli("sync", "max/symlinked")
+check("and its tags are versions, read through the link", has_version(anon, "max/symlinked", "1.1.0") and "invalid" not in versions_of("max/symlinked"))
+# A tag that names a tree, not a commit, is listed; it doesn't hold the other tags up.
+tree_id = sh("git", "rev-parse", "HEAD^{tree}", cwd=SL)
+sh("git", "tag", "treetag", tree_id, cwd=SL)
+commit_tag(SL, "1.2", "v1.2.0")
+push_all(SL, slbare)
+ok, out = cli("sync", "max/symlinked")
+check("a tag naming a tree is listed as not a version, and the next tag is read",
+      ok and has_version(anon, "max/symlinked", "1.2.0") and "treetag</span>: treetag names a tree" in page(maxv, "/max/symlinked"), out[-300:])
+
+# --- An invalid version whose tag is deleted upstream goes, and the version's other tag is read.
+DL = new_tree("delinvalid")
+thorn_at(DL, "DlArr")
+write(DL, "cactarium.toml", package_toml("delinvalid", "DlArr"))
+commit_tag(DL, "0.5", "v0.5.0")
+dlbare = publish_tree(DL, "delinvalid")
+cli("register", "max", REPOS + "/delinvalid.git")
+write(DL, "cactarium.toml", "format = 1\n[package\n")
+commit_tag(DL, "broken", "1.0.0")
+push_all(DL, dlbare)
+cli("sync", "max/delinvalid")
+write(DL, "cactarium.toml", package_toml("delinvalid", "DlArr"))
+commit_tag(DL, "the release", "v1.0.0")
+push_all(DL, dlbare)
+cli("sync", "max/delinvalid")
+check("a bare 1.0.0 with a broken manifest froze 1.0.0 invalid; v1.0.0 waits as its duplicate",
+      "is not valid" in versions_of("max/delinvalid") and "version 1.0.0 is already another tag" in page(maxv, "/max/delinvalid"))
+sh("git", "push", "-q", dlbare, ":refs/tags/1.0.0", cwd=DL)
+cli("sync", "max/delinvalid"); cli("sync", "max/delinvalid")
+s, r, _ = resolve("max/delinvalid@1.0.0")
+check("once the bare tag is deleted, the invalid version goes and v1.0.0 is read", s == 200 and r.get("tag") == "v1.0.0", r)
+
 # --- The seeded multi-sim entry, registered with --tag beside its package.
 page(anon, "/max/bbh-demo-sims", contains="Sims in this version")
 page(anon, "/max/bbh-demo-sims/1.0.0?sim=tov&tab=thornlist", contains="BBHDemoArr/BBHDemo")

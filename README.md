@@ -60,7 +60,17 @@ organization with `just cli org create et <your-username> --display-name "Einste
   of the entry at all).
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
   uses 25): after deploying, the first polls examine the existing tags of big repos over a few
-  checks, and an entry's new versions are frozen once all its tags have been examined.
+  checks; a version is frozen once no unexamined or waiting tag could also be it.
+- Upgrading from master to this release, by design but worth knowing:
+  - a newer manifest's `since` no longer excludes older tags: each tag is read by the manifest in
+    its commit, so an old tag whose manifest had no `since` becomes a version on the first sync if
+    it wasn't one;
+  - invalid versions whose tags moved before the deploy are read again on the first sync, at the
+    tags' new commits;
+  - invalid versions frozen by master keep their labels (an admin can re-read them, also from
+    another tag of the same version);
+  - the stored tag pattern is now only a display hint for repo entries; after a rollback to the
+    retry-not-freeze release it would be taken as the real rule again.
 - `move-repo` moves every entry on the repo together.
 - A database that ran an early build of the multi-sim branch (with `0012_multi_sim.sql`, or
   `0013_multi_sim.sql` before it was renumbered to 0014) refuses to start: "migration 12 (or 13) was
