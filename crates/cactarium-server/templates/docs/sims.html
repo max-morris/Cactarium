@@ -6,7 +6,7 @@
 <h2 id="ways">Two ways to publish</h2>
 <ul>
   <li><strong>Upload</strong> the file: on the site with <a href="/new/sim">Upload a sim</a>, or from CactUp, which uses <code>POST /api/v1/sims/{owner}/{name}</code>.</li>
-  <li><strong>From a repo</strong>: commit a <code>cactarium-sim.toml</code> that names the <code>.sim</code> file and <a href="/docs/publishing#repo">register the repo</a>. Each version tag then publishes the file as it is at that tag.</li>
+  <li><strong>From a repo</strong>: commit a <code>cactarium-sim.toml</code> that names the <code>.sim</code> file (or <a href="#multi">several</a>) and <a href="/docs/publishing#repo">register the repo</a>. Each version tag then publishes the files as they are at that tag.</li>
 </ul>
 <p>A sim uses one way only: once it is registered from a repo, uploads to it are refused.</p>
 
@@ -25,16 +25,60 @@ A black hole and neutron star merger like GW230529, at high resolution.
   <tbody>
     <tr><td><code>name</code><br><span class="small muted">required</span></td><td>The entry's name, with the same rules as a package's.</td></tr>
     <tr><td><code>owners</code><br><span class="small muted">required</span></td><td>The users or organizations allowed to publish the repo's sim: the <a href="/docs/publishing#owners">proof that you control the repo</a>.</td></tr>
-    <tr><td><code>file</code><br><span class="small muted">required</span></td><td>The <code>.sim</code> file, a relative path inside the repo (no leading <code>/</code>, no <code>..</code>). It must exist at every version tag.</td></tr>
+    <tr><td><code>file</code><br><span class="small muted">this or <code>[sim.files]</code></span></td><td>The <code>.sim</code> file, a relative path inside the repo (no leading <code>/</code>, no <code>..</code>). It must exist at every version tag. The entry is this one sim.</td></tr>
+    <tr><td><code>[sim.files]</code><br><span class="small muted">this or <code>file</code>; format 2</span></td><td>Several sims released together, each <code>.sim</code> keyed by its sim name. See <a href="#multi">several sims in one entry</a>.</td></tr>
     <tr><td><code>description</code></td><td>Markdown shown on the sim's page; it wins over the description inside the <code>.sim</code>. Default: the <code>.sim</code>'s own description.</td></tr>
     <tr><td><code>contact</code></td><td>Where to go for help: an <code>https://</code> URL or a <code>mailto:</code> address. Default: the <code>.sim</code>'s own contact, else the repo.</td></tr>
-    <tr><td><code>tag-pattern</code>, <code>since</code></td><td>Which tags are versions, as for <a href="/docs/packages#package">packages</a>; see <a href="/docs/versions#tag-pattern">tag patterns</a>.</td></tr>
+    <tr><td><code>tag-pattern</code>, <code>since</code></td><td>Which tags are versions, as for <a href="/docs/packages#package">packages</a>; see <a href="/docs/versions#tag-pattern">tag patterns</a>. Without a pattern the sims share <code>vX.Y.Z</code> tags with the repo's package and stack; with one, they follow only their own (<a href="/docs/publishing#tags">how tags become versions</a>). Never <code>sim/v…</code>, which <a href="/docs/publishing#no-slash">reads as a track</a>.</td></tr>
   </tbody>
 </table></div>
 <p>A <code>[sim]</code> goes only in <code>cactarium-sim.toml</code>; the same repo can also carry a package or a stack in their own files.</p>
 
+<h2 id="multi">Several sims in one entry: [sim.files]</h2>
+<p>A repo with several example runs can publish them all as one entry, released together: list them in <code>[sim.files]</code>, a table keyed by sim name, instead of <code>file</code>. The manifest then needs <code>format = 2</code> (a Cactarium or CactUp from before it says "upgrade" rather than tripping over the new key).</p>
+<pre class="code">format = 2
+
+[sim]
+name = "cottonmouth-sims"
+owners = ["et"]
+description = "Cottonmouth's example simulations, on et/cottonmouth-stack."
+tag-pattern = "sim-v{major}.{minor}.{patch}"   # released separately from the package
+
+[sim.files]
+qc0-bssnok = "examples/sims/qc0-bssnok.sim"
+qc0-z4c    = "examples/sims/qc0-z4c.sim"
+mag-tov    = "examples/sims/mag-tov.sim"</pre>
+<ul>
+  <li><strong>Sim names</strong> follow the rules for entry names (lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, at most 64 characters, not ending in <code>.</code> or <code>-</code>) and must start with a letter. Each name appears once (TOML refuses a repeated key), and two names can't point at the same file. If a file's own <code>[sim] name</code> differs from its key, reviewers get a warning; the key is what counts.</li>
+  <li><strong>A version is one tag holding every sim the manifest lists there.</strong> Each is checked as an upload is. If one fails, the whole version is invalid, with every sim's reason: a version silently missing a sim would be worse. Review, yanking and visibility are per version.</li>
+  <li><strong>The list may change between versions.</strong> A sim added at 1.2.0 exists from 1.2.0 on; one dropped at 1.2.0 stays available at its last version (see below).</li>
+  <li><strong>The form is fixed when the entry is registered</strong>, from the manifest it is registered from: an entry registered with <code>file</code> keeps it, and one registered with <code>[sim.files]</code> keeps that, even when it lists a single sim, because every address would change meaning otherwise. A tag whose manifest uses the other form isn't the entry's: it is listed among <a href="/docs/publishing#not-ours">the tags not read as versions</a> (so older one-file tags of a repo that moved to <code>[sim.files]</code> don't become invalid versions). To move from one form to the other, register the new form as a new entry.</li>
+  <li>The entry's page shows one sim at a time, with the version's sims listed above the tabs; its description is the manifest's.</li>
+  <li>Uploads stay one sim per entry: <code>[sim.files]</code> is for sims released from a repo.</li>
+</ul>
+
+<h3 id="addressing">Addressing: by the manifest's form, never by the count</h3>
+<div class="table-box"><table>
+  <thead><tr><th scope="col"></th><th scope="col">A <code>file</code> entry</th><th scope="col">A <code>[sim.files]</code> entry</th></tr></thead>
+  <tbody>
+    <tr><td>Reference</td><td><code>owner/name[@range]</code></td><td><code>owner/name/sim[@range]</code>, always, even with one sim listed</td></tr>
+    <tr><td>Bare <code>owner/name</code></td><td>the sim</td><td>refused, with the list of its sims</td></tr>
+    <tr><td><code>owner/name/x</code></td><td>refused: it has no sims to name</td><td>sim <code>x</code></td></tr>
+    <tr><td>Import</td><td><code>cactup import max/qc0-demo@1</code></td><td><code>cactup import et/cottonmouth-sims/qc0-z4c@1</code></td></tr>
+    <tr><td>Stored copy's stamp</td><td><code>cactarium = "owner/name@1.0.0"</code></td><td><code>cactarium = "owner/name/sim@1.0.0"</code> (<code>.sim</code> format 4)</td></tr>
+    <tr><td>Web page</td><td><code>/owner/name/1.0.0</code></td><td><code>/owner/name/1.0.0?sim=qc0-z4c</code></td></tr>
+    <tr><td>Download</td><td><code>…/1.0.0/download.sim</code></td><td><code>…/1.0.0/download.sim?sim=qc0-z4c</code></td></tr>
+  </tbody>
+</table></div>
+<p>Why always name the sim: if <code>owner/name</code> meant "the only sim" while the list had one entry, it would silently change meaning, or break, the day a second sim is added.</p>
+<p><strong>Ranges</strong> choose the newest version in range <em>that holds the sim</em>. When a newer version in range dropped it, the answer says so and CactUp warns: with <code>qc0-z4c</code> listed at 1.0.0 and 1.1.0 but dropped at 1.2.0, <code>et/cottonmouth-sims/qc0-z4c@1</code> is 1.1.0, flagged that 1.2.0 doesn't have it. A sim that no version in range holds is refused, naming the sims the newest version has.</p>
+<p>A CactUp from before multi-sim entries reads <code>owner/name/x</code> as a thorn and can't import such sims; it can't fetch the wrong file either, since the Cactarium refuses a bare <code>owner/name</code> and a download without <code>?sim=</code> for a multi-sim entry. Upgrade CactUp to import them.</p>
+
+<h3 id="own-repo">Sims that build the repo's own package</h3>
+<p>Example sims usually pin the package they ship with, in the same repo. That works: every pin must be a registered, public package's repo, and the package entry beside the sims is one. When both are registered together, or the package is still awaiting review, a sims tag simply waits (it is <a href="/docs/publishing#retried">left unread and tried again</a>) until the package is public, and is then read. A pin to a commit the package's repo doesn't have yet waits the same way.</p>
+
 <h2 id="checks">What every published sim must satisfy</h2>
-<p>These checks apply to every upload and to the file at every tag of a repo-backed sim. An upload that fails one is refused with the reason; a tag that fails one becomes an invalid version with the reason. At a tag, a pin problem that isn't a fact about the commit is <a href="/docs/publishing#retried">tried again</a> instead: the pinned repo's history can't be read right now, the pinned commit isn't in it yet, or its package is registered but not public yet. A tarball pin, or a pin to a repo no package was ever registered for, is a fact: the version is invalid.</p>
+<p>These checks apply to every upload and to the file at every tag of a repo-backed sim. An upload that fails one is refused with the reason; a tag that fails one becomes an invalid version with the reason. At a tag, a pin problem that isn't a fact about the commit is <a href="/docs/publishing#retried">tried again</a> instead: the pinned repo's history can't be read right now, the pinned commit isn't in it yet, or no public package has the pinned repo yet (it isn't registered yet, or awaits review). The reason shows as the last check's error on the sim's page. A tarball pin is a fact: the version is invalid.</p>
 <ul>
   <li>The file is at most 1 MiB of UTF-8 text and a valid <code>.sim</code>. The reader is strict: unknown keys, or a format newer than the server knows, are errors.</li>
   <li>It is <strong>fully specified</strong>: every <code>[[repo]]</code> is pinned to a commit, none was dirty when exported, and every thorn in the build comes from one of those repos. And every repo is a <strong>registered package's</strong>, the flesh included (<code>et/cactus</code> or a fork of it), at a commit that package's repo has: a published version's commit, or any other commit of its history. Someone downstream can then rebuild the sim from the Cactarium alone. A repo that isn't on the Cactarium is registered first, or the sim pins a fork that is; a tarball pin has no package identity and is refused.</li>
@@ -58,7 +102,7 @@ A black hole and neutron star merger like GW230529, at high resolution.
 <h2 id="versions">Versions</h2>
 <p>Sim versions are semantic versions, like those of packages and stacks. An upload names its version, such as <code>1.0.1</code> for a fix to 1.0.0, or, without one, becomes the next major version: 1.0.0 for the first, then 2.0.0, and so on. A repo-backed sim takes its versions from its tags. A version never changes and is never reused: publish a new one instead.</p>
 <p>References work as for packages: <code>owner/name@1</code> means the newest 1.x.x, and <code>owner/name@1.0.1</code> exactly 1.0.1 (see <a href="/docs/versions#ranges">ranges</a>).</p>
-<p>The stored copy of each version records its own reference in <code>[sim] cactarium</code>, such as <code>"max-morris/bhns-gw230529-dense@1.0.0"</code>. The thornlist and the parfile stay byte for byte as published. <em>Download .sim</em> on the sim's page and the API serve that stored copy.</p>
+<p>The stored copy of each version records its own reference in <code>[sim] cactarium</code>, such as <code>"max-morris/bhns-gw230529-dense@1.0.0"</code>, or <code>"et/cottonmouth-sims/qc0-z4c@1.0.0"</code> for one sim of a <a href="#multi">multi-sim entry</a> (stored as <code>.sim</code> format 4, so an older reader asks to be upgraded instead of reading the third part as a thorn). The thornlist and the parfile stay byte for byte as published. <em>Download .sim</em> on the sim's page and the API serve that stored copy, with its own sha256.</p>
 
 <h2 id="inputs">Inputs</h2>
 <p>An <code>[[input]]</code> declares something the parfile needs from outside the source tree, reached through a CactUp knob (<code>@KNOB(name)@</code>). On import, CactUp asks for a value, or downloads the input's <code>url</code> and checks its <code>sha256</code>. An archive input (<code>unpack = true</code>) is downloaded, verified and unpacked, may point the knob at a <code>path</code> inside it, and may apply text fixups. The sim's <em>Inputs</em> tab shows what each input does. The details are in <a href="{{ doc.cactup("inputs") }}">CactUp's docs on inputs</a>.</p>

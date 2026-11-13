@@ -5,6 +5,14 @@
     <button class="button small ghost" type="submit">Check for new tags now</button>
   </form>
   {% if !r.poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ r.poll_error }}</p>{% endif %}
+  {% if !r.tag_rule.is_empty() %}<p class="small muted">{% if r.curated %}Versions come from {{ r.tag_rule }} (its curated manifest's rule).{% else %}Follows {{ r.tag_rule }}, as its newest version's manifest says. Each tag is read by the manifest in its own commit, so a manifest change applies from the tags that carry it on (<a href="/docs/publishing#tags">how</a>).{% endif %}</p>{% endif %}
+  {% if !r.foreign.is_empty() %}
+  <details><summary class="small">Tags not read as versions ({{ r.foreign.len() }})</summary>
+    <p class="small muted">Each was examined and found not to be a version of this entry, with the reason; a tag that moves is examined again:</p>
+    <ul class="small">{% for f in r.foreign %}<li><span class="mono">{{ f.0 }}</span>: {{ f.1 }}</li>{% endfor %}</ul>
+  </details>
+  {% endif %}
+  {% if !r.siblings.is_empty() %}<p class="small muted">Also on this repo: {% for s in r.siblings %}<a class="mono" href="/{{ s }}">{{ s }}</a>{% if !loop.last %}, {% endif %}{% endfor %}. A webhook on any of them checks them all.</p>{% endif %}
   <details><summary class="small">Webhook for instant updates</summary>
     <p class="small">Secret: <code class="mono">{{ r.secret }}</code></p>
     <p class="small"><strong>GitHub</strong> (Settings › Webhooks; content type application/json; "Just the push event"): <code class="mono">{{ r.webhook_base }}/github/{{ r.entry_id }}</code></p>

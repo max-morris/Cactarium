@@ -25,8 +25,9 @@
 
 <h2 id="reads">Read endpoints</h2>
 
-<h3 id="resolve"><code>GET /resolve?req=owner/name@range</code></h3>
+<h3 id="resolve"><code>GET /resolve?req=owner/name[/sim]@range[&amp;kind=package|stack|sim]</code></h3>
 <p>The best version of a package, stack or sim matching a <a href="/docs/versions#ranges">reference</a>: the highest published, non-yanked, valid version in the range, on the track the range names. An exact request such as <code>@1.2.3</code> also reaches a yanked version, which the response marks <code>"yanked": true</code>. For a package, <code>@head</code> and <code>@master</code> resolve to its default branch's tip, with the unpinned headers; for a stack they are refused (fetch <code>releases/head</code> instead).</p>
+<p>With <code>kind</code>, an entry of another kind is a 400 saying what it is (<code>owner/name is a sim, not a package</code>), before anything else about the reference is read; a client that only takes one kind can send it. Without it, a bare <code>owner/name</code> of a multi-sim entry is a 400 that says it is a sim entry and lists its sims.</p>
 <p>Response: <code>Resolved</code>. <code>slug</code> is the exact reference chosen, <code>kind</code> is <code>package</code>, <code>stack</code> or <code>sim</code>, <code>url</code> is the repo to fetch from (for an entry registered from a repo), <code>contact</code> is the version's declared contact or the repo, and the fields of <code>VersionInfo</code> follow inline.</p>
 <pre class="code">curl -G {{ doc.base_url }}/api/v1/resolve --data-urlencode 'req=max-morris/carpetx@mixed-precision:^1'</pre>
 <pre class="code">{
@@ -46,9 +47,28 @@
   "published": 1762300800
 }</pre>
 <p><code>state</code> is <code>ok</code>, <code>invalid</code>, <code>tag-moved</code> (the tag points elsewhere upstream now; the frozen <code>commit</code> still counts) or <code>upstream-missing</code>. <code>published</code> is in Unix seconds. <code>tag</code> is null for versions named by commit and for uploads.</p>
+<p id="resolve-sims"><strong>One sim of a multi-sim entry</strong> (<a href="/docs/sims#multi"><code>[sim.files]</code></a>) is always named: <code>owner/name/sim@range</code>. The answer is the newest version in range <em>that holds the sim</em>, and carries two more fields, absent otherwise:</p>
+<ul>
+  <li><code>sim</code>: the sim chosen, to pass to the download as <code>?sim=</code>;</li>
+  <li><code>newer-without-sim</code>: when a newer version in range no longer holds the sim (it was dropped), that version; CactUp warns. Absent when the chosen version is the newest in range.</li>
+</ul>
+<pre class="code">curl -G {{ doc.base_url }}/api/v1/resolve --data-urlencode 'req=et/cottonmouth-sims/qc0-z4c@1'</pre>
+<pre class="code">{
+  "slug": "et/cottonmouth-sims/qc0-z4c@1.1.0",
+  "kind": "sim",
+  "url": "https://github.com/EinsteinToolkit/Cottonmouth",
+  "contact": "https://github.com/EinsteinToolkit/Cottonmouth",
+  "sim": "qc0-z4c",
+  "newer-without-sim": "1.2.0",
+  "version": "1.1.0",
+  "track": null,
+  "tag": "sim-v1.1.0",
+  …
+}</pre>
+<p>A bare <code>owner/name</code> for a multi-sim entry is a 400 listing its sims (<code>owner/name/qc0-z4c, …</code>); <code>owner/name/x</code> for a one-sim entry is a 400 too; a sim no version in range holds is a 400 naming the sims the newest version has. For a package the third part is a thorn (<code>owner/pkg/Thorn@range</code>), checked against thorn-name rules, and the answer is the package's.</p>
 
 <h3 id="entry"><code>GET /entries/{owner}/{name}</code></h3>
-<p>Any entry. Response: <code>EntryInfo</code>: its <code>slug</code>, <code>kind</code>, <code>summary</code>, whether it is <code>verified</code> or <code>curated</code>, its <code>repo</code> and <code>contact</code>, its number of saves (<code>hearts</code>), its <code>tracks</code> (the default track as <code>""</code>) and the labels of its published <code>versions</code>.</p>
+<p>Any entry. Response: <code>EntryInfo</code>: its <code>slug</code>, <code>kind</code>, <code>summary</code>, whether it is <code>verified</code> or <code>curated</code>, its <code>repo</code> and <code>contact</code>, its number of saves (<code>hearts</code>), its <code>tracks</code> (the default track as <code>""</code>) and the labels of its published <code>versions</code>. For a multi-sim entry, <code>sims</code> lists the sims of its newest version (absent otherwise).</p>
 
 <h3 id="package-versions"><code>GET /packages/{owner}/{name}/versions</code></h3>
 <p>Every published version of a package, newest first within each track, yanked and invalid ones included and marked. Response: <code>PackageVersions</code>, whose <code>versions</code> are <code>PackageVersion</code>s: the <code>VersionInfo</code> fields, the repo <code>url</code>, the <code>thorns</code> (<code>ThornInfo</code>: <code>arrangement</code>, <code>thorn</code>, the <a href="/docs/packages#repo-path"><code>repo-path</code></a> to write in a thornlist, and the CCL <code>facts</code>) and the <code>claims</code> (<code>ClaimInfo</code>: <code>kind</code>, <code>target</code>, <code>range</code>, <code>note</code>).</p>
@@ -64,8 +84,9 @@
 <p>One release, by its exact version: <code>1.2.0</code>, or <code>track:1.2.0</code>. A yanked release is still served. Response: <code>FrozenStack</code>: <code>format</code>, the exact <code>stack</code> reference, <code>root</code>, the <code>thornlist</code> (<code>filename</code> and verbatim <code>text</code>), one <code>repo</code> entry per repo with its pin, and the <code>recipe</code> (the definition) it was cut from. Carries <code>x-cactarium-contact</code>.</p>
 <p>With <code>head</code> or <code>master</code> in place of the version, the response is the stack's <a href="/docs/stacks#tips">unpinned form</a>, resolved now: repos left on a branch tip have no <code>commit</code>, and <code>stack</code> ends in <code>@head</code> or <code>@master</code>. It carries <code>x-cactarium-unpinned</code> and <code>x-cactarium-untrusted</code>, answers 403 for an untrusted stack unless the site allows untrusted branch tips, and is limited to 12 requests a minute.</p>
 
-<h3 id="sim-download"><code>GET /sims/{owner}/{name}/{version}/download</code></h3>
+<h3 id="sim-download"><code>GET /sims/{owner}/{name}/{version}/download[?sim=&lt;sim&gt;]</code></h3>
 <p>One sim version's <code>.sim</code> file, by its exact version, such as <code>1.0.0</code>; a yanked version is still served. The body is the stored file (content type <code>application/toml</code>), with its sha256 in <code>x-sha256</code>.</p>
+<p>For a multi-sim entry, <code>?sim=</code> names the sim and is required (without it the answer is a 400 naming the version's sims); the body and <code>x-sha256</code> are that sim's own, stamped <code>cactarium = "owner/name/sim@X.Y.Z"</code> in <code>.sim</code> format 4. A one-sim entry refuses <code>?sim=</code>. A client caching downloads keys them by sim too (for example <code>simfiles/&lt;owner&gt;/&lt;name&gt;/&lt;sim&gt;/&lt;version&gt;.sim</code>).</p>
 
 <h2 id="tokens">API tokens</h2>
 <p>Write endpoints take a token in the <code>Authorization</code> header:</p>
@@ -93,5 +114,5 @@
 <p>Checks the entry's repo for new, moved and deleted tags now, like <em>Check for new tags now</em> on the site. The token's user must manage the entry. Despite the path, it works for any entry registered from a repo. Limited to 10 requests a minute. Response: <code>Refreshed</code>: the <code>slug</code>, how many versions this check added (<code>new-versions</code>), and how many of the entry's versions wait for review (<code>awaiting-review</code>).</p>
 
 <h2 id="other">Outside the API</h2>
-<p>The site's own downloads, <code>/{owner}/{name}/{version}/download.sim</code> for a sim and <code>/{owner}/{name}/{version}/download.th</code> for a stack's frozen thornlist, serve plain files. Forge webhooks go to <code>/hooks/{github|gitlab|bitbucket}/{entry-id}</code>; see <a href="/docs/publishing#new-tags">Publishing</a>.</p>
+<p>The site's own downloads, <code>/{owner}/{name}/{version}/download.sim</code> for a sim (with <code>?sim=</code> for one of a multi-sim entry) and <code>/{owner}/{name}/{version}/download.th</code> for a stack's frozen thornlist, serve plain files. A multi-sim entry's pages take <code>?sim=</code> too: <code>/{owner}/{name}/{version}?sim=qc0-z4c</code>. Forge webhooks go to <code>/hooks/{github|gitlab|bitbucket}/{entry-id}</code>, and a verified delivery checks every entry on the same repo; see <a href="/docs/publishing#new-tags">Publishing</a>.</p>
 {% endblock %}

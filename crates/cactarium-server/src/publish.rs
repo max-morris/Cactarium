@@ -136,6 +136,15 @@ pub async fn submit_release(
 }
 
 pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> AppResult<Entry> {
+    let mut tx = state.db.begin().await?;
+    let entry = create_entry_in(&mut tx, state, user, n).await?;
+    tx.commit().await?;
+    Ok(entry)
+}
+
+/// [`create_entry`], writing the entry, its submission and the audit record through `db` (a
+/// transaction the caller commits with whatever else it creates).
+pub async fn create_entry_in(db: &mut sqlx::PgConnection, state: &AppState, user: &User, n: NewEntry<'_>) -> AppResult<Entry> {
     n.owner.parse::<Owner>().map_err(AppError::bad)?;
     n.name.parse::<Name>().map_err(AppError::bad)?;
     if n.curated && !user.is_admin() {
@@ -161,17 +170,17 @@ pub async fn create_entry(state: &AppState, user: &User, n: NewEntry<'_>) -> App
     .bind(visibility)
     .bind(n.curated)
     .bind(user.id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *db)
     .await?;
     let status = if skip { "auto-approved" } else { "open" };
     sqlx::query("INSERT INTO submissions (entry_id, submitter, status, decided_at) VALUES ($1, $2, $3, CASE WHEN $3 = 'open' THEN NULL ELSE now() END)")
         .bind(entry.id)
         .bind(user.id)
         .bind(status)
-        .execute(&state.db)
+        .execute(&mut *db)
         .await?;
-    audit(
-        state,
+    crate::audit::audit_with(
+        db,
         Some(user.id),
         "entry.create",
         Some(&entry.slug()),

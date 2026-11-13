@@ -5,15 +5,18 @@
   <h1>Register a repo</h1>
   <p class="lead">Your code stays in your repo. The Cactarium reads it at every version tag and freezes the commit the tag names.</p>
   <ol class="steps">
-    <li>Commit <span class="mono">cactarium.toml</span> (a package), <span class="mono">cactarium-stack.toml</span> (a stack) and/or <span class="mono">cactarium-sim.toml</span> (a sim: it names the <span class="mono">.sim</span> file to publish) at the repo root, each with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span> (or the organization you publish under). Only someone who can push to the repo can put that name there; that is the proof you control it.</li>
-    <li>Tag a release: <span class="mono">v1.0.0</span>, or on a track, <span class="mono">mixed-precision/v1.0.0</span>.</li>
-    <li>Paste the repo's https URL below.</li>
+    <li>Commit <span class="mono">cactarium.toml</span> (a package), <span class="mono">cactarium-stack.toml</span> (a stack) and/or <span class="mono">cactarium-sim.toml</span> (sims: it names the <span class="mono">.sim</span> file, or several in <span class="mono">[sim.files]</span>) at the repo root, each with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span> (or the organization you publish under). Only someone who can push to the repo can put that name there; that is the proof you control it. Each manifest becomes its own entry.</li>
+    <li>Tag a release: <span class="mono">v1.0.0</span>, or on a track, <span class="mono">mixed-precision/v1.0.0</span>, or whatever the manifest's <span class="mono">tag-pattern</span> says. Without patterns, one tag releases every kind the repo carries; see <a href="/docs/publishing#tags">how tags become versions</a>.</li>
+    <li>Paste the repo's https URL below. A repo that already has entries gets only the missing ones.</li>
   </ol>
   {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
   <form class="card stack" method="post" action="/new/repo">
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <label for="url">Repo URL</label>
     <input id="url" name="url" class="mono" value="{{ url }}" placeholder="https://github.com/you/YourArrangement" required>
+    <label for="tag">Tag <span class="muted small">(optional)</span></label>
+    <input id="tag" name="tag" class="mono" value="{{ tag }}" placeholder="sim-v1.0.0">
+    <p class="muted small">Reads the manifests at exactly this tag, instead of at each kind's newest tag: needed when a manifest isn't on the default branch yet, and it is the very commit that becomes the first version. Every new entry is read at its tag before anything is registered; if one fails, nothing is.</p>
     {% let owner_id = "owner" %}{% include "_publish_under.html" %}
     <button class="button" type="submit">Register</button>
   </form>

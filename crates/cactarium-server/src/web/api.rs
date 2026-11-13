@@ -17,6 +17,7 @@ use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
 use cactup_ecosystem_common::sim::ThornlistText;
 use cactup_ecosystem_common::slug::{Slug, Tip};
 use cactup_ecosystem_common::stack::FrozenStack;
+use cactup_ecosystem_common::version::TrackedVersion;
 use serde::Deserialize;
 
 use crate::auth::{User, sha256};
@@ -154,13 +155,18 @@ pub async fn entry(
     let e = public_entry(&state, &owner, &name, None).await?;
     let versions = model::versions(&state, e.id).await?;
     let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
+    let sims = match versions.iter().filter(|v| v.state != "invalid").max_by(|a, b| a.sort_key.cmp(&b.sort_key)) {
+        Some(v) if e.kind == "sim" && model::multi_sim(&state, e.id).await? => model::sim_names(&state, v.id).await?,
+        _ => vec![],
+    };
     Ok(Json(EntryInfo {
         slug: e.slug(),
         kind: e.kind.clone(),
         summary: e.summary.clone(),
         verified: e.verified,
         curated: e.curated,
-        contact: model::entry_contact(&state, &e, repo.as_deref()).await?,
+        contact: model::entry_contact(&state, &e, repo.as_deref(), None).await?,
+        sims,
         hearts: model::heart_count(&state, e.id).await?,
         repo,
         tracks: model::tracks_of(&versions, None),
@@ -225,6 +231,9 @@ async fn version_at_commit(state: &AppState, e: &Entry, commit: &str) -> ApiResu
 #[derive(Deserialize)]
 pub struct ResolveQ {
     req: String,
+    /// The kind the client expects (`package`, `stack` or `sim`): an entry of another kind is
+    /// refused saying so, before anything else about the reference.
+    kind: Option<String>,
 }
 
 /// `owner/name@[track:]range` → the highest usable matching version, with its frozen commit.
@@ -236,6 +245,17 @@ pub async fn resolve(
 ) -> ApiResult<Response> {
     let slug: Slug = q.req.parse().map_err(AppError::bad)?;
     let e = entry_for(&state, slug.owner.as_str(), slug.name.as_str(), None, &reviewer).await?;
+    // The kind first: `cactup add` on a sim entry learns it is a sim, not what its third
+    // segment would mean.
+    if let Some(want) = q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        if !matches!(want, "package" | "stack" | "sim") {
+            return Err(AppError::bad(format!("kind '{want}' is none of package, stack or sim")).into());
+        }
+        if want != e.kind {
+            return Err(AppError::bad(format!("{} is a {}, not a {want}", e.slug(), e.kind)).into());
+        }
+    }
+    let sim = third_segment(&state, &e, &slug, &reviewer).await?;
     if let Some(tip) = slug.tip() {
         if e.kind != "package" {
             return Err(AppError::bad(
@@ -247,12 +267,14 @@ pub async fn resolve(
         let trusted = unreviewed_allowed(&state, &e, label, Unreviewed::Tip).await?;
         let t = package_snapshot(&state, &e, ip, None).await?;
         let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
-        let contact = model::entry_contact(&state, &e, url.as_deref()).await?;
+        let contact = model::entry_contact(&state, &e, url.as_deref(), None).await?;
         let body = Resolved {
             slug: format!("{}@{label}", e.slug()),
             kind: e.kind.clone(),
             url,
             contact,
+            sim: None,
+            newer_without_sim: None,
             version: tip_version_info(&e, label, &t),
         };
         return Ok((tip_headers(trusted), Json(body)).into_response());
@@ -262,23 +284,59 @@ pub async fn resolve(
         return commit_answer(&state, &e, ip, prefix).await;
     }
     let versions = servable_versions(&state, &e, &reviewer).await?;
+    // For one sim of a multi-sim entry, only the versions that hold it.
+    let holding: Option<std::collections::HashSet<i64>> = match &sim {
+        Some(name) => Some(
+            sqlx::query_scalar::<_, i64>("SELECT version_id FROM sim_files WHERE name = $1 AND version_id = ANY($2)")
+                .bind(name)
+                .bind(versions.iter().map(|v| v.id).collect::<Vec<_>>())
+                .fetch_all(&state.db)
+                .await
+                .map_err(AppError::from)?
+                .into_iter()
+                .collect(),
+        ),
+        None => None,
+    };
+    let holds = |v: &Version| holding.as_ref().is_none_or(|h| h.contains(&v.id));
     // Packages, stacks and sims alike: a semver range (`@1` is 1.x.x), or an exact version. Every
     // reading of `@<x>` other than a commit wins; a package tries `<x>` as a commit only when it
     // matches nothing (or isn't a version or range at all) and looks like one.
+    let mut newer_without_sim = None;
     let matched: Result<&Version, AppError> = match slug.req() {
         Err(e) => Err(AppError::bad(e)),
         Ok(req) => {
             // An exact request (`1.2.3`) still reaches a yanked version, which the response marks
             // `yanked`; a range never chooses one.
             let exact = req.is_exact();
-            versions
+            let in_range: Vec<(TrackedVersion, &Version)> = versions
                 .iter()
                 .filter(|v| v.valid() && (!v.yanked || exact))
                 .filter_map(|v| model::tracked(v).map(|t| (t, v)))
                 .filter(|(t, _)| req.matches(t))
+                .collect();
+            let best = in_range
+                .iter()
+                .filter(|(_, v)| holds(v))
                 .max_by(|a, b| a.0.version.cmp(&b.0.version))
-                .map(|(_, v)| v)
-                .ok_or_else(|| AppError::bad(format!("no version of {} matches {req}", e.slug())))
+                .map(|(t, v)| (t.clone(), *v));
+            // A newer version in range that dropped the sim: the client warns.
+            if let Some((bt, _)) = &best {
+                newer_without_sim = in_range
+                    .iter()
+                    .filter(|(t, v)| t.version > bt.version && !holds(v))
+                    .max_by(|a, b| a.0.version.cmp(&b.0.version))
+                    .map(|(_, v)| v.label());
+            }
+            match (best, &sim) {
+                (Some((_, v)), _) => Ok(v),
+                (None, Some(name)) if !in_range.is_empty() => Err(AppError::bad(format!(
+                    "no version of {} matching {req} holds the sim {name}; the newest of them holds {}",
+                    e.slug(),
+                    sims_list(&state, &e, in_range.iter().max_by(|a, b| a.0.version.cmp(&b.0.version)).map(|(_, v)| v.id)).await?
+                ))),
+                (None, _) => Err(AppError::bad(format!("no version of {} matches {req}", e.slug()))),
+            }
         }
     };
     let best = match matched {
@@ -290,22 +348,87 @@ pub async fn resolve(
     };
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
     let contact = match e.kind.as_str() {
-        "sim" => model::entry_contact(&state, &e, None).await?,
+        "sim" => model::entry_contact(&state, &e, None, sim.as_deref()).await?,
         _ => model::manifest_contact(best.manifest.as_ref())
             .or_else(|| url.as_deref().map(model::repo_page)),
     };
     let marked = unreviewed_header(&e, Some(best));
+    let named = match &sim {
+        Some(s) => format!("{}/{s}", e.slug()),
+        None => e.slug(),
+    };
     Ok((
         axum::response::AppendHeaders(marked),
         Json(Resolved {
-            slug: format!("{}@{}", e.slug(), best.label()),
+            slug: format!("{named}@{}", best.label()),
             kind: e.kind.clone(),
             url,
             contact,
+            sim,
+            newer_without_sim,
             version: version_info(best),
         }),
     )
     .into_response())
+}
+
+/// What a reference's third segment (`owner/name/x`) means for its entry, by the entry's kind. For
+/// a package it is a thorn (the answer is the package's, as always), and stacks keep the same
+/// rule. For a multi-sim entry it is one of its sims, which it always needs, whatever the count:
+/// a bare `owner/name` is refused, listing them. A one-sim entry has no sims to name. Returns the
+/// sim named, if any.
+async fn third_segment(state: &AppState, e: &Entry, slug: &Slug, reviewer: &Reviewer) -> ApiResult<Option<String>> {
+    if e.kind != "sim" {
+        // Worded apart from older servers' "is not a Cactarium reference: ... is not a thorn
+        // name", which CactUp reads as a server that predates multi-sim entries.
+        if let (Err(_), Some(x)) = (slug.as_thorn(), &slug.thorn) {
+            return Err(AppError::bad(format!(
+                "{} is a {}, not a sim entry: a third segment names one of its thorns, and '{x}' can't be a thorn's",
+                e.slug(),
+                e.kind
+            ))
+            .into());
+        }
+        return Ok(None);
+    }
+    let multi = model::multi_sim(state, e.id).await?;
+    match (multi, &slug.thorn) {
+        (true, None) => {
+            let newest = servable_versions(state, e, reviewer)
+                .await?
+                .into_iter()
+                .filter(|v| v.state != "invalid")
+                .max_by(|a, b| a.sort_key.cmp(&b.sort_key))
+                .map(|v| v.id);
+            Err(AppError::bad(format!(
+                "{} is a sim entry, not a package or a stack, and it holds several sims, each named: {}; name one, as owner/name/sim[@range]",
+                e.slug(),
+                sims_list(state, e, newest).await?
+            ))
+            .into())
+        }
+        (true, Some(_)) => Ok(slug.as_sim().map_err(AppError::bad)?.map(|s| s.to_string())),
+        (false, Some(x)) => Err(AppError::bad(format!(
+            "{} is one sim, addressed {}; it has no sim '{x}' to name",
+            e.slug(),
+            e.slug()
+        ))
+        .into()),
+        (false, None) => Ok(None),
+    }
+}
+
+/// A version's sims as references (`owner/name/a, owner/name/b`), for a message.
+async fn sims_list(state: &AppState, e: &Entry, version_id: Option<i64>) -> ApiResult<String> {
+    let names = match version_id {
+        Some(id) => model::sim_names(state, id).await?,
+        None => vec![],
+    };
+    Ok(if names.is_empty() {
+        "none yet".to_owned()
+    } else {
+        names.iter().map(|n| format!("{}/{n}", e.slug())).collect::<Vec<_>>().join(", ")
+    })
 }
 
 /// `@<commit>` (as a fallback) or `#<commit>` on `/resolve`: the version frozen at that commit if
@@ -324,18 +447,22 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) 
             kind: e.kind.clone(),
             url,
             contact,
+            sim: None,
+            newer_without_sim: None,
             version: version_info(&v),
         })
         .into_response());
     }
     let trusted = unreviewed_allowed(state, e, &commit, Unreviewed::Commit).await?;
     let t = package_snapshot(state, e, ip, Some(&commit)).await?;
-    let contact = model::entry_contact(state, e, url.as_deref()).await?;
+    let contact = model::entry_contact(state, e, url.as_deref(), None).await?;
     let body = Resolved {
         slug: format!("{}#{commit}", e.slug()),
         kind: e.kind.clone(),
         url,
         contact,
+        sim: None,
+        newer_without_sim: None,
         version: tip_version_info(e, &commit, &t),
     };
     Ok(([untrusted_header(trusted)], Json(body)).into_response())
@@ -567,7 +694,7 @@ pub async fn stack_release(
         _ => None,
     };
     let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
-    let contact = model::entry_contact(&state, &e, repo.as_deref()).await?.unwrap_or_default();
+    let contact = model::entry_contact(&state, &e, repo.as_deref(), None).await?.unwrap_or_default();
     let contact =
         header::HeaderValue::from_str(&contact).unwrap_or(header::HeaderValue::from_static(""));
     let contact_header = (header::HeaderName::from_static(CONTACT_HEADER), contact);
@@ -643,26 +770,44 @@ async fn current_definition(state: &AppState, e: &Entry) -> ApiResult<(String, O
     }
 }
 
+#[derive(Deserialize, Default)]
+pub struct SimQ {
+    /// One sim of a multi-sim entry (`?sim=`, [`cactup_ecosystem_common::api::SIM_QUERY`]).
+    sim: Option<String>,
+}
+
+/// The stored `.sim` of a version, with its own sha256. A multi-sim entry needs `?sim=` (which of
+/// its sims); a one-sim entry takes none.
 pub async fn sim_download(
     State(state): State<AppState>,
     reviewer: Reviewer,
     Path((owner, name, version)): Path<(String, String, String)>,
+    Query(q): Query<SimQ>,
 ) -> ApiResult<Response> {
     let e = entry_for(&state, &owner, &name, Some("sim"), &reviewer).await?;
     let v = model::any_version_by_label(&state, e.id, &version)
         .await?
         .filter(|v| servable(v, &reviewer))
         .ok_or(AppError::NotFound)?;
+    let sim = q.sim.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let which = match (model::multi_sim(&state, e.id).await?, sim) {
+        (true, Some(s)) => s.to_owned(),
+        (true, None) => {
+            return Err(AppError::bad(format!(
+                "{} holds several sims; add ?sim= naming one: {}",
+                e.slug(),
+                model::sim_names(&state, v.id).await?.join(", ")
+            ))
+            .into());
+        }
+        (false, Some(s)) => {
+            return Err(AppError::bad(format!("{} is one sim; it has no sim '{s}' (drop ?sim=)", e.slug())).into());
+        }
+        (false, None) => String::new(),
+    };
     let marked = unreviewed_header(&e, Some(&v));
-    // The file and its sha256 from one row: they always belong together (a later release can
-    // store several sims per version).
-    let (content, sha): (String, String) =
-        sqlx::query_as("SELECT content, sha256 FROM sim_files WHERE version_id = $1 LIMIT 1")
-            .bind(v.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(AppError::from)?
-            .ok_or(AppError::NotFound)?;
+    // The file and its sha256 from one row: the sha always belongs to the file served.
+    let (content, sha) = crate::web::public::sim_file(&state, v.id, &which).await.map(|f| (f.content, f.sha256))?;
     Ok((
         axum::response::AppendHeaders(marked),
         [

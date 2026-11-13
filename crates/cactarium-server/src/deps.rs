@@ -115,6 +115,26 @@ async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetV
     }))
 }
 
+/// Whether the target of `alt` has tags in its range not read yet (see
+/// `tracker::unread_in_range`): a version of it may yet supply what is missing.
+async fn alt_unread(state: &AppState, alt: &Alt) -> AppResult<crate::tracker::Unread> {
+    use crate::tracker::Unread;
+    let req = match (&alt.sha, &alt.range) {
+        (Some(_), _) => None,
+        (None, Some(r)) => r.parse::<TrackedReq>().ok(),
+        (None, None) => Some(TrackedReq::any()),
+    };
+    let target_id: Option<i64> = sqlx::query_scalar("SELECT id FROM entries WHERE owner = $1 AND name = $2")
+        .bind(&alt.owner)
+        .bind(&alt.name)
+        .fetch_optional(&state.db)
+        .await?;
+    Ok(match (req, target_id) {
+        (Some(req), Some(id)) => crate::tracker::unread_in_range(state, id, &req).await?,
+        _ => Unread::No,
+    })
+}
+
 /// Whether a library's checkout can't go at `path`: something is there already (a file, or a
 /// folder with anything in it).
 fn occupied(path: &Path) -> bool {
@@ -209,21 +229,8 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                     if !missing.is_empty() {
                         // A version of the target in range that isn't read yet (released together
                         // with this one, say) may have them: then this waits rather than freezing.
-                        let req = match (&alt.sha, &alt.range) {
-                            (Some(_), _) => None,
-                            (None, Some(r)) => r.parse::<TrackedReq>().ok(),
-                            (None, None) => Some(TrackedReq::any()),
-                        };
-                        let target_id: Option<i64> = sqlx::query_scalar("SELECT id FROM entries WHERE owner = $1 AND name = $2")
-                            .bind(&alt.owner)
-                            .bind(&alt.name)
-                            .fetch_optional(&state.db)
-                            .await?;
                         use crate::tracker::Unread;
-                        let unread = match (req, target_id) {
-                            (Some(req), Some(id)) => crate::tracker::unread_in_range(state, id, &req).await?,
-                            _ => Unread::No,
-                        };
+                        let unread = alt_unread(state, &alt).await?;
                         for n in missing {
                             let said = format!("the dependency on {} needs {n}, which {}@{} doesn't have", alt.target(), alt.target(), tv.label);
                             match unread {
@@ -252,7 +259,9 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
         return Err(AppError::Upstream(waiting.join("; ")));
     }
 
-    // Every hard CCL requirement of every published thorn is met.
+    // Every hard CCL requirement of every published thorn is met. One unmet while an applicable
+    // dependency has a version in range not read yet waits for it.
+    let mut ccl_waiting: Vec<String> = Vec::new();
     let mut explained: Vec<(String, String)> = Vec::new(); // (target, needs thorn) some requirement used
     for (arr, name, _, facts) in own {
         for need in needs_of(facts) {
@@ -289,16 +298,34 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                         .map(|(t, _)| format!(": add \"{t}\" to the needs of the dependency on {}", if c.alternatives.is_empty() { alt.target() } else { format!("{} (in its any-of)", alt.target()) }))
                 })
             });
-            problems.push(format!(
+            let said = format!(
                 "{arr}/{name} {}, which neither this package nor a dependency's needs supplies{}",
                 need.says(),
                 hint.unwrap_or_else(|| ": add a [[dependency]] on the package that provides it, with needs naming its thorn, or exclude-thorns this thorn if it can't build".to_owned())
-            ));
+            );
+            let mut unread = None;
+            'deps: for (_, opts) in &applicable {
+                for (alt, _) in opts {
+                    if alt_unread(state, alt).await? != crate::tracker::Unread::No {
+                        unread = Some(alt.target());
+                        break 'deps;
+                    }
+                }
+            }
+            match unread {
+                Some(t) => ccl_waiting.push(format!("{said}; {t} has a version in range not read yet, which may supply it")),
+                None => problems.push(said),
+            }
         }
     }
     if !problems.is_empty() {
         problems.dedup();
+        problems.extend(ccl_waiting);
         return Err(AppError::bad(problems.join("; ")));
+    }
+    if !ccl_waiting.is_empty() {
+        ccl_waiting.dedup();
+        return Err(AppError::Upstream(ccl_waiting.join("; ")));
     }
 
     // Smells for reviewers: needs no CCL requirement explains (fine for a header included by path,

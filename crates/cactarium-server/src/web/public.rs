@@ -419,9 +419,25 @@ async fn repo_manage(
             .fetch_optional(&state.db)
             .await?
             .flatten();
+    let tag_rule = tracker::TagRule::of_repo(&repo)?.describe_with_since();
+    let siblings = tracker::entries_on(state, &repo.url)
+        .await?
+        .into_iter()
+        .filter(|(e, _)| e.id != entry.id)
+        .map(|(e, _)| e.slug())
+        .collect();
+    let foreign: Vec<(String, String)> =
+        sqlx::query_as("SELECT tag, reason FROM foreign_tags WHERE entry_id = $1 ORDER BY seen_at DESC LIMIT 20")
+            .bind(entry.id)
+            .fetch_all(&state.db)
+            .await?;
     Ok(Some(RepoManage {
         entry_url: entry.url(),
         poll_error: poll_error.unwrap_or_default(),
+        tag_rule,
+        siblings,
+        curated: repo.overlay_manifest.is_some(),
+        foreign,
         webhook_base: state.cfg.url("/hooks"),
         entry_id: entry.id,
         secret: repo.webhook_secret,
@@ -443,7 +459,7 @@ async fn head_of(state: &AppState, e: &Entry, user: Option<&User>) -> AppResult<
         Default::default()
     };
     let repo_url = repo.as_ref().map(|r| r.url.clone());
-    let contact = model::entry_contact(state, e, repo_url.as_deref()).await?.unwrap_or_default();
+    let contact = model::entry_contact(state, e, repo_url.as_deref(), None).await?.unwrap_or_default();
     let hearted = match user {
         Some(u) => {
             sqlx::query_scalar(
@@ -566,10 +582,11 @@ async fn pin_rows(
 }
 
 fn tabs(base: &str, list: &[(&str, &str)], selected: &str) -> Vec<Tab> {
+    let sep = if base.contains('?') { '&' } else { '?' };
     list.iter()
         .map(|(id, label)| Tab {
             label: label.to_string(),
-            url: format!("{base}?tab={id}"),
+            url: format!("{base}{sep}tab={id}"),
             selected: *id == selected,
         })
         .collect()
@@ -579,6 +596,8 @@ fn tabs(base: &str, list: &[(&str, &str)], selected: &str) -> Vec<Tab> {
 pub struct EntryQ {
     tab: Option<String>,
     track: Option<String>,
+    /// One sim of a multi-sim entry.
+    sim: Option<String>,
 }
 
 pub async fn entry(
@@ -850,14 +869,32 @@ async fn stack_page(
     Ok(page(&p)?.into_response())
 }
 
-pub async fn sim_file(state: &AppState, version_id: i64) -> AppResult<(String, crate::sims::SimIndex)> {
-    let (content, index): (String, serde_json::Value) =
-        sqlx::query_as("SELECT content, index FROM sim_files WHERE version_id = $1")
+/// What a version's reading noticed for reviewers (versions.smells).
+async fn current_smells(state: &AppState, version_id: i64) -> AppResult<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT unnest(smells) FROM versions WHERE id = $1")
+        .bind(version_id)
+        .fetch_all(&state.db)
+        .await?)
+}
+
+/// One stored sim of a version.
+pub struct StoredSim {
+    pub content: String,
+    pub sha256: String,
+    pub index: crate::sims::SimIndex,
+}
+
+/// The stored sim `name` of a version ("" for a one-sim entry's only sim), from one row, so its
+/// sha256 is always the served file's.
+pub async fn sim_file(state: &AppState, version_id: i64, name: &str) -> AppResult<StoredSim> {
+    let (content, sha256, index): (String, String, serde_json::Value) =
+        sqlx::query_as("SELECT content, sha256, index FROM sim_files WHERE version_id = $1 AND name = $2")
             .bind(version_id)
+            .bind(name)
             .fetch_optional(&state.db)
             .await?
             .ok_or(AppError::NotFound)?;
-    Ok((content, serde_json::from_value(index).unwrap_or_default()))
+    Ok(StoredSim { content, sha256, index: serde_json::from_value(index).unwrap_or_default() })
 }
 
 async fn sim_page(
@@ -870,9 +907,29 @@ async fn sim_page(
     q: EntryQ,
 ) -> AppResult<Response> {
     let current = pick(&versions, label, None, None)?.ok_or(AppError::NotFound)?;
-    let (content, index) = sim_file(state, current.id).await?;
+    // A multi-sim entry shows one of the version's sims: the one asked for, else the first.
+    let names = model::sim_names(state, current.id).await?;
+    let multi = names.iter().any(|n| !n.is_empty());
+    let asked = q.sim.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (shown, note) = match asked {
+        Some(a) if names.iter().any(|n| n == a) => (a.to_owned(), String::new()),
+        Some(a) if multi => (
+            names.first().cloned().unwrap_or_default(),
+            format!("Version {} has no sim '{a}'; showing {}.", current.label(), names.first().cloned().unwrap_or_default()),
+        ),
+        _ => (names.first().cloned().unwrap_or_default(), String::new()),
+    };
+    let stored = sim_file(state, current.id, &shown).await?;
+    let (content, index) = (stored.content, stored.index);
     let sim = SimFile::from_toml(&content)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("stored sim unreadable: {e}")))?;
+    let mut e = e;
+    if multi {
+        let repo_url = tracker::repo_of(state, entry.id).await?.map(|r| r.url);
+        e.contact = model::entry_contact(state, entry, repo_url.as_deref(), Some(&shown)).await?.unwrap_or_default();
+    }
+    // The sim in a URL: `?sim=` on a multi-sim entry's pages, nothing on a one-sim entry's.
+    let q_sim = |sep: char| if multi { format!("{sep}sim={shown}") } else { String::new() };
     let tab = q.tab.unwrap_or_else(|| "parfile".into());
     let mut run = Vec::new();
     if let Some(r) = &sim.run {
@@ -931,10 +988,27 @@ async fn sim_page(
         ParfileKind::Py => " (Python generator)",
     };
     let repo = repo_manage(state, entry, e.can_manage).await?;
+    let mut version_rows: Vec<VersionRow> = versions.iter().map(|v| version_row(entry, v, Some(current.id))).collect();
+    for r in &mut version_rows {
+        r.url.push_str(&q_sim('?'));
+    }
     let p = SimPage {
         repo,
+        sims: if multi {
+            names
+                .iter()
+                .map(|n| SimChoice {
+                    name: n.clone(),
+                    url: format!("{}/{}?sim={n}", entry.url(), current.label()),
+                    selected: *n == shown,
+                })
+                .collect()
+        } else {
+            vec![]
+        },
+        sim_note: note,
         tabs: tabs(
-            &format!("{}/{}", entry.url(), current.label()),
+            &format!("{}/{}{}", entry.url(), current.label(), q_sim('?')),
             &[
                 ("parfile", "Parfile"),
                 ("thornlist", "Thornlist"),
@@ -946,7 +1020,7 @@ async fn sim_page(
             &tab,
         ),
         tab,
-        versions: versions.iter().map(|v| version_row(entry, v, Some(current.id))).collect(),
+        versions: version_rows,
         thornlist_name: sim.thornlist.filename.clone(),
         thornlist: sim.thornlist.text.clone(),
         parfile_name: format!("{}{kind}", sim.parfile.filename),
@@ -955,9 +1029,13 @@ async fn sim_page(
         inputs,
         run,
         provenance,
-        warnings: index.warnings,
-        import_cmd: format!("cactup import {}@{}", entry.slug(), current.label()),
-        download_url: format!("{}/{}/download.sim", entry.url(), current.label()),
+        warnings: index.warnings.into_iter().chain(current_smells(state, current.id).await?).collect(),
+        import_cmd: if multi {
+            format!("cactup import {}/{shown}@{}", entry.slug(), current.label())
+        } else {
+            format!("cactup import {}@{}", entry.slug(), current.label())
+        },
+        download_url: format!("{}/{}/download.sim{}", entry.url(), current.label(), q_sim('?')),
         authors: sim.sim.authors.join(", "),
         license: sim.sim.license.clone().unwrap_or_default(),
         ctx,
@@ -966,11 +1044,12 @@ async fn sim_page(
     Ok(page(&p)?.into_response())
 }
 
-/// `.sim` files and frozen stack thornlists.
+/// `.sim` files (`?sim=` naming one sim of a multi-sim entry) and frozen stack thornlists.
 pub async fn download(
     State(state): State<AppState>,
     v: Visitor,
     Path((owner, name, label, file)): Path<(String, String, String, String)>,
+    Query(q): Query<EntryQ>,
 ) -> AppResult<Response> {
     let e = model::visible_entry(&state, &owner, &name, v.user()).await?;
     let ver = model::any_version_by_label(&state, e.id, &label)
@@ -978,7 +1057,22 @@ pub async fn download(
         .filter(|ver| ver.approved() || e.manageable_by(v.user()))
         .ok_or(AppError::NotFound)?;
     let (body, filename) = match (e.kind.as_str(), file.as_str()) {
-        ("sim", "download.sim") => (sim_file(&state, ver.id).await?.0, format!("{name}-{label}.sim")),
+        ("sim", "download.sim") => {
+            let sim = q.sim.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let multi = model::multi_sim(&state, e.id).await?;
+            match (multi, sim) {
+                (true, Some(s)) => (sim_file(&state, ver.id, s).await?.content, format!("{name}-{s}-{label}.sim")),
+                (false, None) => (sim_file(&state, ver.id, "").await?.content, format!("{name}-{label}.sim")),
+                (true, None) => {
+                    return Err(AppError::bad(format!(
+                        "{} holds several sims; add ?sim= naming one: {}",
+                        e.slug(),
+                        model::sim_names(&state, ver.id).await?.join(", ")
+                    )));
+                }
+                (false, Some(_)) => return Err(AppError::NotFound),
+            }
+        }
         ("stack", "download.th") => {
             let f = stacks::frozen_of(&state, &ver).await?;
             (f.thornlist.text, format!("{name}-{}.th", label.replace(':', "-")))
@@ -1052,7 +1146,7 @@ async fn compare_side(
             .map(|t| if t.is_empty() { "default".to_owned() } else { t.clone() })
             .collect::<Vec<_>>()
             .join(", "),
-        contact: model::entry_contact(state, &e, repo.as_deref()).await?.unwrap_or_default(),
+        contact: model::entry_contact(state, &e, repo.as_deref(), None).await?.unwrap_or_default(),
         repo: repo.unwrap_or_default(),
         claims: match current {
             Some(v) => claims_of(state, v.id).await?,

@@ -95,6 +95,7 @@ pub async fn new_repo_page(State(state): State<AppState>, s: SignedIn) -> AppRes
     Ok(page(&NewRepoPage {
         ctx: PageCtx::new(&state, Some(&s.session)),
         url: String::new(),
+        tag: String::new(),
         error: None,
     })?
     .into_response())
@@ -106,6 +107,9 @@ pub struct RepoForm {
     /// Admins only: the namespace to publish under, if not their own.
     #[serde(default)]
     owner: Option<String>,
+    /// Read the manifests at exactly this tag, instead of each kind's newest.
+    #[serde(default)]
+    tag: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -118,15 +122,16 @@ pub async fn new_repo(
 ) -> AppResult<Response> {
     s.session.check_csrf(&f.csrf)?;
     state.limiter.check("register", ip.0, 10)?;
-    match tracker::register(&state, &s.user, &f.url, f.owner.as_deref()).await {
-        Ok(entries) => {
-            Ok(Redirect::to(&entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into()))
+    match tracker::register(&state, &s.user, &f.url, f.owner.as_deref(), f.tag.as_deref()).await {
+        Ok(done) => {
+            Ok(Redirect::to(&done.entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into()))
                 .into_response())
         }
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m)) => {
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
             Ok(page(&NewRepoPage {
                 ctx: PageCtx::new(&state, Some(&s.session)),
                 url: f.url,
+                tag: f.tag.unwrap_or_default(),
                 error: Some(m),
             })?
             .into_response())

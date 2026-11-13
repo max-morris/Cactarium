@@ -2,6 +2,10 @@
 //!
 //! Each tracked repo has its own secret. GitHub and Bitbucket sign the body (HMAC-SHA256 in
 //! `X-Hub-Signature-256` / `X-Hub-Signature`); GitLab sends the secret itself in `X-Gitlab-Token`.
+//!
+//! A repo can carry several entries (a package, a stack, sims), each with its own hook URL and
+//! secret. One verified delivery syncs them all: a tag one kind pushes may be another's release
+//! too, so a single hook on the repo is enough.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -47,7 +51,16 @@ pub async fn receive(
     if h("x-github-event") == Some("ping") {
         return Ok(StatusCode::NO_CONTENT);
     }
-    tracker::sync_soon(state, entry_id);
+    // Every entry on the same repo (compared normalized), this one first.
+    let mut ids = vec![entry_id];
+    for (e, _) in tracker::entries_on(&state, &repo.url).await? {
+        if !ids.contains(&e.id) {
+            ids.push(e.id);
+        }
+    }
+    for id in ids {
+        tracker::sync_soon(state.clone(), id);
+    }
     Ok(StatusCode::ACCEPTED)
 }
 

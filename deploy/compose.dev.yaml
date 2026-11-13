@@ -6,6 +6,10 @@ services:
       CACTARIUM_DEV_LOGIN: "1"
       CACTARIUM_ALLOW_LOCAL_REPOS: "1"
       CACTARIUM_POLL_SECONDS: "60"
+      # Small, so the smoke test sees examining a repo's tags (and reading manifests that need a
+      # checkout) take several syncs.
+      CACTARIUM_EXAMINE_PER_SYNC: "25"
+      CACTARIUM_CHECKOUTS_PER_SYNC: "1"
       CACTARIUM_SUPERADMIN: ${CACTARIUM_SUPERADMIN:-dev:max}
     volumes:
       # The demo repos sit at the same absolute path inside and outside the container, so their

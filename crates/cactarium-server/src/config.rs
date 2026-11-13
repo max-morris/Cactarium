@@ -30,6 +30,13 @@ pub struct Config {
     pub trust_proxy: bool,
     /// Seconds between polls of every tracked repo for new tags.
     pub poll_interval: u64,
+    /// At most this many new tags of a repo entry are examined (their manifests read) per sync;
+    /// later syncs continue (`CACTARIUM_EXAMINE_PER_SYNC`, default 300).
+    pub examine_per_sync: usize,
+    /// At most this many of those tags are read from a checkout per sync (a manifest that is a
+    /// symbolic link, or a host that refuses files by id); the rest wait for later syncs
+    /// (`CACTARIUM_CHECKOUTS_PER_SYNC`, default 40).
+    pub checkouts_per_sync: usize,
     /// Where the static files are.
     pub static_dir: String,
     /// The base URL of CactUp's own documentation (its CLI and the `.sim` format), which the
@@ -94,6 +101,8 @@ impl Config {
                 .map(|s| s.parse())
                 .transpose()?
                 .unwrap_or(4 * 3600),
+            examine_per_sync: var("CACTARIUM_EXAMINE_PER_SYNC").map(|s| s.parse()).transpose()?.unwrap_or(300).max(1),
+            checkouts_per_sync: var("CACTARIUM_CHECKOUTS_PER_SYNC").map(|s| s.parse()).transpose()?.unwrap_or(40).max(1),
             static_dir: var("CACTARIUM_STATIC_DIR").unwrap_or_else(|| "static".into()),
             cactup_docs_url: var("CACTUP_DOCS_URL")
                 .unwrap_or_else(|| DEFAULT_CACTUP_DOCS_URL.into())

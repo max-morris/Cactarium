@@ -27,10 +27,23 @@
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
       <span class="muted">Repo <span class="mono">{{ e.repo_url }}</span></span>
       <label class="sr-only" for="nu{{ e.id }}">New repo URL</label><input id="nu{{ e.id }}" name="new_url" class="mono" placeholder="new URL, e.g. after a GitHub transfer">
-      <button class="button small ghost" name="action" value="move-repo" title="Only if the new URL holds the same tags at the same commits">Move repo</button>
+      <button class="button small ghost" name="action" value="move-repo" title="Moves every entry on this repo, only if the new URL holds each one's tags at the same commits">Move repo</button>
+    </form>
+    <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap small">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label class="sr-only" for="rt{{ e.id }}">Tag not read as a version</label><input id="rt{{ e.id }}" name="tag" class="small-input mono" placeholder="tag not a version">
+      <button class="button small ghost" name="action" value="reexamine-tag" title="Forget why a tag was found not to be a version of this entry, and examine it again under the rules as they are now">Examine tag again</button>
+    </form>
+    {% if !e.curated %}
+    <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap small">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <span class="muted">{{ e.tag_rule }}</span>
+      <label class="sr-only" for="rv{{ e.id }}">Invalid version</label><input id="rv{{ e.id }}" name="version" class="small-input mono" placeholder="invalid version">
+      <button class="button small ghost" name="action" value="reread-version" title="Read an invalid version again at its frozen commit: valid if it reads cleanly now, removed if its tag isn't this entry's">Re-read invalid version</button>
     </form>
     {% endif %}
-    {% if !e.versions.is_empty() %}<p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span>{% if v.yanked %} (yanked){% endif %}{% if v.pending %} (awaiting review){% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+    {% endif %}
+    {% if !e.versions.is_empty() %}<p class="small muted">{% for v in e.versions %}<span class="mono">{{ v.label }}</span>{% if v.yanked %} (yanked){% endif %}{% if v.pending %} (awaiting review){% endif %}{% if v.status.contains("invalid") %} (invalid){% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
   </div>
   {% else %}<p class="muted">No entries.</p>{% endfor %}
 </section>
