@@ -1411,6 +1411,20 @@ check("re-read invalid version reads it from the other tag naming 1.0.0", ok and
 s, r, _ = resolve("max/rebare@1.0.0")
 check("and 1.0.0 is now the real release", s == 200 and r.get("tag") == "v1.0.0", r)
 
+# --- Under a pattern, the spelling it writes wins even without a manifest there; the release in
+# another spelling of that version is reached by re-reading the invalid version.
+RP = new_tree("relpat")
+write(RP, "README", "old\n")
+commit_tag(RP, "old", "rel-1.0")
+thorn_at(RP, "RpArr")
+write(RP, "cactarium.toml", package_toml("relpat", "RpArr", 'tag-pattern = "rel-{major}.{minor}"\n'))
+commit_tag(RP, "release", "rel-1.00", "rel-1.1")
+publish_tree(RP, "relpat")
+cli("register", "max", REPOS + "/relpat.git")
+check("rel-1.0, the pattern's own spelling, is read for 1.0.0 (invalid: no manifest there)", "no cactarium.toml" in versions_of("max/relpat"))
+ok, out = cli("reread", "max", "max/relpat", "1.0.0")
+check("re-read invalid version reads 1.0.0 from rel-1.00", ok and "from rel-1.00" in out, out[-300:])
+
 # --- The seeded multi-sim entry, registered with --tag beside its package.
 page(anon, "/max/bbh-demo-sims", contains="Sims in this version")
 page(anon, "/max/bbh-demo-sims/1.0.0?sim=tov&tab=thornlist", contains="BBHDemoArr/BBHDemo")
