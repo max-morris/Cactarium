@@ -1053,6 +1053,15 @@ s, r, _ = resolve_q("max/invmove@1.1.0")
 check("and is never served, even asked for exactly", s == 400, r)
 s, r, _ = resolve_q("max/invmove@^1")
 check("ranges skip it", s == 200 and r.get("slug") == "max/invmove@1.0.0", r)
+# A second tag naming a version the entry already has (bare 1.0.0 beside v1.0.0) is skipped; it
+# doesn't stop the sync with a collision.
+open(os.path.join(ib, "README"), "w").write("dup\n")
+retag(ib, ibare, "1.0.0")
+retag(ib, ibare, "v1.2.0")
+ok, out = cli_sync("max/invmove")
+check("a tag naming a version the entry has is skipped, and later tags are still read",
+      ok and has_version(anon, "max/invmove", "1.2.0"), out[-300:])
+
 
 # A package's @head and @master: its default branch's tip, read now; unpinned, and refused for an
 # untrusted package unless the site allows untrusted tips.
