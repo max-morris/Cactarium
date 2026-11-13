@@ -1384,6 +1384,16 @@ async fn sync_inner(
     .await?;
     let by_tag: BTreeMap<&str, &Known> =
         known.iter().filter_map(|k| k.tag.as_deref().map(|t| (t, k))).collect();
+    // Versions the entry has, by label, whatever tag froze them: another tag naming one of them (a
+    // bare 1.0.0 beside v1.0.0) is no new version, and would only collide.
+    let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
+    )
+    .bind(entry.id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
 
     for k in &known {
         let (Some(tag), Some(frozen)) = (&k.tag, &k.commit) else { continue };
@@ -1432,7 +1442,9 @@ async fn sync_inner(
     let mut unfetched: Vec<String> = Vec::new();
     let candidates: Vec<(RemoteRef, TrackedVersion)> = version_tags(refs, &TagRule::of(repo)?)
         .into_iter()
-        .filter(|(r, _)| !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit))
+        .filter(|(r, tv)| {
+            !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) && !have.contains(&tv.to_string())
+        })
         .collect();
     let (retry, fresh): (Vec<_>, Vec<_>) =
         candidates.into_iter().partition(|(r, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
