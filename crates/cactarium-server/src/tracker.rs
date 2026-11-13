@@ -30,6 +30,17 @@ use crate::state::AppState;
 
 /// At most this many tags are ingested per sync; the rest follow on later polls.
 const MAX_NEW_PER_SYNC: usize = 50;
+/// At most this many waiting tags (left unread earlier) are tried again per sync, after the new ones.
+const MAX_WAITING_PER_SYNC: usize = 10;
+
+/// Whether a sync honors waiting tags' backoff. The poller does; a sync someone asked for (the
+/// button, the API, the command line, a registration) tries the waiting tags now, still at most
+/// [`MAX_WAITING_PER_SYNC`] of them.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Pace {
+    Now,
+    Background,
+}
 
 fn policy(state: &AppState) -> GitPolicy {
     GitPolicy { allow_local: state.cfg.allow_local_repos }
@@ -292,7 +303,7 @@ pub async fn register(
     for e in &entries {
         // A tag whose commit can't be fetched right now stays unread (kept as the repo's poll
         // error); the poller tries it again.
-        match sync_as(state, e, Some(user)).await {
+        match sync_as(state, e, Some(user), Pace::Now).await {
             Ok(_) | Err(AppError::Upstream(_)) => {}
             Err(err) => return Err(err),
         }
@@ -328,7 +339,7 @@ pub async fn register_curated(
     attach_repo(state, &entry, &url, PACKAGE_FILE, Some(overlay), &TagRule::of_manifest(&m)).await?;
     // The admin vouches for the tags that exist now; later upstream tags are reviewed unless the
     // entry or its owner is trusted. A failure is kept as the repo's poll error.
-    let _ = sync_as(state, &entry, Some(admin)).await;
+    let _ = sync_as(state, &entry, Some(admin), Pace::Now).await;
     Ok(entry)
 }
 
@@ -388,7 +399,7 @@ pub async fn update_curated(
     )
     .await?;
     tx.commit().await?;
-    sync_as(state, entry, Some(admin)).await
+    sync_as(state, entry, Some(admin), Pace::Now).await
 }
 
 /// Admin-only: a curated package whose repo now carries its own cactarium.toml (on its default
@@ -666,7 +677,7 @@ struct Known {
 /// Brings an entry up to date with its repo's tags. Returns how many versions were added. A new
 /// tag is reviewed unless the entry or its owner is trusted (see `publish::release_review`).
 pub async fn sync(state: &AppState, entry: &Entry) -> AppResult<usize> {
-    sync_as(state, entry, None).await
+    sync_as(state, entry, None, Pace::Now).await
 }
 
 /// Syncs of one entry run one at a time: two at once would both see a tag as new and race to
@@ -711,7 +722,7 @@ pub fn sync_soon(state: AppState, entry_id: i64) {
 /// [`sync`] within [`SYNC_BUDGET`]; a sync stopped for time is recorded as the repo's poll error.
 async fn budgeted_sync(state: &AppState, entry_id: i64) -> AppResult<usize> {
     let entry = model::entry_by_id(state, entry_id).await?;
-    match tokio::time::timeout(SYNC_BUDGET, sync(state, &entry)).await {
+    match tokio::time::timeout(SYNC_BUDGET, sync_as(state, &entry, None, Pace::Background)).await {
         Ok(r) => r,
         Err(_) => {
             let why = format!("reading the repo took over {} minutes and was stopped", SYNC_BUDGET.as_secs() / 60);
@@ -726,7 +737,7 @@ async fn budgeted_sync(state: &AppState, entry_id: i64) -> AppResult<usize> {
 }
 
 /// `sync`, with the tags found counted as published by `actor` (the user registering the repo).
-async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppResult<usize> {
+async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>, pace: Pace) -> AppResult<usize> {
     let lock = entry_sync_lock(entry.id);
     let _one_at_a_time = lock.lock().await;
     let Some(repo) = repo_of(state, entry.id).await? else { return Ok(0) };
@@ -744,7 +755,7 @@ async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>) -> AppRe
             .await?;
         return Ok(0);
     }
-    let result = sync_inner(state, entry, &repo, actor).await;
+    let result = sync_inner(state, entry, &repo, actor, pace).await;
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
         .bind(entry.id)
@@ -759,6 +770,7 @@ async fn sync_inner(
     entry: &Entry,
     repo: &RepoRow,
     actor: Option<&User>,
+    pace: Pace,
 ) -> AppResult<usize> {
     let refs = git::ls_tags(policy(state), &repo.url).await.map_err(AppError::bad)?;
     let remote: BTreeMap<String, String> =
@@ -809,22 +821,51 @@ async fn sync_inner(
         BTreeMap::new()
     };
 
+    // Tags left unread earlier (waiting_tags): tried again after the new ones, with backoff.
+    let waiting = waiting_of(state, entry.id, &remote).await?;
     let mut added = 0;
-    // Tags whose commits couldn't be fetched this time: left unread, so the next sync tries again.
-    // They don't count toward MAX_NEW_PER_SYNC, so tags waiting can't hold up newer ones.
+    // Tags that couldn't be read this time: left unread, so a later sync tries again. They don't
+    // count toward MAX_NEW_PER_SYNC, so tags waiting can't hold up newer ones.
     let mut unfetched: Vec<String> = Vec::new();
-    for (r, tv) in version_tags(refs, &TagRule::of(repo)?) {
-        if by_tag.contains_key(r.name.as_str()) || foreign.get(&r.name) == Some(&r.commit) {
-            continue;
-        }
+    let candidates: Vec<(RemoteRef, TrackedVersion)> = version_tags(refs, &TagRule::of(repo)?)
+        .into_iter()
+        .filter(|(r, _)| !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit))
+        .collect();
+    let (retry, fresh): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|(r, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
+    for (r, tv) in &fresh {
         if added == MAX_NEW_PER_SYNC {
             break;
         }
-        match ingest(state, entry, repo, &r, &tv, actor).await {
-            Ok(()) => added += 1,
-            Err(AppError::Upstream(why)) => unfetched.push(why),
+        match ingest(state, entry, repo, r, tv, actor).await {
+            Ok(()) => {
+                added += 1;
+                // A tag that waited at another commit and moved since.
+                done_waiting(state, entry.id, &r.name).await?;
+            }
+            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await?),
             Err(e) => return Err(e),
         }
+    }
+    let (mut tried, mut later) = (0, 0);
+    for (r, tv) in &retry {
+        let w = &waiting[&r.name];
+        if tried == MAX_WAITING_PER_SYNC || (pace == Pace::Background && w.next_try_at > time::OffsetDateTime::now_utc()) {
+            later += 1;
+            continue;
+        }
+        tried += 1;
+        match ingest(state, entry, repo, r, tv, actor).await {
+            Ok(()) => {
+                added += 1;
+                done_waiting(state, entry.id, &r.name).await?;
+            }
+            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await?),
+            Err(e) => return Err(e),
+        }
+    }
+    if later > 0 {
+        unfetched.push(format!("{later} more waiting tag(s) not tried this time (each backs off, up to 6 hours apart)"));
     }
     if added > 0 {
         publish::touch(state, entry.id).await?;
@@ -856,6 +897,65 @@ async fn sync_inner(
         )));
     }
     Ok(added)
+}
+
+/// A tag left unread: when it was last judged, and when the poller may try it again.
+struct Waiting {
+    commit: String,
+    next_try_at: time::OffsetDateTime,
+}
+
+/// The entry's waiting tags, forgetting those deleted upstream.
+async fn waiting_of(state: &AppState, entry_id: i64, remote: &BTreeMap<String, String>) -> AppResult<BTreeMap<String, Waiting>> {
+    let rows: Vec<(String, String, time::OffsetDateTime)> =
+        sqlx::query_as("SELECT tag, commit, next_try_at FROM waiting_tags WHERE entry_id = $1")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?;
+    let gone: Vec<&str> = rows.iter().filter(|(t, _, _)| !remote.contains_key(t)).map(|(t, _, _)| t.as_str()).collect();
+    if !gone.is_empty() {
+        sqlx::query("DELETE FROM waiting_tags WHERE entry_id = $1 AND tag = ANY($2)")
+            .bind(entry_id)
+            .bind(&gone)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|(t, _, _)| remote.contains_key(t))
+        .map(|(t, commit, next_try_at)| (t, Waiting { commit, next_try_at }))
+        .collect())
+}
+
+/// Records that a tag is still waiting: its retry backs off exponentially (5 minutes, doubling, at
+/// most 6 hours apart), starting over when the tag moves. Returns `why` with the next try's time.
+async fn wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: String) -> AppResult<String> {
+    let next: time::OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO waiting_tags (entry_id, tag, commit, tries, reason, next_try_at)
+         VALUES ($1, $2, $3, 1, $4, now() + interval '5 minutes')
+         ON CONFLICT (entry_id, tag) DO UPDATE SET
+           tries = CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN waiting_tags.tries + 1 ELSE 1 END,
+           commit = EXCLUDED.commit, reason = EXCLUDED.reason,
+           next_try_at = now() + LEAST(interval '6 hours', interval '5 minutes' *
+             power(2, CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN waiting_tags.tries ELSE 0 END))
+         RETURNING next_try_at",
+    )
+    .bind(entry.id)
+    .bind(&r.name)
+    .bind(&r.commit)
+    .bind(&why)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(format!("{why} (next automatic try after {})", model::fmt_time(next)))
+}
+
+async fn done_waiting(state: &AppState, entry_id: i64, tag: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM waiting_tags WHERE entry_id = $1 AND tag = $2")
+        .bind(entry_id)
+        .bind(tag)
+        .execute(&state.db)
+        .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

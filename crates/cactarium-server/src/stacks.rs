@@ -29,6 +29,15 @@ use crate::git::{self, GitPolicy};
 use crate::model::{self, Version};
 use crate::state::AppState;
 
+/// For someone publishing or asking now (a form, an upload, a tip): what a tag would wait for is
+/// simply what stops this request, an error to show rather than a 502.
+pub fn for_a_person(e: AppError) -> AppError {
+    match e {
+        AppError::Upstream(m) => AppError::BadRequest(m),
+        other => other,
+    }
+}
+
 /// Remote lookups run at once while resolving one stack.
 const LOOKUPS_AT_ONCE: usize = 8;
 
@@ -41,17 +50,20 @@ pub struct RepoMove {
 }
 
 /// Loads a base stack's release. Only public stacks, or the extending stack owner's own, can be
-/// bases; anything else is reported exactly like a release that does not exist. The message is the
-/// same either way, but a stack entry that exists and isn't usable yet (awaiting review, or the
-/// release not read yet) is [`AppError::Upstream`], so a tag that needs it waits instead of
-/// freezing invalid; no stack of that name at all is a fact.
+/// bases; anything else is reported exactly like a release that does not exist. Whatever may still
+/// become available (no stack of that name yet, one awaiting review, the release not read yet) is
+/// [`AppError::Upstream`], so a tag that needs it waits instead of freezing invalid; interactive
+/// callers turn it into an error ([`for_a_person`]). An entry of that name that is no stack is a
+/// fact.
 pub async fn load_release(state: &AppState, owner: &str, slug: &Slug) -> AppResult<FrozenStack> {
     let msg = format!("base stack release '{slug}' is not available");
     let exact = slug.exact().map_err(|_| AppError::bad(&msg))?;
-    let found = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
-        .await?
-        .filter(|e| e.kind == "stack");
-    let Some(entry) = found else { return Err(AppError::bad(&msg)) };
+    let Some(entry) = model::find_entry(state, slug.owner.as_str(), slug.name.as_str()).await? else {
+        return Err(AppError::Upstream(msg));
+    };
+    if entry.kind != "stack" {
+        return Err(AppError::bad(msg));
+    }
     if !(entry.visibility == "public" || (entry.owner == owner && entry.visibility != "hidden")) {
         return Err(AppError::Upstream(msg));
     }
@@ -327,12 +339,10 @@ pub async fn resolve(
     }
     while let Some(done) = set.join_next().await {
         let (i, result) = done.map_err(anyhow::Error::from)?;
-        // A ref the repo says it doesn't have is a fact about the definition; a repo that couldn't
-        // be read (the network, the host) is not, and a tag read now is tried again later.
-        let result = result.map_err(|e| {
-            let why = format!("repo '{}': {e:#}", pins[i].name);
-            if e.downcast_ref::<git::Missing>().is_some() { AppError::bad(why) } else { AppError::Upstream(why) }
-        });
+        // A repo that couldn't be read (the network, the host), or a ref it doesn't have yet (a tag
+        // pushed a moment after this one), may change without a new commit of this stack: a tag
+        // read now waits. Interactive callers turn it into an error ([`for_a_person`]).
+        let result = result.map_err(|e| AppError::Upstream(format!("repo '{}': {e:#}", pins[i].name)));
         match result? {
             Found::Commit(c) => pins[i].commit = Some(c),
             Found::Base(b) => {
@@ -458,10 +468,13 @@ fn check_collisions(components: &[Component]) -> AppResult<()> {
 /// `owner/pkg@range` → (repo url, tag, frozen commit) of the best matching usable version.
 pub async fn resolve_package(state: &AppState, slug: &Slug) -> AppResult<(String, String, String)> {
     let req: TrackedReq = slug.req().map_err(AppError::bad)?;
+    // No such package yet may change (registered a moment after this tag); another kind won't.
     let entry = model::find_entry(state, slug.owner.as_str(), slug.name.as_str())
         .await?
-        .filter(|e| e.kind == "package")
-        .ok_or_else(|| AppError::bad(format!("package '{}' does not exist", slug.entry())))?;
+        .ok_or_else(|| AppError::Upstream(format!("package '{}' does not exist (yet)", slug.entry())))?;
+    if entry.kind != "package" {
+        return Err(AppError::bad(format!("'{}' is a {}, not a package", slug.entry(), entry.kind)));
+    }
     // A package that exists but isn't public yet, or has no matching version yet, may become
     // usable without a new commit of this stack: a tag that needs it waits.
     if entry.visibility != "public" {
