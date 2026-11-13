@@ -696,7 +696,7 @@ pub async fn stack_release(
         let (definition, own) = current_definition(&state, &e).await?;
         let m = Manifest::from_toml(&definition).map_err(AppError::bad)?;
         let section = m.stack.ok_or_else(|| AppError::bad("the stack definition has no [stack]"))?;
-        let r = stacks::resolve(&state, &e.owner, &section, own.as_deref(), Some(tip)).await?;
+        let r = stacks::resolve(&state, &e.owner, &section, own.as_deref(), Some(tip)).await.map_err(stacks::for_a_person)?;
         Ok::<_, ApiError>(std::sync::Arc::new(FrozenStack {
             format: 1,
             stack: format!("{}@{version}", e.slug()).parse().map_err(AppError::bad)?,

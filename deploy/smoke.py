@@ -1368,6 +1368,86 @@ ok, out = cli_sync("max/flakystack")
 check("once the source answers, the stack tag becomes a valid release",
       ok and has_version(anon, "max/flakystack", "1.1.0") and "invalid" not in versions_page(maxv, "max/flakystack"), out[-400:])
 
+# Waiting tags back off and are tried a few at a time: a dozen tags waiting on the same source.
+os.rename(depbare, depbare + ".away")
+for i in range(1, 13):
+    retag(stk, stkbare, f"v1.2.{i}")
+ok, out = cli_sync("max/flakystack")
+check("new tags that can't be read wait, each with its next automatic try",
+      not ok and "next automatic try after" in out and not has_version(maxv, "max/flakystack", "1.2.1"), out[-300:])
+ok, out = cli_sync("max/flakystack")
+check("waiting tags are tried again at most ten per sync", not ok and "2 more waiting tag(s) not tried this time" in out, out[-300:])
+os.rename(depbare + ".away", depbare)
+cli_sync("max/flakystack")
+cli_sync("max/flakystack")
+check("once the source answers they are all read, ten at a time",
+      has_version(anon, "max/flakystack", "1.2.1") and has_version(anon, "max/flakystack", "1.2.12"))
+
+# A stack pinning a tag of a source repo that is pushed a moment after the stack's own tag waits.
+sh("git", "tag", "d-1", cwd=dep); sh("git", "push", "-q", depbare, "--tags", cwd=dep)
+pst = os.path.join(work, "pinstack")
+os.makedirs(pst)
+open(os.path.join(pst, "s.th"), "w").write(open(os.path.join(stk, "s.th")).read())
+pst_toml = lambda t: f'format = 1\n\n[stack]\nname = "pinstack"\nowners = ["max"]\nthornlist = "s.th"\n\n[[stack.pin]]\nname = "depsrc"\ntag = "{t}"\n'
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-1"))
+sh("git", "init", "-q", "-b", "master", cwd=pst)
+sh("git", "add", "-A", cwd=pst); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=pst); sh("git", "tag", "v1.0.0", cwd=pst)
+pstbare = ENV["DEMO_REPOS"] + "/pinstack.git"
+subprocess.run(["rm", "-rf", pstbare], check=True)
+sh("git", "clone", "-q", "--bare", pst, pstbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/pinstack.git"], capture_output=True, text=True)
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-2"))
+retag(pst, pstbare, "v1.1.0")
+ok, out = cli_sync("max/pinstack")
+check("a stack pinning a source tag that isn't pushed yet waits", not ok and "d-2" in out and not has_version(maxv, "max/pinstack", "1.1.0"), out[-300:])
+open(os.path.join(dep, "README"), "w").write("2\n")
+sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "d-2", cwd=dep); sh("git", "tag", "d-2", cwd=dep)
+sh("git", "push", "-q", depbare, "master", "--tags", cwd=dep)
+ok, out = cli_sync("max/pinstack")
+check("and is read once the tag is there", ok and has_version(anon, "max/pinstack", "1.1.0"), out[-300:])
+
+# A stack override naming a package registered a moment after the stack's tag waits.
+ovp = os.path.join(work, "ovpkg")
+os.makedirs(os.path.join(ovp, "OvArr", "OvThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: OvThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(ovp, "OvArr", "OvThorn", f), "w").write(t)
+open(os.path.join(ovp, "cactarium.toml"), "w").write('format = 1\n\n[package]\nname = "ovpkg"\nowners = ["max"]\ndescription = "x"\n')
+sh("git", "init", "-q", "-b", "master", cwd=ovp)
+sh("git", "add", "-A", cwd=ovp); sh("git", *ident, "commit", "-q", "-m", "ovpkg", cwd=ovp); sh("git", "tag", "v1.0.0", cwd=ovp)
+ovbare = ENV["DEMO_REPOS"] + "/ovpkg.git"
+subprocess.run(["rm", "-rf", ovbare], check=True)
+sh("git", "clone", "-q", "--bare", ovp, ovbare, cwd=work)
+ovs = os.path.join(work, "ovstack")
+os.makedirs(ovs)
+open(os.path.join(ovs, "s.th"), "w").write(
+    f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {REPOS}/ovpkg.git\n!REPO_PATH = $1/$2\n!CHECKOUT =\nOvArr/OvThorn\n")
+ovs_toml = 'format = 1\n\n[stack]\nname = "ovstack"\nowners = ["max"]\nthornlist = "s.th"\n'
+open(os.path.join(ovs, "cactarium-stack.toml"), "w").write(ovs_toml)
+sh("git", "init", "-q", "-b", "master", cwd=ovs)
+sh("git", "add", "-A", cwd=ovs); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=ovs); sh("git", "tag", "v1.0.0", cwd=ovs)
+ovsbare = ENV["DEMO_REPOS"] + "/ovstack.git"
+subprocess.run(["rm", "-rf", ovsbare], check=True)
+sh("git", "clone", "-q", "--bare", ovs, ovsbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/ovstack.git"], capture_output=True, text=True)
+ovt = os.path.join(work, "ovtop")
+os.makedirs(ovt)
+ovt_toml = 'format = 1\n\n[stack]\nname = "ovtop"\nowners = ["max"]\nextends = ["max/ovstack@1.0.0"]\n'
+open(os.path.join(ovt, "cactarium-stack.toml"), "w").write(ovt_toml)
+sh("git", "init", "-q", "-b", "master", cwd=ovt)
+sh("git", "add", "-A", cwd=ovt); sh("git", *ident, "commit", "-q", "-m", "1.0", cwd=ovt); sh("git", "tag", "v1.0.0", cwd=ovt)
+ovtbare = ENV["DEMO_REPOS"] + "/ovtop.git"
+subprocess.run(["rm", "-rf", ovtbare], check=True)
+sh("git", "clone", "-q", "--bare", ovt, ovtbare, cwd=work)
+run = subprocess.run(["just", "cli", "register", "max", REPOS + "/ovtop.git"], capture_output=True, text=True)
+check("register a stack extending another", run.returncode == 0 and has_version(anon, "max/ovtop", "1.0.0"), run.stdout + run.stderr[-300:])
+open(os.path.join(ovt, "cactarium-stack.toml"), "w").write(ovt_toml + '\n[[stack.override]]\nrepo = "ovpkg"\npackage = "max/ovpkg@1"\n')
+retag(ovt, ovtbare, "v1.1.0")
+ok, out = cli_sync("max/ovtop")
+check("a stack override naming a package not registered yet waits", not ok and "max/ovpkg" in out and not has_version(maxv, "max/ovtop", "1.1.0"), out[-300:])
+subprocess.run(["just", "cli", "register", "max", REPOS + "/ovpkg.git"], capture_output=True, text=True)
+ok, out = cli_sync("max/ovtop")
+check("and is read once the package is", ok and has_version(anon, "max/ovtop", "1.1.0") and "invalid" not in versions_page(maxv, "max/ovtop"), out[-300:])
+
 # An invalid version whose tag moves stays invalid, and is never served.
 ib = os.path.join(work, "invmove")
 os.makedirs(os.path.join(ib, "InvArr", "InvThorn"))
