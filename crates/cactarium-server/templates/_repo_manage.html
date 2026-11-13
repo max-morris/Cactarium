@@ -5,24 +5,14 @@
     <button class="button small ghost" type="submit">Check for new tags now</button>
   </form>
   {% if !r.poll_error.is_empty() %}<p class="alert warn small">Last check failed: {{ r.poll_error }}</p>{% endif %}
-  {% if !r.tag_rule.is_empty() %}<p class="small muted">Versions come from {{ r.tag_rule }}.</p>{% endif %}
+  {% if !r.tag_rule.is_empty() %}<p class="small muted">{% if r.curated %}Versions come from {{ r.tag_rule }} (its curated manifest's rule).{% else %}Follows {{ r.tag_rule }}, as its newest version's manifest says. Each tag is read by the manifest in its own commit, so a manifest change applies from the tags that carry it on (<a href="/docs/publishing#tags">how</a>).{% endif %}</p>{% endif %}
   {% if !r.foreign.is_empty() %}
-  <details><summary class="small">Tags that aren't this entry's ({{ r.foreign.len() }})</summary>
-    <p class="small muted">Its tag rule picks these, but they aren't its releases, so they are left alone (and judged again if they move):</p>
+  <details><summary class="small">Tags not read as versions ({{ r.foreign.len() }})</summary>
+    <p class="small muted">Each was examined and found not to be a version of this entry, with the reason; a tag that moves is examined again:</p>
     <ul class="small">{% for f in r.foreign %}<li><span class="mono">{{ f.0 }}</span>: {{ f.1 }}</li>{% endfor %}</ul>
   </details>
   {% endif %}
   {% if !r.siblings.is_empty() %}<p class="small muted">Also on this repo: {% for s in r.siblings %}<a class="mono" href="/{{ s }}">{{ s }}</a>{% if !loop.last %}, {% endif %}{% endfor %}. A webhook on any of them checks them all.</p>{% endif %}
-  {% if r.can_reread %}
-  <details><summary class="small">Switch tag schemes</summary>
-    <form class="stack-sm" method="post" action="{{ r.entry_url }}/tag-rule">
-      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
-      <p class="small">A new tag never changes which tags this entry follows. After adding, changing or removing <span class="mono">tag-pattern</span> in its manifest, re-read the rule from the default branch, or from a tag that has the new manifest. See <a href="/docs/publishing#switching">switching schemes</a>.</p>
-      <label class="sr-only" for="rule-tag">Tag</label><input id="rule-tag" name="tag" class="mono" placeholder="tag (default: the default branch)">
-      <button class="button small ghost" type="submit">Re-read tag rule</button>
-    </form>
-  </details>
-  {% endif %}
   <details><summary class="small">Webhook for instant updates</summary>
     <p class="small">Secret: <code class="mono">{{ r.secret }}</code></p>
     <p class="small"><strong>GitHub</strong> (Settings › Webhooks; content type application/json; "Just the push event"): <code class="mono">{{ r.webhook_base }}/github/{{ r.entry_id }}</code></p>

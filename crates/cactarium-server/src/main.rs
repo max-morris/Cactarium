@@ -79,16 +79,9 @@ enum Command {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Re-read an entry's tag rule from its manifest on the default branch (or at --tag), as a user
-    /// who manages it: how it switches tag schemes.
-    RereadRule {
-        username: String,
-        slug: String,
-        #[arg(long)]
-        tag: Option<String>,
-    },
     /// Re-read an invalid version of a (non-curated) repo entry at its frozen commit, as an admin:
-    /// it becomes valid if it reads cleanly now, or is removed if its tag isn't the entry's.
+    /// it becomes valid if it reads cleanly now (also from another tag of that version), or is
+    /// removed if its tag isn't a version of the entry at all.
     Reread { username: String, slug: String, version: String },
     /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
     /// as the given admin.
@@ -249,18 +242,6 @@ async fn main() -> anyhow::Result<()> {
                 println!("{l}");
             }
             anyhow::ensure!(clean, "{tag} would not be read cleanly");
-            Ok(())
-        }
-        Command::RereadRule { username, slug, tag } => {
-            let state = make_state(cfg, db)?;
-            let user = cli_user(&state, &username).await?;
-            let (owner, name) = slug.split_once('/').context("give owner/name")?;
-            let e = model::find_entry(&state, owner, name)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .context("no such entry")?;
-            let rule = tracker::reread_rule(&state, &user, &e, tag.as_deref()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("{} now follows {rule}", e.slug());
             Ok(())
         }
         Command::Reread { username, slug, version } => {

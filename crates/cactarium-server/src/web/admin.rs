@@ -457,8 +457,6 @@ pub struct EntryAction {
     new_url: Option<String>,
     /// For "reread-version": the invalid version to read again.
     version: Option<String>,
-    /// For "reread-rule": the tag to read the manifest at (default: the default branch).
-    tag: Option<String>,
     #[serde(rename = "_csrf")]
     csrf: String,
 }
@@ -514,13 +512,6 @@ pub async fn entry_action(
                 Err(AppError::BadRequest(m) | AppError::Upstream(m) | AppError::Conflict(m)) => {
                     entries_page(&state, &a, e.name.clone(), Some(m)).await
                 }
-                Err(err) => Err(err),
-            };
-        }
-        "reread-rule" => {
-            return match tracker::reread_rule(&state, &a.user, &e, f.tag.as_deref()).await {
-                Ok(rule) => entries_page(&state, &a, e.name.clone(), Some(format!("{} now follows {rule}", e.slug()))).await,
-                Err(AppError::BadRequest(m)) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
                 Err(err) => Err(err),
             };
         }

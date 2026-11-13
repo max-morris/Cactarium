@@ -419,11 +419,7 @@ async fn repo_manage(
             .fetch_optional(&state.db)
             .await?
             .flatten();
-    let rule = tracker::TagRule::of_repo(&repo)?;
-    let mut tag_rule = rule.describe();
-    if let Some(s) = rule.since() {
-        tag_rule.push_str(&format!(", from {s} on"));
-    }
+    let tag_rule = tracker::TagRule::of_repo(&repo)?.describe_with_since();
     let siblings = tracker::entries_on(state, &repo.url)
         .await?
         .into_iter()
@@ -440,8 +436,8 @@ async fn repo_manage(
         poll_error: poll_error.unwrap_or_default(),
         tag_rule,
         siblings,
+        curated: repo.overlay_manifest.is_some(),
         foreign,
-        can_reread: repo.overlay_manifest.is_none(),
         webhook_base: state.cfg.url("/hooks"),
         entry_id: entry.id,
         secret: repo.webhook_secret,

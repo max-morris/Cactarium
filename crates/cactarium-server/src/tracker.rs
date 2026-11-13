@@ -77,10 +77,6 @@ impl TagRule {
         Self::of(repo)
     }
 
-    pub fn since(&self) -> Option<&semver::Version> {
-        self.since.as_ref()
-    }
-
     fn of(repo: &RepoRow) -> AppResult<TagRule> {
         Ok(TagRule {
             pattern: repo.tag_pattern.as_deref().map(str::parse).transpose().map_err(AppError::bad)?,
@@ -106,6 +102,14 @@ impl TagRule {
             None => TrackedVersion::from_tag(tag)?,
         };
         self.since.as_ref().is_none_or(|s| tv.version >= *s).then_some(tv)
+    }
+
+    /// [`TagRule::describe`], with `since` when it has one.
+    pub fn describe_with_since(&self) -> String {
+        match &self.since {
+            Some(s) => format!("{}, from {s} on", self.describe()),
+            None => self.describe(),
+        }
     }
 
     pub fn describe(&self) -> String {
@@ -180,21 +184,6 @@ pub fn unreadable_at_tag(e: cactup_ecosystem_common::Error) -> AppError {
 }
 
 /// Keeps the repo's tag rule in step with a manifest.
-/// Moves an entry's `since` to what a new version's manifest says, only while its tag pattern is
-/// still `pattern` (the one the sync read): a re-read of the rule in between wins. Never the
-/// pattern itself, which only a re-read, a curated update or a hand-over sets.
-async fn store_since(state: &AppState, entry_id: i64, since: Option<String>, pattern: Option<&str>) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE entry_repos SET min_version = $2 WHERE entry_id = $1 AND tag_pattern IS NOT DISTINCT FROM $3 AND overlay_manifest IS NULL",
-    )
-    .bind(entry_id)
-    .bind(since)
-    .bind(pattern)
-    .execute(&state.db)
-    .await?;
-    Ok(())
-}
-
 fn version_tags(refs: Vec<RemoteRef>, rule: &TagRule) -> Vec<(RemoteRef, TrackedVersion)> {
     let mut v: Vec<_> = refs.into_iter().filter_map(|r| rule.version(&r.name).map(|t| (r, t))).collect();
     // Two tags naming one version: the one written the rule's own way wins (see `spelling_rank`),
@@ -239,37 +228,58 @@ pub enum Unread {
 }
 
 /// Whether an entry has tags in `req` that aren't read yet: waiting ones, or ones its rule picks
-/// with neither a version nor a "not this entry's" record.
+/// with neither a version nor a "not a version" record.
 pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosystem_common::version::TrackedReq) -> AppResult<Unread> {
     let Some(repo) = repo_of(state, entry_id).await? else { return Ok(Unread::No) };
-    let rule = TagRule::of(&repo)?;
-    let in_range = |tag: &str| rule.version(tag).is_some_and(|v| req.matches(&v));
-    let waiting: Vec<String> = sqlx::query_scalar("SELECT tag FROM waiting_tags WHERE entry_id = $1")
-        .bind(entry_id)
-        .fetch_all(&state.db)
-        .await?;
-    if waiting.iter().any(|t| in_range(t)) {
-        return Ok(Unread::Yes);
-    }
     let Ok(refs) = git::ls_tags(policy(state), &repo.url).await else { return Ok(Unread::CantTell) };
-    let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
-        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
-    )
-    .bind(entry_id)
-    .fetch_all(&state.db)
-    .await?
-    .into_iter()
-    .collect();
-    let has_foreign: bool = sqlx::query_scalar("SELECT to_regclass('foreign_tags') IS NOT NULL").fetch_one(&state.db).await?;
-    let foreign: std::collections::BTreeSet<String> = if has_foreign {
-        sqlx::query_scalar("SELECT tag FROM foreign_tags WHERE entry_id = $1").bind(entry_id).fetch_all(&state.db).await?.into_iter().collect()
-    } else {
-        Default::default()
-    };
-    let any = version_tags(refs, &rule)
-        .iter()
-        .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && !foreign.contains(&r.name));
-    Ok(if any { Unread::Yes } else { Unread::No })
+    let remote: BTreeMap<String, String> = refs.iter().map(|r| (r.name.clone(), r.commit.clone())).collect();
+    let by_tag: std::collections::BTreeSet<String> =
+        sqlx::query_scalar("SELECT tag FROM versions WHERE entry_id = $1 AND tag IS NOT NULL")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect();
+    let have = version_labels(state, entry_id).await?;
+    let foreign: BTreeMap<String, String> =
+        sqlx::query_as::<_, (String, String)>("SELECT tag, commit FROM foreign_tags WHERE entry_id = $1")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect();
+    if repo.overlay_manifest.is_some() {
+        // A curated entry: its overlay's rule decides which tags are versions.
+        let rule = TagRule::of(&repo)?;
+        let any = version_tags(refs, &rule)
+            .iter()
+            .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && foreign.get(&r.name) != Some(&r.commit));
+        return Ok(if any { Unread::Yes } else { Unread::No });
+    }
+    // A repo entry: a tag read as a version in range and not frozen yet, or one not examined yet (or
+    // waiting), which could be any version, counts as unread.
+    let reads: BTreeMap<String, (String, String)> =
+        sqlx::query_as::<_, (String, String, String)>("SELECT tag, commit, label FROM tag_reads WHERE entry_id = $1")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .map(|(t, c, l)| (t, (c, l)))
+            .collect();
+    for (tag, commit) in &remote {
+        if by_tag.contains(tag) || foreign.get(tag) == Some(commit) {
+            continue;
+        }
+        match reads.get(tag) {
+            Some((c, label)) if c == commit => {
+                if label.parse::<TrackedVersion>().is_ok_and(|v| req.matches(&v)) && !have.contains(label) {
+                    return Ok(Unread::Yes);
+                }
+            }
+            _ => return Ok(Unread::Yes),
+        }
+    }
+    Ok(Unread::No)
 }
 
 fn read_manifests(co: &git::Checkout, at: &str) -> AppResult<Vec<(&'static str, Manifest)>> {
@@ -779,18 +789,39 @@ pub async fn check(
     };
     for (e, _) in &existing {
         let Some(repo) = repo_of(state, e.id).await? else { continue };
-        let rule = TagRule::of(&repo)?;
-        let Some(tv) = rule.version(tag) else {
-            lines.push(format!("{}: {tag} isn't one of its tags (it follows {})", e.slug(), rule.describe()));
-            continue;
-        };
         let Some(r) = &r else { continue };
+        // What the entry would make of the tag: a curated entry by its overlay's rule; a repo entry
+        // by its own manifest at the tag's commit.
+        let tv = if repo.overlay_manifest.is_some() {
+            let rule = TagRule::of(&repo)?;
+            match rule.version(tag) {
+                Some(tv) => tv,
+                None => {
+                    lines.push(format!("{}: {tag} isn't one of its tags (it follows {})", e.slug(), rule.describe()));
+                    continue;
+                }
+            }
+        } else {
+            match examine(state, e, &repo, std::slice::from_ref(r)).await?.pop() {
+                Some(Exam::Version { tv, error: None, .. }) => tv,
+                Some(Exam::Version { tv, error: Some(err), .. }) => {
+                    clean = false;
+                    lines.push(format!("{}@{tv}: would be an invalid version: {err}", e.slug()));
+                    continue;
+                }
+                Some(Exam::Not { why, .. }) => {
+                    lines.push(format!("{}: {tag} wouldn't be read as a version: {why}", e.slug()));
+                    continue;
+                }
+                Some(Exam::Wait(why)) => {
+                    lines.push(format!("{}: {tag} would wait (left unread, tried again): {why}", e.slug()));
+                    continue;
+                }
+                None => continue,
+            }
+        };
         let via = commit.filter(|_| r.name == tag && !remote_has_tag).unwrap_or(tag);
         let co = git::checkout(policy(state), &repo.url, &r.commit, Some(via)).await.map_err(AppError::bad)?;
-        if let Some((_, why)) = foreign_reason(state, e, &repo, &co, r, &tv).await? {
-            lines.push(format!("{}: {tag} would be recorded as not its own: {why}", e.slug()));
-            continue;
-        }
         match prepare(state, e, &repo, &co, r, &tv, &PrepOpts::default()).await {
             Ok(p) => lines.push(format!("{}@{tv}: reads cleanly{}", e.slug(), sims_note(&p))),
             Err(AppError::Upstream(why)) => lines.push(format!("{}@{tv}: would wait (left unread, tried again): {why}", e.slug())),
@@ -865,7 +896,7 @@ pub async fn update_curated(
     }
     let (pattern, since) = TagRule::of_manifest(&m).stored();
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
-    // No sync of this entry runs while its rule changes (see `reread_rule`).
+    // No sync of this entry runs while its rule changes.
     let lock = entry_sync_lock(entry.id);
     let one_at_a_time = lock.lock().await;
     let current = repo_of(state, entry.id).await?.map(|r| r.url).unwrap_or_default();
@@ -898,10 +929,10 @@ pub async fn update_curated(
         None,
     )
     .await?;
-    // The rule may have changed: the repo's "not this entry's" judgments are made again.
+    // The overlay may have changed its rule: this entry's tags are examined again.
     // The entry's own judgments, and claims on the repo it now reads; the old URL's other entries
     // are left alone.
-    clear_foreign_on(&mut tx, state, entry.id, &url).await?;
+    clear_foreign_on(&mut tx, entry.id).await?;
     tx.commit().await?;
     drop(one_at_a_time);
     sync_as(state, entry, Some(admin), Pace::Now).await
@@ -911,7 +942,7 @@ pub async fn update_curated(
 /// branch, naming the entry's owner) stops using the overlay. Its name and versions stay; its tag
 /// rule becomes the repo manifest's.
 pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResult<()> {
-    // No sync of this entry runs while its rule changes (see `reread_rule`).
+    // No sync of this entry runs while its rule changes.
     let lock = entry_sync_lock(entry.id);
     let _one_at_a_time = lock.lock().await;
     let repo = repo_of(state, entry.id).await?.ok_or(AppError::NotFound)?;
@@ -957,8 +988,8 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
         .await?;
     crate::audit::audit_with(&mut tx, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
         .await?;
-    // The rule is the repo manifest's now: the repo's "not this entry's" judgments are made again.
-    clear_foreign_on(&mut tx, state, entry.id, &repo.url).await?;
+    // Its tags are read by the repo's manifests now: they are examined again.
+    clear_foreign_on(&mut tx, entry.id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1059,100 +1090,12 @@ pub async fn reapply_curated(state: &AppState, admin: &User, entry: &Entry) -> A
     Ok((done, left))
 }
 
-/// Owner or admin: re-reads an entry's tag rule from its manifest on the repo's default branch, or
-/// at a named tag, and makes it the entry's rule. This is how an entry switches tag schemes (adds,
-/// changes or drops `tag-pattern`, moves `since`): a new tag never does it on its own. At a named
-/// tag, the manifest must read that tag as one of its versions. Tags recorded as not the entry's
-/// are judged again under the new rule at the next sync, which this starts. Returns the new rule,
-/// described.
-pub async fn reread_rule(state: &AppState, user: &User, entry: &Entry, tag: Option<&str>) -> AppResult<String> {
-    if !entry.manageable_by(Some(user)) {
-        return Err(AppError::Forbidden);
-    }
-    let repo = repo_of(state, entry.id)
-        .await?
-        .ok_or_else(|| AppError::bad(format!("{} isn't released from a repo", entry.slug())))?;
-    if repo.overlay_manifest.is_some() {
-        return Err(AppError::bad(format!(
-            "{} is curated: its tag rule is its overlay manifest's; change that instead",
-            entry.slug()
-        )));
-    }
-    let tag = tag.map(str::trim).filter(|t| !t.is_empty());
-    // No sync of this entry runs meanwhile (in this process): one judging tags under the old rule
-    // could otherwise record them after the re-read cleared those records. Across processes, the
-    // records and `since` are written only under the rule they were judged by.
-    let lock = entry_sync_lock(entry.id);
-    let one_at_a_time = lock.lock().await;
-    let (commit, at) = match tag {
-        Some(t) => {
-            let c = git::resolve_tag(policy(state), &repo.url, t)
-                .await
-                .map_err(AppError::bad)?
-                .ok_or_else(|| AppError::bad(format!("the repo has no tag '{t}'")))?;
-            (c, format!("tag {t}"))
-        }
-        None => (git::resolve_ref(policy(state), &repo.url, None).await.map_err(AppError::bad)?, "the default branch".to_owned()),
-    };
-    let co = git::checkout(policy(state), &repo.url, &commit, tag).await.map_err(AppError::bad)?;
-    let text = git::read_in(&co, &repo.manifest_file)
-        .map_err(AppError::bad)?
-        .ok_or_else(|| AppError::bad(format!("there is no {} at {at}", repo.manifest_file)))?;
-    let m = Manifest::from_repo_file(&repo.manifest_file, &text).map_err(|e| AppError::bad(format!("{} at {at}: {e}", repo.manifest_file)))?;
-    if name_of(&m) != entry.name {
-        return Err(AppError::bad(format!("{} at {at} names '{}', not '{}'", repo.manifest_file, name_of(&m), entry.name)));
-    }
-    if !owners_of(&m).contains(&entry.owner) {
-        return Err(AppError::bad(format!("{} at {at} doesn't list '{}' in owners", repo.manifest_file, entry.owner)));
-    }
-    let rule = TagRule::of_manifest(&m);
-    if let Some(t) = tag
-        && rule.version(t).is_none()
-    {
-        return Err(AppError::bad(format!(
-            "{} at {t} follows {}, which {t} isn't one of: re-read it from one of its own tags",
-            repo.manifest_file,
-            rule.describe()
-        )));
-    }
-    let before = TagRule::of(&repo)?;
-    let (pattern, since) = rule.stored();
-    let mut tx = state.db.begin().await?;
-    sqlx::query("UPDATE entry_repos SET tag_pattern = $2, min_version = $3 WHERE entry_id = $1")
-        .bind(entry.id)
-        .bind(&pattern)
-        .bind(&since)
-        .execute(&mut *tx)
-        .await?;
-    clear_foreign_on(&mut tx, state, entry.id, &repo.url).await?;
-    crate::audit::audit_with(
-        &mut tx,
-        Some(user.id),
-        "repo.tag-rule",
-        Some(&entry.slug()),
-        json!({ "from": before.stored().0, "to": pattern, "since": since, "read_at": at, "commit": commit }),
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-    drop(one_at_a_time);
-    match sync(state, entry).await {
-        Ok(_) | Err(AppError::Upstream(_)) => {}
-        Err(e) => return Err(e),
-    }
-    let mut said = rule.describe();
-    if let Some(s) = &rule.since {
-        said.push_str(&format!(", from {s} on"));
-    }
-    Ok(said)
-}
-
 /// Admin-only: reads an invalid version of a repo-released (not curated) entry again, at its frozen
-/// commit, the way a new tag is read now. An invalid version was never served, so nothing depended
-/// on it (the argument of migration 0009): one that now reads cleanly becomes valid and is reviewed
-/// as a pushed tag is; one that isn't the entry's tag at all (another kind's, under the self-consistency
-/// rule or the sibling backstop) is removed and recorded as not the entry's. A version that still
-/// fails stays as it was, and the reason is returned as the error.
+/// commit, the way a new tag is read now, or from another tag its own manifest reads as exactly that
+/// version. An invalid version was never served, so nothing depended on it (the argument of
+/// migration 0009): one that now reads cleanly becomes valid and is reviewed as a pushed tag is;
+/// one whose tag is no version of the entry at all (examined per commit) is removed and recorded
+/// so. A version that still fails stays as it was, and the reason is returned as the error.
 pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label: &str) -> AppResult<String> {
     if !admin.is_admin() {
         return Err(AppError::Forbidden);
@@ -1173,36 +1116,40 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
         return Err(AppError::bad(format!("{}@{label} has no tag and commit to read", entry.slug())));
     };
     let tv: TrackedVersion = v.label().parse().map_err(AppError::bad)?;
-    // The frozen tag first; then any other tag naming exactly this version under the entry's rule
-    // (say, the real v1.0.0 beside an old bare 1.0.0 that took the version), best spelling first.
-    let rule = TagRule::of(&repo)?;
-    let mut candidates = vec![RemoteRef { name: tag.clone(), commit: commit.clone() }];
-    let others = git::ls_tags(policy(state), &repo.url)
+    // The frozen tag first; then any other tag its own manifest reads as exactly this version (say,
+    // the real v1.0.0 beside an old bare 1.0.0 that took the version), best spelling first.
+    let frozen = RemoteRef { name: tag.clone(), commit: commit.clone() };
+    let all = git::ls_tags(policy(state), &repo.url)
         .await
         .map_err(|e| AppError::Upstream(format!("cannot list the repo's tags: {e:#}")))?;
-    let mut others: Vec<RemoteRef> =
-        others.into_iter().filter(|o| o.name != tag && rule.version(&o.name).as_ref() == Some(&tv)).collect();
-    others.sort_by_key(|o| (spelling_rank(&rule, &o.name, &tv), o.name.clone()));
-    candidates.extend(others);
-    let (mut frozen_foreign, mut first_error) = (None, None);
+    let others: Vec<RemoteRef> = all.into_iter().filter(|o| o.name != tag).collect();
+    let mut tags = vec![frozen.clone()];
+    tags.extend(others);
+    let exams = examine(state, entry, &repo, &tags).await?;
+    let mut candidates: Vec<(RemoteRef, i32)> = Vec::new();
+    let mut frozen_foreign = None;
+    for (i, (r, exam)) in tags.iter().zip(exams).enumerate() {
+        match exam {
+            Exam::Version { tv: read, rank, error: None } if read == tv => candidates.push((r.clone(), if i == 0 { -1 } else { rank })),
+            Exam::Not { kind, why } if i == 0 => frozen_foreign = Some((kind, why)),
+            Exam::Wait(why) if i == 0 => return Err(AppError::Upstream(why)),
+            _ => {}
+        }
+    }
+    candidates.sort_by(|a, b| (a.1, &a.0.name).cmp(&(b.1, &b.0.name)));
+    let mut first_error = None;
     let mut found = None;
-    for (i, r) in candidates.iter().enumerate() {
+    for (r, _) in &candidates {
         let co = git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name))
             .await
             .map_err(|e| AppError::Upstream(format!("cannot fetch {}: {e:#}", r.commit)))?;
-        if let Some(judged) = foreign_reason(state, entry, &repo, &co, r, &tv).await? {
-            if i == 0 {
-                frozen_foreign = Some(judged);
-            }
-            continue;
-        }
         match prepare(state, entry, &repo, &co, r, &tv, &PrepOpts::default()).await {
             Ok(p) => {
                 found = Some((r.clone(), co, p));
                 break;
             }
             Err(AppError::BadRequest(m)) => {
-                first_error.get_or_insert(AppError::BadRequest(if i == 0 { m } else { format!("{} also fails: {m}", r.name) }));
+                first_error.get_or_insert(AppError::BadRequest(if r.name == tag { m } else { format!("{} also fails: {m}", r.name) }));
             }
             Err(e) => return Err(e),
         }
@@ -1226,7 +1173,7 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
             tx.commit().await?;
             return Ok(format!("{tag} isn't {}'s tag ({why}); the invalid version was removed", entry.slug()));
         }
-        return Err(first_error.unwrap_or_else(|| AppError::bad(format!("{}@{label} still isn't readable", entry.slug()))));
+        return Err(first_error.unwrap_or_else(|| AppError::bad(format!("{}@{label}: no tag of that version reads cleanly", entry.slug()))));
     };
     // Reviewed as the tag would be if pushed now: the admin re-reading it doesn't vouch for it.
     let review = publish::release_review(state, entry, None).await?;
@@ -1252,6 +1199,22 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     }
     store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
     publish::submit_release(&mut tx, entry, v.id, review, None).await?;
+    // The tag read is the version's now; the one it was frozen from is no longer a version of it.
+    for table in ["foreign_tags", "tag_reads"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE entry_id = $1 AND tag = $2")).bind(entry.id).bind(&r.name).execute(&mut *tx).await?;
+    }
+    if r.name != tag {
+        sqlx::query(
+            "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind) VALUES ($1, $2, $3, $4, 'duplicate')
+             ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
+        )
+        .bind(entry.id)
+        .bind(&tag)
+        .bind(&commit)
+        .bind(format!("version {label} is already another tag's"))
+        .execute(&mut *tx)
+        .await?;
+    }
     crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread", Some(&entry.slug()), json!({ "version": label, "tag": r.name, "was": tag, "now": "valid", "review": review }), None).await?;
     tx.commit().await?;
     publish::touch(state, entry.id).await?;
@@ -1506,31 +1469,18 @@ async fn sync_inner(
     let refs = git::ls_tags(policy(state), &repo.url).await.map_err(AppError::bad)?;
     let remote: BTreeMap<String, String> =
         refs.iter().map(|r| (r.name.clone(), r.commit.clone())).collect();
-    let known: Vec<Known> = sqlx::query_as(
-        "SELECT id, tag, commit, state FROM versions WHERE entry_id = $1 AND NOT is_virtual",
-    )
-    .bind(entry.id)
-    .fetch_all(&state.db)
-    .await?;
-    let by_tag: BTreeMap<&str, &Known> =
-        known.iter().filter_map(|k| k.tag.as_deref().map(|t| (t, k))).collect();
-    // Versions the entry has, by label, whatever tag froze them: another tag naming one of them (a
-    // bare 1.0.0 beside v1.0.0) is no new version, and would only collide.
-    let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
-        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
-    )
-    .bind(entry.id)
-    .fetch_all(&state.db)
-    .await?
-    .into_iter()
-    .collect();
-
+    let known = known_versions(state, entry.id).await?;
+    let mut forgot = false;
     for k in &known {
         let (Some(tag), Some(frozen)) = (&k.tag, &k.commit) else { continue };
         match remote.get(tag) {
-            // An invalid version is never served: a tag moving off it changes nothing (it stays
-            // invalid, never "tag-moved", which would make it look like a usable version).
-            Some(now) if now != frozen && k.state != "tag-moved" && k.state != "invalid" => {
+            // An invalid version was never served: when its tag moves, the tag is read again at its
+            // new commit (the invalid row goes, recorded in the audit log).
+            Some(now) if now != frozen && k.state == "invalid" => {
+                forget_invalid(state, entry, k.id, tag, frozen, now).await?;
+                forgot = true;
+            }
+            Some(now) if now != frozen && k.state != "tag-moved" => {
                 mark(state, entry, k.id, "tag-moved", tag, frozen, Some(now)).await?;
             }
             None if k.state != "upstream-missing" && k.state != "invalid" => {
@@ -1545,147 +1495,484 @@ async fn sync_inner(
             _ => {}
         }
     }
+    let known = if forgot { known_versions(state, entry.id).await? } else { known };
+    let by_tag: BTreeMap<&str, &Known> =
+        known.iter().filter_map(|k| k.tag.as_deref().map(|t| (t, k))).collect();
+    // Versions the entry has, by label, whatever tag froze them: another tag naming one of them (a
+    // bare 1.0.0 beside v1.0.0) is no new version.
+    let have = version_labels(state, entry.id).await?;
 
-    // Tags found not to be this entry's (see `foreign_reason`): skipped while they name the commit
-    // they were judged at; a tag that moved is judged again, and one that is gone is forgotten.
+    // Tags found not to be versions of this entry: skipped while they name the commit they were
+    // judged at; a tag that moved is judged again, and one that is gone is forgotten.
+    let foreign = foreign_of(state, entry.id, &remote).await?;
+    // Tags left unread earlier (waiting_tags): tried again after the new ones, with backoff.
+    let waiting = waiting_of(state, entry.id, &remote).await?;
+    let mut run = Run::default();
+    if repo.overlay_manifest.is_some() {
+        // A curated entry: its overlay manifest is read at every tag, so its stored rule decides.
+        let candidates: Vec<(RemoteRef, TrackedVersion, Option<String>)> = version_tags(refs, &TagRule::of(repo)?)
+            .into_iter()
+            .filter(|(r, tv)| {
+                !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) && !have.contains(&tv.to_string())
+            })
+            .map(|(r, tv)| (r, tv, None))
+            .collect();
+        ingest_all(state, entry, repo, actor, pace, candidates, &waiting, &mut run).await?;
+    } else {
+        examine_and_ingest(state, entry, repo, actor, pace, refs, &by_tag, &have, &foreign, &waiting, &mut run).await?;
+    }
+    if run.added > 0 {
+        publish::touch(state, entry.id).await?;
+        // For a repo entry, the stored rule is only what its page says it follows: the newest
+        // version's manifest's. Each tag is read by the manifest in it.
+        if repo.overlay_manifest.is_none() {
+            let newest = newest_rule(state, entry.id).await?;
+            if let Some(rule) = newest {
+                let (pattern, since) = rule.stored();
+                sqlx::query("UPDATE entry_repos SET tag_pattern = $2, min_version = $3 WHERE entry_id = $1 AND overlay_manifest IS NULL")
+                    .bind(entry.id)
+                    .bind(pattern)
+                    .bind(since)
+                    .execute(&state.db)
+                    .await?;
+            }
+        }
+    }
+    // What couldn't be read is reported (it becomes the repo's poll error) and tried again.
+    if !run.unfetched.is_empty() {
+        return Err(AppError::Upstream(format!(
+            "{} new version(s) read; {} tag(s) will be tried again at the next sync: {}",
+            run.added,
+            run.unfetched.len(),
+            run.unfetched.join("; ")
+        )));
+    }
+    Ok(run.added)
+}
+
+/// What one sync did so far.
+#[derive(Default)]
+struct Run {
+    added: usize,
+    /// Tags read to a conclusion (a version, or not one), toward [`MAX_NEW_PER_SYNC`].
+    read: usize,
+    /// Why tags were left unread, for the poll error.
+    unfetched: Vec<String>,
+}
+
+async fn known_versions(state: &AppState, entry_id: i64) -> AppResult<Vec<Known>> {
+    Ok(sqlx::query_as("SELECT id, tag, commit, state FROM versions WHERE entry_id = $1 AND NOT is_virtual")
+        .bind(entry_id)
+        .fetch_all(&state.db)
+        .await?)
+}
+
+async fn version_labels(state: &AppState, entry_id: i64) -> AppResult<std::collections::BTreeSet<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
+    )
+    .bind(entry_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+/// The rule of the entry's newest valid version's manifest.
+async fn newest_rule(state: &AppState, entry_id: i64) -> AppResult<Option<TagRule>> {
+    let newest: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND state <> 'invalid'
+         ORDER BY (track = '') DESC, sort_key DESC LIMIT 1",
+    )
+    .bind(entry_id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten();
+    Ok(newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()).map(|m| TagRule::of_manifest(&m)))
+}
+
+/// The entry's "not a version" records (tag → commit), forgetting tags deleted upstream.
+async fn foreign_of(state: &AppState, entry_id: i64, remote: &BTreeMap<String, String>) -> AppResult<BTreeMap<String, String>> {
     let foreign: BTreeMap<String, String> =
         sqlx::query_as::<_, (String, String)>("SELECT tag, commit FROM foreign_tags WHERE entry_id = $1")
-            .bind(entry.id)
+            .bind(entry_id)
             .fetch_all(&state.db)
             .await?
             .into_iter()
             .collect();
-    let gone: Vec<&String> = foreign.keys().filter(|t| !remote.contains_key(*t)).collect();
+    let gone: Vec<&str> = foreign.keys().filter(|t| !remote.contains_key(*t)).map(String::as_str).collect();
     if !gone.is_empty() {
         sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 AND tag = ANY($2)")
-            .bind(entry.id)
-            .bind(gone.iter().map(|t| t.as_str()).collect::<Vec<_>>())
+            .bind(entry_id)
+            .bind(&gone)
             .execute(&state.db)
             .await?;
     }
+    Ok(foreign.into_iter().filter(|(t, _)| remote.contains_key(t)).collect())
+}
 
-    // Tags a sibling's own tag-pattern reads are the sibling's: recorded as not this entry's and left
-    // out before tags naming one version are deduplicated, so a claimed bare 1.0.0 can't hide this
-    // entry's own v1.0.0.
-    let own_rule = TagRule::of(repo)?;
-    let mut sibling_rules = Vec::new();
-    if repo.overlay_manifest.is_none() {
-        for sib in siblings(state, entry.id, &repo.url).await? {
-            if let Some(r) = repo_of(state, sib.id).await? {
-                sibling_rules.push((sib.slug(), TagRule::of(&r)?));
-            }
-        }
-    }
-    let mut refs_left = Vec::new();
-    for r in refs {
-        let claim = sibling_rules.iter().find_map(|(slug, theirs)| claimed_by(&r.name, &own_rule, theirs).map(|why| format!("it is {slug}'s release: {why}")));
-        match claim {
-            Some(why) if own_rule.version(&r.name).is_some() => {
-                if !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) {
-                    record_foreign(state, entry, &r, ("claim", &why), repo.tag_pattern.as_deref()).await?;
-                }
-            }
-            _ => refs_left.push(r),
-        }
-    }
-    let refs = refs_left;
-    // Tags left unread earlier (waiting_tags): tried again after the new ones, with backoff.
-    let waiting = waiting_of(state, entry.id, &remote).await?;
-    let (mut added, mut read) = (0, 0);
-    // Tags that couldn't be read this time: left unread, so a later sync tries again. Only tags
-    // read to a conclusion count toward MAX_NEW_PER_SYNC, so tags waiting can't hold up newer ones.
-    let mut unfetched: Vec<String> = Vec::new();
-    let candidates: Vec<(RemoteRef, TrackedVersion)> = version_tags(refs, &TagRule::of(repo)?)
-        .into_iter()
-        .filter(|(r, tv)| {
-            !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) && !have.contains(&tv.to_string())
-        })
-        .collect();
+/// An invalid version whose tag moved: it was never served, so the row goes and the tag is read
+/// again at its new commit, like a new tag. Audited.
+async fn forget_invalid(state: &AppState, entry: &Entry, version_id: i64, tag: &str, frozen: &str, now: &str) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM versions WHERE id = $1 AND state = 'invalid'").bind(version_id).execute(&mut *tx).await?;
+    crate::audit::audit_with(
+        &mut tx,
+        None,
+        "version.invalid-tag-moved",
+        Some(&entry.slug()),
+        json!({ "tag": tag, "frozen": frozen, "now": now, "then": "read again at the new commit" }),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Ingests candidate tags: new ones first (at most [`MAX_NEW_PER_SYNC`] concluded, and at most
+/// [`MAX_WAITING_PER_SYNC`] that turn out to wait), then waiting ones (at most
+/// [`MAX_WAITING_PER_SYNC`], honoring backoff in the background). A candidate with a reason
+/// (`Some`) is frozen invalid with it, without reading the commit.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_all(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    actor: Option<&User>,
+    pace: Pace,
+    candidates: Vec<(RemoteRef, TrackedVersion, Option<String>)>,
+    waiting: &BTreeMap<String, Waiting>,
+    run: &mut Run,
+) -> AppResult<()> {
     let (retry, fresh): (Vec<_>, Vec<_>) =
-        candidates.into_iter().partition(|(r, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
+        candidates.into_iter().partition(|(r, _, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
     // New tags that turn out to wait are capped too, so one sync (a registration's, say) never
     // tries hundreds of them; the rest are new again at the next sync.
     let (mut new_waiting, mut new_later) = (0, 0);
-    for (r, tv) in &fresh {
-        if read == MAX_NEW_PER_SYNC {
+    for (r, tv, preset) in &fresh {
+        if run.read == MAX_NEW_PER_SYNC {
             break;
         }
         if new_waiting == MAX_WAITING_PER_SYNC {
             new_later += 1;
             continue;
         }
-        match ingest(state, entry, repo, r, tv, actor).await {
+        match ingest(state, entry, repo, r, tv, actor, preset.as_deref()).await {
             Ok(outcome) => {
-                read += 1;
+                run.read += 1;
                 if matches!(outcome, Ingested::Version) {
-                    added += 1;
+                    run.added += 1;
                 }
                 // A tag that waited at another commit and moved since.
                 done_waiting(state, entry.id, &r.name).await?;
             }
             Err(AppError::Upstream(why)) => {
                 new_waiting += 1;
-                unfetched.push(wait(state, entry, r, why).await);
+                run.unfetched.push(wait(state, entry, r, why).await);
             }
             Err(e) => return Err(e),
         }
     }
     if new_later > 0 {
-        unfetched.push(format!("{new_later} more new tag(s) not tried this time (at most {MAX_WAITING_PER_SYNC} new tags wait per check)"));
+        run.unfetched.push(format!("{new_later} more new tag(s) not tried this time (at most {MAX_WAITING_PER_SYNC} new tags wait per check)"));
     }
     let (mut tried, mut later) = (0, 0);
-    for (r, tv) in &retry {
+    for (r, tv, preset) in &retry {
         let w = &waiting[&r.name];
         if tried == MAX_WAITING_PER_SYNC || (pace == Pace::Background && w.next_try_at > time::OffsetDateTime::now_utc()) {
             later += 1;
             continue;
         }
         tried += 1;
-        match ingest(state, entry, repo, r, tv, actor).await {
+        match ingest(state, entry, repo, r, tv, actor, preset.as_deref()).await {
             Ok(outcome) => {
                 if matches!(outcome, Ingested::Version) {
-                    added += 1;
+                    run.added += 1;
                 }
                 done_waiting(state, entry.id, &r.name).await?;
             }
-            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await),
+            Err(AppError::Upstream(why)) => run.unfetched.push(wait(state, entry, r, why).await),
             Err(e) => return Err(e),
         }
     }
     if later > 0 {
-        unfetched.push(format!("{later} more waiting tag(s) not tried this time (each backs off, up to 6 hours apart)"));
+        run.unfetched.push(format!("{later} more waiting tag(s) not tried this time (each backs off, up to 6 hours apart)"));
     }
-    if added > 0 {
-        publish::touch(state, entry.id).await?;
+    Ok(())
+}
+
+/// What examining a tag for an entry found: what the entry's manifest at the tag's commit makes of
+/// the tag.
+#[derive(Clone, Debug, PartialEq)]
+enum Exam {
+    /// A version, `tv`, spelled with this rank ([`spelling_rank`] under the manifest's own rule).
+    /// With `error`, the manifest is unreadable and the version is frozen invalid with it.
+    Version { tv: TrackedVersion, rank: i32, error: Option<String> },
+    /// Not a version of this entry: a kind (for `foreign_tags`) and why.
+    Not { kind: &'static str, why: String },
+    /// Can't be told now (a newer format, the repo unreadable): tried again later.
+    Wait(String),
+}
+
+/// The rank of a version read from an unreadable manifest: any readable one wins over it.
+const UNREADABLE_RANK: i32 = 9;
+
+/// What the entry's manifest at a tag's commit makes of the tag (see the publishing docs): a tag
+/// is a version exactly when the entry's manifest file is in its commit and that manifest's own
+/// rule (`tag-pattern`, else `[track/]vX.Y.Z`, and its own `since`) reads it as one, the manifest
+/// names the entry and lists its owner, the sims' form is the entry's, and no sibling's manifest at
+/// that commit claims the tag with its own pattern. A manifest there that can't be read is still a
+/// version (invalid, with the error) when the standard form, or the rule of the entry's newest
+/// version, reads the tag; otherwise it isn't one.
+#[allow(clippy::too_many_arguments)]
+fn judge(
+    entry: &Entry,
+    file: &str,
+    form: Option<&str>,
+    tag: &str,
+    own: &git::FileAt,
+    sibs: &[(String, &str, &git::FileAt)],
+    newest: Option<&TagRule>,
+) -> Exam {
+    let unreadable = |error: String| {
+        let tv = TagRule::default().version(tag).or_else(|| newest.and_then(|n| n.version(tag)));
+        match tv {
+            Some(tv) => Exam::Version { tv, rank: UNREADABLE_RANK, error: Some(error) },
+            None => Exam::Not {
+                kind: "unreadable",
+                why: format!("{error}; {tag} isn't a version under the standard form or the newest version's rule"),
+            },
+        }
+    };
+    let text = match own {
+        git::FileAt::Absent => return Exam::Not { kind: "absent", why: format!("no {file}") },
+        git::FileAt::TooLarge(n) => return unreadable(format!("{file} is larger than 4 MB ({n} bytes)")),
+        git::FileAt::Content(bytes) => match std::str::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => return unreadable(format!("'{file}' is not UTF-8 text")),
+        },
+    };
+    let m = match Manifest::from_repo_file(file, text) {
+        Ok(m) => m,
+        Err(e @ cactup_ecosystem_common::Error::NewerFormat { .. }) => {
+            return Exam::Wait(format!("{file} at {tag}: {e} (this server reads it once it is upgraded)"));
+        }
+        Err(e) => return unreadable(format!("{file}: {e}")),
+    };
+    let rule = TagRule::of_manifest(&m);
+    let Some(tv) = rule.version(tag) else {
+        return Exam::Not { kind: "rule", why: format!("its {file} follows {}, which {tag} isn't one of", rule.describe_with_since()) };
+    };
+    if name_of(&m) != entry.name {
+        return Exam::Not { kind: "identity", why: format!("its {file} names '{}', not '{}'", name_of(&m), entry.name) };
     }
-    if added > 0 && repo.overlay_manifest.is_none() {
-        // The newest version's manifest may move `since`; the tag form stays the entry's own
-        // until someone re-reads the tag rule. A curated entry's rule is its overlay's.
-        let newest: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT manifest FROM versions WHERE entry_id = $1 AND manifest IS NOT NULL AND state <> 'invalid'
-             ORDER BY (track = '') DESC, sort_key DESC LIMIT 1",
-        )
-        .bind(entry.id)
-        .fetch_optional(&state.db)
-        .await?
-        .flatten();
-        if let Some(m) = newest.and_then(|m| serde_json::from_value::<Manifest>(m).ok()) {
-            let rule = TagRule::of_manifest(&m);
-            if rule.same_pattern(&TagRule::of(repo)?) {
-                store_since(state, entry.id, rule.stored().1, repo.tag_pattern.as_deref()).await?;
-            }
+    if !entry.curated && !owners_of(&m).contains(&entry.owner) {
+        return Exam::Not { kind: "identity", why: format!("its {file} doesn't list '{}' in owners", entry.owner) };
+    }
+    if let (Some(fixed), Some(here)) = (form, sim_form_of(&m))
+        && fixed != here
+    {
+        return Exam::Not {
+            kind: "form",
+            why: format!("its {file} uses {}, but this entry publishes {} (fixed when it was registered)", form_words(&here), form_words(fixed)),
+        };
+    }
+    for (slug, sib_file, content) in sibs {
+        let git::FileAt::Content(bytes) = content else { continue };
+        let Ok(text) = std::str::from_utf8(bytes) else { continue };
+        let Ok(theirs) = Manifest::from_repo_file(sib_file, text) else { continue };
+        if let Some(why) = claimed_by(tag, &rule, &TagRule::of_manifest(&theirs)) {
+            return Exam::Not { kind: "claim", why: format!("it is {slug}'s release: {why}") };
         }
     }
-    // What couldn't be read is reported (it becomes the repo's poll error) and tried again.
-    if !unfetched.is_empty() {
-        return Err(AppError::Upstream(format!(
-            "{} new version(s) read; {} tag(s) will be tried again at the next sync: {}",
-            added,
-            unfetched.len(),
-            unfetched.join("; ")
-        )));
+    let rank = i32::from(spelling_rank(&rule, tag, &tv));
+    Exam::Version { tv, rank, error: None }
+}
+
+/// Examines tags for an entry, reading its manifest (and its siblings', for claims) at each commit
+/// from the repo's history mirror, without checking anything out.
+async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[RemoteRef]) -> AppResult<Vec<Exam>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(added)
+    let sibs: Vec<(Entry, String)> = entries_on(state, &repo.url).await?.into_iter().filter(|(e, _)| e.id != entry.id).collect();
+    let mut wants = Vec::new();
+    for r in tags {
+        wants.push((r.commit.clone(), repo.manifest_file.clone()));
+        for (_, f) in &sibs {
+            wants.push((r.commit.clone(), f.clone()));
+        }
+    }
+    let files = match git::read_files_at(policy(state), &repo.url, &wants).await {
+        Ok(f) => f,
+        Err(e) => {
+            let why = format!("cannot read the repo's manifests right now: {e:#}");
+            return Ok(tags.iter().map(|_| Exam::Wait(why.clone())).collect());
+        }
+    };
+    let newest = newest_rule(state, entry.id).await?;
+    let per = 1 + sibs.len();
+    Ok(tags
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let chunk = &files[i * per..(i + 1) * per];
+            let theirs: Vec<(String, &str, &git::FileAt)> =
+                sibs.iter().zip(&chunk[1..]).map(|((e, f), c)| (e.slug(), f.as_str(), c)).collect();
+            judge(entry, &repo.manifest_file, fixed_form(entry, repo), &r.name, &chunk[0], &theirs, newest.as_ref())
+        })
+        .collect())
+}
+
+/// A repo entry's tags, read per commit: new tags are examined (at most the configured number per
+/// sync, standard spellings first, then by name), recording each outcome; once every tag has been
+/// examined, the tags read as versions are frozen, one per version: the best spelling under its own
+/// manifest's rule, then the first by name. Freezing waits for the whole repo to be examined, so
+/// which tag becomes a version doesn't depend on how the examining was paged across syncs.
+#[allow(clippy::too_many_arguments)]
+async fn examine_and_ingest(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    actor: Option<&User>,
+    pace: Pace,
+    refs: Vec<RemoteRef>,
+    by_tag: &BTreeMap<&str, &Known>,
+    have: &std::collections::BTreeSet<String>,
+    foreign: &BTreeMap<String, String>,
+    waiting: &BTreeMap<String, Waiting>,
+    run: &mut Run,
+) -> AppResult<()> {
+    let reads = reads_of(state, entry.id, &refs).await?;
+    let open: Vec<&RemoteRef> = refs
+        .iter()
+        .filter(|r| {
+            !by_tag.contains_key(r.name.as_str())
+                && foreign.get(&r.name) != Some(&r.commit)
+                && reads.get(&r.name).map(|(c, _, _, _)| c) != Some(&r.commit)
+        })
+        .collect();
+    // Tags whose examining waits (a newer format, the repo unreadable) are retried with backoff;
+    // they don't hold up the others.
+    let (mut retry, mut fresh): (Vec<&RemoteRef>, Vec<&RemoteRef>) =
+        open.into_iter().partition(|r| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
+    let standard_first = |r: &&RemoteRef| {
+        let standard = TrackedVersion::from_tag(&r.name).is_some_and(|tv| tv.conventional_tag() == r.name);
+        (!standard, r.name.clone())
+    };
+    fresh.sort_by_key(standard_first);
+    retry.sort_by_key(standard_first);
+    let cap = state.cfg.examine_per_sync;
+    let now = time::OffsetDateTime::now_utc();
+    let retry_now: Vec<RemoteRef> = retry
+        .iter()
+        .filter(|r| pace == Pace::Now || waiting[&r.name].next_try_at <= now)
+        .take(MAX_WAITING_PER_SYNC)
+        .map(|r| (*r).clone())
+        .collect();
+    let batch: Vec<RemoteRef> = fresh.iter().take(cap).map(|r| (*r).clone()).collect();
+    let unexamined = fresh.len() - batch.len();
+    let all: Vec<RemoteRef> = batch.into_iter().chain(retry_now).collect();
+    let exams = examine(state, entry, repo, &all).await?;
+    for (r, exam) in all.iter().zip(exams) {
+        match exam {
+            Exam::Version { tv, rank, error } => {
+                sqlx::query(
+                    "INSERT INTO tag_reads (entry_id, tag, commit, label, rank, error) VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, label = EXCLUDED.label,
+                       rank = EXCLUDED.rank, error = EXCLUDED.error, seen_at = now()",
+                )
+                .bind(entry.id)
+                .bind(&r.name)
+                .bind(&r.commit)
+                .bind(tv.to_string())
+                .bind(rank)
+                .bind(&error)
+                .execute(&state.db)
+                .await?;
+                done_waiting(state, entry.id, &r.name).await?;
+            }
+            Exam::Not { kind, why } => {
+                record_foreign(state, entry, r, (kind, &why)).await?;
+                done_waiting(state, entry.id, &r.name).await?;
+            }
+            Exam::Wait(why) => run.unfetched.push(wait(state, entry, r, why).await),
+        }
+    }
+    if unexamined > 0 {
+        run.unfetched.push(format!(
+            "{unexamined} tag(s) not examined yet (at most {cap} per check); new versions are frozen once every tag has been read"
+        ));
+        return Ok(());
+    }
+    // Every tag examined: freeze one tag per version.
+    let reads = reads_of(state, entry.id, &refs).await?;
+    let mut by_label: BTreeMap<String, Vec<(String, String, i32, Option<String>)>> = BTreeMap::new();
+    for (tag, (commit, label, rank, error)) in reads {
+        by_label.entry(label).or_default().push((tag, commit, rank, error));
+    }
+    let mut candidates = Vec::new();
+    for (label, mut tags) in by_label {
+        tags.sort_by(|a, b| (a.2, &a.0).cmp(&(b.2, &b.0)));
+        if have.contains(&label) {
+            for (tag, commit, _, _) in &tags {
+                let why = format!("version {label} is already another tag's");
+                record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit: commit.clone() }, ("duplicate", &why)).await?;
+            }
+            sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND label = $2").bind(entry.id).bind(&label).execute(&state.db).await?;
+            continue;
+        }
+        let (tag, commit, _, error) = tags.swap_remove(0);
+        let tv: TrackedVersion = label.parse().map_err(AppError::bad)?;
+        candidates.push((RemoteRef { name: tag, commit }, tv, error));
+    }
+    ingest_all(state, entry, repo, actor, pace, candidates, waiting, run).await?;
+    // The versions frozen now settle the other tags read as the same versions.
+    let have = version_labels(state, entry.id).await?;
+    let reads = reads_of(state, entry.id, &refs).await?;
+    for (tag, (commit, label, _, _)) in reads {
+        if have.contains(&label) {
+            if !by_tag.contains_key(tag.as_str()) && !version_tag_is(state, entry.id, &tag).await? {
+                let why = format!("version {label} is already another tag's");
+                record_foreign(state, entry, &RemoteRef { name: tag.clone(), commit }, ("duplicate", &why)).await?;
+            }
+            sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = $2").bind(entry.id).bind(&tag).execute(&state.db).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn version_tag_is(state: &AppState, entry_id: i64, tag: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM versions WHERE entry_id = $1 AND tag = $2)")
+        .bind(entry_id)
+        .bind(tag)
+        .fetch_one(&state.db)
+        .await?)
+}
+
+/// The entry's tags read as versions and not frozen yet (tag → commit, label, rank, error),
+/// forgetting those deleted or moved upstream (a moved tag is examined again).
+async fn reads_of(state: &AppState, entry_id: i64, refs: &[RemoteRef]) -> AppResult<BTreeMap<String, (String, String, i32, Option<String>)>> {
+    let rows: Vec<(String, String, String, i32, Option<String>)> =
+        sqlx::query_as("SELECT tag, commit, label, rank, error FROM tag_reads WHERE entry_id = $1")
+            .bind(entry_id)
+            .fetch_all(&state.db)
+            .await?;
+    let remote: BTreeMap<&str, &str> = refs.iter().map(|r| (r.name.as_str(), r.commit.as_str())).collect();
+    let stale: Vec<&str> =
+        rows.iter().filter(|(t, c, _, _, _)| remote.get(t.as_str()) != Some(&c.as_str())).map(|(t, _, _, _, _)| t.as_str()).collect();
+    if !stale.is_empty() {
+        sqlx::query("DELETE FROM tag_reads WHERE entry_id = $1 AND tag = ANY($2)")
+            .bind(entry_id)
+            .bind(&stale)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|(t, c, _, _, _)| remote.get(t.as_str()) == Some(&c.as_str()))
+        .map(|(t, c, l, r, e)| (t, (c, l, r, e)))
+        .collect())
 }
 
 /// A tag left unread: when it was last judged, and when the poller may try it again.
@@ -1800,73 +2087,6 @@ fn short(commit: &str) -> &str {
     &commit[..10.min(commit.len())]
 }
 
-/// Why a candidate tag (one the entry's stored rule picks) is not the entry's at all, if it isn't:
-///
-/// - **Self-consistency:** the entry's own manifest inside the tag must read that tag as that
-///   version under its own rule. A manifest that dropped or changed its `tag-pattern` reads it
-///   otherwise (or not at all), so the tag belongs to another scheme, typically another kind on
-///   the same repo, and must not become a version of this entry.
-/// - **The sibling backstop:** for an entry with siblings (other entries on the same repo), a tag
-///   without the entry's manifest file is a sibling's release (or from before this kind's manifest
-///   existed), not a broken release of this entry.
-///
-/// Such a tag is recorded as not this entry's instead of frozen invalid, and judged again if it
-/// moves. A manifest that can't be read decides nothing here: `prepare` reports it. A curated
-/// entry reads its overlay at every tag, so its rule is consistent by construction.
-async fn foreign_reason(
-    state: &AppState,
-    entry: &Entry,
-    repo: &RepoRow,
-    co: &git::Checkout,
-    r: &RemoteRef,
-    tv: &TrackedVersion,
-) -> AppResult<Option<(&'static str, String)>> {
-    if repo.overlay_manifest.is_some() {
-        return Ok(None);
-    }
-    let sibs = siblings(state, entry.id, &repo.url).await?;
-    // A kind that declares a tag-pattern follows only it; the kinds without one stay on the
-    // standard form. So a tag a sibling's own pattern reads (bare 1.2.3 for {major}.{minor}.{patch},
-    // say), which the standard form also reads, is that sibling's, not this entry's.
-    let own = TagRule::of(repo)?;
-    if own.version(&r.name).is_some() && own.pattern.as_ref().is_none_or(|p| p.version(&r.name).is_none()) {
-        for sib in &sibs {
-            let Some(theirs) = repo_of(state, sib.id).await? else { continue };
-            if let Some(why) = claimed_by(&r.name, &own, &TagRule::of(&theirs)?) {
-                return Ok(Some(("claim", format!("it is {}'s release: {why}", sib.slug()))));
-            }
-        }
-    }
-    // A file that can't be read decides nothing here: prepare reports it (an invalid version).
-    let Ok(read) = git::read_in(co, &repo.manifest_file) else { return Ok(None) };
-    let Some(text) = read else {
-        if sibs.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some((
-            "backstop",
-            format!("it has no {} (a release of another entry on this repo, or from before this one's manifest)", repo.manifest_file),
-        )));
-    };
-    let Ok(m) = Manifest::from_repo_file(&repo.manifest_file, &text) else { return Ok(None) };
-    // The form (one file or [sim.files]) is the entry's, fixed when it was registered: a manifest in
-    // the other form is another scheme's, not a release of this entry.
-    if let (Some(fixed), Some(here)) = (fixed_form(entry, repo), sim_form_of(&m))
-        && fixed != here
-    {
-        return Ok(Some((
-            "form",
-            format!(
-                "its {} uses {}, but this entry publishes {} (fixed when it was registered)",
-                repo.manifest_file,
-                form_words(&here),
-                form_words(fixed)
-            ),
-        )));
-    }
-    Ok(inconsistent(&TagRule::of_manifest(&m), &repo.manifest_file, &r.name, tv).map(|why| ("consistency", why)))
-}
-
 /// Whether `tag` belongs to a sibling with its own tag-pattern, rather than to an entry following
 /// `own`: the sibling's pattern reads it and `own`'s pattern (if any) doesn't, and the two patterns
 /// differ (kinds with the same pattern share its tags). Says why.
@@ -1900,45 +2120,28 @@ fn form_words(form: &str) -> &'static str {
     if form == "files" { "several sims ([sim.files])" } else { "one sim (file)" }
 }
 
-/// Self-consistency: why the manifest's own rule `own` doesn't read `tag` as `tv`, if it doesn't.
-fn inconsistent(own: &TagRule, file: &str, tag: &str, tv: &TrackedVersion) -> Option<String> {
-    match own.version(tag) {
-        Some(v) if v == *tv => None,
-        Some(v) => Some(format!("its {file} reads {tag} as {v}, not {tv}")),
-        None => Some(format!("its {file} follows {}, which {tag} isn't one of", own.describe())),
-    }
-}
 
-/// After `entry_id`'s tag rule changes: forgets its own "not this entry's" judgments, and, on the
-/// repo at `url`, the siblings' that are claims by a tag-pattern (which its old pattern may have
-/// made). Each is judged again at its entry's next sync. The siblings' other judgments (no manifest
-/// for them, another form, their own manifest's rule) don't depend on this entry's rule and stay.
-async fn clear_foreign_on(db: &mut sqlx::PgConnection, state: &AppState, entry_id: i64, url: &str) -> AppResult<()> {
-    let ids: Vec<i64> = entries_on(state, url).await?.into_iter().map(|(e, _)| e.id).collect();
-    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 OR (entry_id = ANY($2) AND kind = 'claim')")
-        .bind(entry_id)
-        .bind(&ids)
-        .execute(&mut *db)
-        .await?;
+/// After a curated entry's overlay changes (or is handed over to the repo's manifests): forgets its
+/// own "not a version" judgments and pending reads, which were made under the old rule; its tags
+/// are examined again at the next sync. Siblings' judgments read their own manifests and stay.
+async fn clear_foreign_on(db: &mut sqlx::PgConnection, entry_id: i64) -> AppResult<()> {
+    for table in ["foreign_tags", "tag_reads"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE entry_id = $1")).bind(entry_id).execute(&mut *db).await?;
+    }
     Ok(())
 }
 
-/// Records `r` as not `entry`'s tag, with why (replacing an earlier judgment of the same tag).
-/// Only while the entry's tag rule is still `pattern`, the one the caller judged under: a re-read
-/// of the rule (which clears these records) in between makes the judgment stale, and nothing is
-/// written.
-async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, (kind, why): (&str, &str), pattern: Option<&str>) -> AppResult<()> {
+/// Records `r` as not a version of `entry`, with a kind and why (replacing an earlier judgment of
+/// the same tag).
+async fn record_foreign(state: &AppState, entry: &Entry, r: &RemoteRef, (kind, why): (&str, &str)) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind)
-         SELECT $1, $2, $3, $4, $6 WHERE EXISTS
-           (SELECT 1 FROM entry_repos WHERE entry_id = $1 AND tag_pattern IS NOT DISTINCT FROM $5)
+        "INSERT INTO foreign_tags (entry_id, tag, commit, reason, kind) VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (entry_id, tag) DO UPDATE SET commit = EXCLUDED.commit, reason = EXCLUDED.reason, kind = EXCLUDED.kind, seen_at = now()",
     )
     .bind(entry.id)
     .bind(&r.name)
     .bind(&r.commit)
     .bind(why)
-    .bind(pattern)
     .bind(kind)
     .execute(&state.db)
     .await?;
@@ -1958,6 +2161,7 @@ enum Ingested {
 /// commit make a version invalid: when `prepare` answers [`AppError::Upstream`] or fails on our
 /// side, nothing is stored and the tag is tried again at the next sync. A tag that isn't this
 /// entry's at all ([`foreign_reason`]) is recorded as such and becomes no version.
+#[allow(clippy::too_many_arguments)]
 async fn ingest(
     state: &AppState,
     entry: &Entry,
@@ -1965,16 +2169,23 @@ async fn ingest(
     r: &RemoteRef,
     tv: &TrackedVersion,
     actor: Option<&User>,
+    preset: Option<&str>,
 ) -> AppResult<Ingested> {
     let track = tv.track.as_ref().map(|t| t.to_string()).unwrap_or_default();
-    let co = git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await;
+    // A version whose manifest was found unreadable when examined: frozen invalid with that error,
+    // nothing more to read.
+    let co = match preset {
+        Some(_) => Err(anyhow::anyhow!("not read")),
+        None => git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await,
+    };
     let (invalid, tree, prepared) = match co {
+        Err(_) if preset.is_some() => (preset.map(str::to_owned), None, None),
         // Too large is a fact about the commit: the version is stored invalid, as for a bad manifest.
         // On a repo carrying several entries, though, whose release it is can't be read, so it is
         // recorded as not this entry's (judged again if the tag moves) rather than frozen here.
         Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
             if repo.overlay_manifest.is_none() && !siblings(state, entry.id, &repo.url).await?.is_empty() {
-                record_foreign(state, entry, r, ("large", &format!("{e:#}, so whose release it is can't be read")), repo.tag_pattern.as_deref()).await?;
+                record_foreign(state, entry, r, ("large", &format!("{e:#}, so whose release it is can't be read"))).await?;
                 return Ok(Ingested::Foreign);
             }
             (Some(format!("cannot index the tagged commit: {e:#}")), None, None)
@@ -1985,10 +2196,6 @@ async fn ingest(
             return Err(AppError::Upstream(format!("{}: cannot fetch {} ({}): {e:#}", entry.slug(), r.name, short(&r.commit))));
         }
         Ok(co) => {
-            if let Some((kind, why)) = foreign_reason(state, entry, repo, &co, r, tv).await? {
-                record_foreign(state, entry, r, (kind, &why), repo.tag_pattern.as_deref()).await?;
-                return Ok(Ingested::Foreign);
-            }
             match prepare(state, entry, repo, &co, r, tv, &PrepOpts::default()).await {
                 Ok(p) => (None, Some(co.tree.clone()), Some(p)),
                 // Not a fact about the commit (a newer format than this server reads, a pinned package
@@ -2050,12 +2257,14 @@ async fn ingest(
         store_prepared(&mut tx, entry, vid, &track, p).await?;
     }
     publish::submit_release(&mut tx, entry, vid, review, actor).await?;
-    // A tag judged not this entry's earlier and since moved onto a release of it.
-    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1 AND tag = $2")
-        .bind(entry.id)
-        .bind(&r.name)
-        .execute(&mut *tx)
-        .await?;
+    // A tag judged not this entry's earlier and since moved onto a release of it; its read is done.
+    for table in ["foreign_tags", "tag_reads"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE entry_id = $1 AND tag = $2"))
+            .bind(entry.id)
+            .bind(&r.name)
+            .execute(&mut *tx)
+            .await?;
+    }
     crate::audit::audit_with(
         &mut tx,
         None,
@@ -2772,17 +2981,72 @@ mod tests {
         assert!(claimed_by("2.0.0", &explicit, &bare).is_some(), "a different pattern still claims");
     }
 
-    /// A tag the stored rule picks is the entry's only if the manifest inside reads it the same way.
+    fn entry(name: &str) -> Entry {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        Entry {
+            id: 1,
+            kind: "sim".into(),
+            owner: "max".into(),
+            name: name.into(),
+            summary: None,
+            description: None,
+            visibility: "public".into(),
+            verified: false,
+            trusted: false,
+            curated: false,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn sims_manifest(pattern: Option<&str>) -> git::FileAt {
+        let pat = pattern.map(|p| format!("tag-pattern = \"{p}\"\n")).unwrap_or_default();
+        git::FileAt::Content(format!("format = 1\n\n[sim]\nname = \"s\"\nowners = [\"max\"]\nfile = \"a.sim\"\n{pat}").into_bytes())
+    }
+
+    /// Each tag is read by the manifest in its own commit.
     #[test]
-    fn self_consistency() {
+    fn a_tag_is_read_by_the_manifest_in_its_commit() {
+        let e = entry("s");
+        let judge1 = |tag: &str, own: &git::FileAt| judge(&e, SIM_FILE, Some("file"), tag, own, &[], None);
+        // No pattern: the standard form.
+        assert!(matches!(judge1("v1.0.0", &sims_manifest(None)), Exam::Version { error: None, .. }));
+        assert!(matches!(judge1("sim-v1.0.0", &sims_manifest(None)), Exam::Not { kind: "rule", .. }));
+        // A pattern at this commit: only its tags, from here on, without any switch.
+        assert!(matches!(judge1("sim-v2.0.0", &sims_manifest(Some("sim-v{major}.{minor}.{patch}"))), Exam::Version { .. }));
+        assert!(matches!(judge1("v2.0.0", &sims_manifest(Some("sim-v{major}.{minor}.{patch}"))), Exam::Not { kind: "rule", .. }));
+        // No manifest: never a version, whatever the repo.
+        assert!(matches!(judge1("v1.0.0", &git::FileAt::Absent), Exam::Not { kind: "absent", .. }));
+        // Unreadable: invalid when the standard form reads the tag, else not a version.
+        let broken = git::FileAt::Content(b"format = 1\n[sim\n".to_vec());
+        assert!(matches!(judge1("v1.1.0", &broken), Exam::Version { error: Some(_), .. }));
+        assert!(matches!(judge1("sim-v1.1.0", &broken), Exam::Not { kind: "unreadable", .. }));
+        let newest = rule(Some("sim-v{major}.{minor}.{patch}"));
+        assert!(matches!(judge(&e, SIM_FILE, Some("file"), "sim-v1.1.0", &broken, &[], Some(&newest)), Exam::Version { error: Some(_), .. }));
+        // A newer format waits.
+        let newer = git::FileAt::Content(b"format = 99\n".to_vec());
+        assert!(matches!(judge1("v1.0.0", &newer), Exam::Wait(_)));
+        // Another entry's name is not a version of this one.
+        assert!(matches!(judge(&entry("other"), SIM_FILE, None, "v1.0.0", &sims_manifest(None), &[], None), Exam::Not { kind: "identity", .. }));
+        // A sibling's own pattern at the same commit claims what the standard form would read.
+        let pkg = git::FileAt::Content(
+            b"format = 1\n\n[package]\nname = \"p\"\nowners = [\"max\"]\ntag-pattern = \"{major}.{minor}.{patch}\"\n".to_vec(),
+        );
+        let sibs = [("max/p".to_owned(), PACKAGE_FILE, &pkg)];
+        assert!(matches!(judge(&e, SIM_FILE, None, "2.0.0", &sims_manifest(None), &sibs, None), Exam::Not { kind: "claim", .. }));
+        assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &sims_manifest(None), &sibs, None), Exam::Version { .. }));
+    }
+
+    /// Among tags read as one version, the spelling the manifest's pattern writes wins, then the
+    /// standard one, then any other.
+    #[test]
+    fn spellings_rank() {
         let tv = |s: &str| s.parse::<TrackedVersion>().unwrap();
-        let sims = rule(Some("sim-v{major}.{minor}.{patch}"));
-        assert_eq!(inconsistent(&sims, SIM_FILE, "sim-v1.0.0", &tv("1.0.0")), None);
-        // A later manifest that dropped its pattern doesn't read sim-v tags at all.
-        let dropped = inconsistent(&rule(None), SIM_FILE, "sim-v2.0.0", &tv("2.0.0")).unwrap();
-        assert!(dropped.contains("isn't one of"), "{dropped}");
-        // One that reads the tag as another version.
-        let other = rule(Some("sim-v{major}.{minor}"));
-        assert!(inconsistent(&other, SIM_FILE, "sim-v2.0", &tv("2.1.0")).unwrap().contains("as 2.0.0"));
+        let rel = rule(Some("rel-{major}.{minor}"));
+        assert_eq!(spelling_rank(&rel, "rel-1.0", &tv("1.0.0")), 0);
+        assert_eq!(spelling_rank(&rel, "rel-01.0", &tv("1.0.0")), 2);
+        assert_eq!(spelling_rank(&rule(None), "v1.0.0", &tv("1.0.0")), 1);
+        assert_eq!(spelling_rank(&rule(None), "1.0.0", &tv("1.0.0")), 2);
     }
 }

@@ -46,18 +46,21 @@ migrates and restarts.
 Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>]`, `check <url> --tag <tag>
-[--commit <ref>]`, `publish-sim`, `sync`, `reread-rule <user> <owner/name> [--tag <tag>]`,
-`reread <admin> <owner/name> <version>`, `move-repo`, `reapply`, `token`. Create the `et`
+[--commit <ref>]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>`, `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
 - `register` reads each new entry at its newest tag (or exactly `--tag`) before writing anything,
   and creates every new entry in one transaction; on a repo that already has entries it adds only
   the missing ones. `check` is the same reading as a dry run (nothing written), also for tags that
   don't exist yet (`--commit` names the commit or branch they would name).
-- `reread-rule` makes an entry follow the tag rule of its manifest on the default branch (or at
-  `--tag`): the only way an entry switches tag schemes. `reread` reads an invalid version of a
-  non-curated repo entry again (valid if it reads cleanly now; removed if its tag isn't the
-  entry's).
+- Each tag is read by the entry's manifest in the tag's commit (`tag-pattern`, else
+  `[track/]vX.Y.Z`, and its `since`): a manifest change applies to the tags carrying it, with no
+  admin step. `reread` reads an invalid version of a non-curated repo entry again (valid if it
+  reads cleanly now, or from another tag naming that version; removed if the tag isn't a version
+  of the entry at all).
+- New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
+  uses 25): after deploying, the first polls examine the existing tags of big repos over a few
+  checks, and an entry's new versions are frozen once all its tags have been examined.
 - `move-repo` moves every entry on the repo together.
 - A database that ran an early build of the multi-sim branch (with `0012_multi_sim.sql`, or
   `0013_multi_sim.sql` before it was renumbered to 0014) refuses to start: "migration 12 (or 13) was

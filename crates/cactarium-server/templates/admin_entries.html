@@ -33,8 +33,6 @@
     <form method="post" action="/admin/entries/{{ e.id }}" class="row-wrap small">
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
       <span class="muted">{{ e.tag_rule }}</span>
-      <label class="sr-only" for="rt{{ e.id }}">Tag to read the rule at</label><input id="rt{{ e.id }}" name="tag" class="small-input mono" placeholder="tag (default branch)">
-      <button class="button small ghost" name="action" value="reread-rule" title="Read the tag rule from the manifest on the default branch, or at the tag given">Re-read tag rule</button>
       <label class="sr-only" for="rv{{ e.id }}">Invalid version</label><input id="rv{{ e.id }}" name="version" class="small-input mono" placeholder="invalid version">
       <button class="button small ghost" name="action" value="reread-version" title="Read an invalid version again at its frozen commit: valid if it reads cleanly now, removed if its tag isn't this entry's">Re-read invalid version</button>
     </form>

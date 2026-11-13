@@ -341,8 +341,8 @@ pub struct RepoManage {
     pub tag_rule: String,
     /// The other entries on the same repo (`owner/name`).
     pub siblings: Vec<String>,
-    /// Re-reading the tag rule applies (not a curated entry, whose rule is its overlay's).
-    pub can_reread: bool,
+    /// A curated entry, whose stored rule (its overlay's) decides; for others it is only a hint.
+    pub curated: bool,
     /// Tags its rule picks that turned out not to be its own: (tag, why), newest first.
     pub foreign: Vec<(String, String)>,
     /// `<base>/hooks`, to which the template appends `/<forge>/<entry id>`.

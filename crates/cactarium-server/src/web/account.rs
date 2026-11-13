@@ -425,31 +425,6 @@ pub async fn refresh(
 }
 
 #[derive(Deserialize)]
-pub struct RuleForm {
-    /// Read the manifest at this tag instead of on the default branch.
-    #[serde(default)]
-    tag: Option<String>,
-    #[serde(rename = "_csrf")]
-    csrf: String,
-}
-
-/// "Re-read tag rule": the entry follows the tag rule its manifest gives on the default branch (or
-/// at a named tag) from now on. How an entry switches tag schemes.
-pub async fn reread_rule(
-    State(state): State<AppState>,
-    s: SignedIn,
-    ip: ClientIp,
-    Path((owner, name)): Path<(String, String)>,
-    Form(f): Form<RuleForm>,
-) -> AppResult<Response> {
-    s.session.check_csrf(&f.csrf)?;
-    state.limiter.check("refresh", ip.0, 10)?;
-    let e = managed(&state, &s, &owner, &name).await?;
-    tracker::reread_rule(&state, &s.user, &e, f.tag.as_deref()).await?;
-    Ok(Redirect::to(&e.url()).into_response())
-}
-
-#[derive(Deserialize)]
 pub struct YankForm {
     version_id: i64,
     yank: String,

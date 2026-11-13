@@ -191,12 +191,23 @@ const STDERR_TAIL: usize = 64 * 1024;
 /// bytes: git has no size limit on what a fetch downloads. However the command ends early (a time
 /// limit, a cap, the caller going away), git is killed.
 async fn exec(
-    mut cmd: Command,
+    cmd: Command,
     input: Option<String>,
     what: &str,
     limit: Duration,
     watch: Option<(&Path, u64)>,
 ) -> anyhow::Result<String> {
+    exec_raw(cmd, input, what, limit, watch).await.map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// [`exec`], with the output as git printed it (bytes, not text).
+async fn exec_raw(
+    mut cmd: Command,
+    input: Option<String>,
+    what: &str,
+    limit: Duration,
+    watch: Option<(&Path, u64)>,
+) -> anyhow::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if input.is_some() {
         cmd.stdin(Stdio::piped());
@@ -254,7 +265,7 @@ async fn exec(
         }
         // A write error (a closed pipe) matters only if git otherwise succeeded.
         written.with_context(|| format!("{what}: cannot write to git"))?;
-        anyhow::Ok(String::from_utf8_lossy(&out).into_owned())
+        anyhow::Ok(out)
     };
     let watched = async {
         let Some((dir, max)) = watch else { return std::future::pending().await };
@@ -491,11 +502,7 @@ pub async fn resolve_commit_prefix(
     if prefix.len() == 40 || prefix.len() == 64 {
         return Ok(PrefixMatch::One(prefix.to_owned()));
     }
-    let root = private_root().await?;
-    // Keyed by the stored URL (normalized when the repo was registered), so a lookup the mirror can
-    // answer needs no DNS; the URL is checked when an update goes out to the network.
-    let key = url.trim().trim_end_matches('/');
-    let dir = root.join(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(key.as_bytes())));
+    let (root, key, dir) = mirror_of(url).await?;
     let home = tempfile::tempdir()?;
     let mut broken = false;
     if mirror_complete(&dir).await {
@@ -521,6 +528,128 @@ pub async fn resolve_commit_prefix(
     }
 }
 
+/// The mirror root, a repo's key and its mirror's directory. Keyed by the stored URL (normalized
+/// when the repo was registered), so a lookup the mirror can answer needs no DNS; the URL is checked
+/// when an update goes out to the network.
+async fn mirror_of(url: &str) -> anyhow::Result<(PathBuf, String, PathBuf)> {
+    let root = private_root().await?;
+    let key = url.trim().trim_end_matches('/').to_owned();
+    let dir = root.join(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(key.as_bytes())));
+    Ok((root, key, dir))
+}
+
+/// Whether the mirror is missing (or lacks any of) `commits`.
+async fn lacks_commits(policy: GitPolicy, dir: &Path, commits: &[String]) -> bool {
+    if !mirror_complete(dir).await {
+        return true;
+    }
+    let Ok(home) = tempfile::tempdir() else { return true };
+    let mut c = git(policy, home.path());
+    c.arg("-C").arg(dir).args(["cat-file", "--batch-check=%(objecttype)"]);
+    let input: String = commits.iter().map(|c| format!("{c}\n")).collect();
+    match run_with_input(c, input, "looking up the tagged commits").await {
+        Ok(out) => out.lines().any(|l| l.trim() != "commit"),
+        Err(_) => true,
+    }
+}
+
+/// A file as a commit has it.
+pub enum FileAt {
+    /// The commit has no such file.
+    Absent,
+    /// Larger than [`MAX_FILE_AT`]: its size.
+    TooLarge(u64),
+    Content(Vec<u8>),
+}
+
+/// The largest file [`read_files_at`] returns, like [`read_in`].
+pub const MAX_FILE_AT: u64 = 4 * 1024 * 1024;
+
+/// Reads files at commits from the repo's history mirror, without checking anything out: the
+/// mirror is fetched when a commit isn't in it (at most once per [`MIRROR_REFRESH`]), and the
+/// blobs it lacks (it is blobless) are fetched by id, together, from the repo. For deciding what a
+/// tag is before reading it in full. An error means the repo couldn't be read right now.
+pub async fn read_files_at(policy: GitPolicy, url: &str, wants: &[(String, String)]) -> anyhow::Result<Vec<FileAt>> {
+    if wants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (root, key, dir) = mirror_of(url).await?;
+    let home = tempfile::tempdir()?;
+    let mut commits: Vec<String> = wants.iter().map(|(c, _)| c.clone()).collect();
+    commits.sort_unstable();
+    commits.dedup();
+    if lacks_commits(policy, &dir, &commits).await {
+        let error = update_mirror_if(policy, key.clone(), root, dir.clone(), false, Some(commits.clone())).await;
+        if lacks_commits(policy, &dir, &commits).await {
+            bail!("{}", error.unwrap_or_else(|| "the tagged commits aren't in the repo's history yet".into()));
+        }
+    }
+    // Each file's blob id, or none.
+    let mut oids: Vec<Option<String>> = Vec::with_capacity(wants.len());
+    for (commit, path) in wants {
+        let mut c = git(policy, home.path());
+        c.arg("-C").arg(&dir).args(["ls-tree", commit, "--", path]);
+        let out = run(c, "listing the commit's files").await?;
+        oids.push(out.lines().find_map(|l| {
+            let (meta, _) = l.split_once('\t')?;
+            let mut parts = meta.split_whitespace();
+            let (_, kind, oid) = (parts.next()?, parts.next()?, parts.next()?);
+            (kind == "blob").then(|| oid.to_owned())
+        }));
+    }
+    let mut unique: Vec<&str> = oids.iter().flatten().map(String::as_str).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    let sizes = |dir: PathBuf, unique: Vec<String>| {
+        let home = home.path().to_path_buf();
+        async move {
+            let mut c = git(policy, &home);
+            c.arg("-C").arg(&dir).args(["cat-file", "--batch-check=%(objectname) %(objectsize)"]);
+            let input: String = unique.iter().map(|o| format!("{o}\n")).collect();
+            let out = run_with_input(c, input, "looking up the files").await?;
+            let mut found = std::collections::HashMap::new();
+            for l in out.lines() {
+                let mut p = l.split_whitespace();
+                if let (Some(oid), Some(size)) = (p.next(), p.next())
+                    && let Ok(n) = size.parse::<u64>()
+                {
+                    found.insert(oid.to_owned(), n);
+                }
+            }
+            Ok::<_, anyhow::Error>(found)
+        }
+    };
+    let unique: Vec<String> = unique.into_iter().map(str::to_owned).collect();
+    let mut found = sizes(dir.clone(), unique.clone()).await?;
+    let absent: Vec<&String> = unique.iter().filter(|o| !found.contains_key(*o)).collect();
+    if !absent.is_empty() {
+        let t = check(policy, &key).await?;
+        for chunk in absent.chunks(200) {
+            let mut c = git_to(policy, home.path(), &t);
+            c.arg("-C").arg(&dir).args(["fetch", "--quiet", "--no-write-fetch-head", "--", &t.url]);
+            c.args(chunk.iter().map(|o| o.as_str()));
+            run(c, "fetching the files").await?;
+        }
+        found = sizes(dir.clone(), unique.clone()).await?;
+    }
+    let mut out = Vec::with_capacity(wants.len());
+    for oid in oids {
+        let Some(oid) = oid else {
+            out.push(FileAt::Absent);
+            continue;
+        };
+        let size = *found.get(&oid).ok_or_else(|| anyhow!("the repo didn't send file {oid}"))?;
+        if size > MAX_FILE_AT {
+            out.push(FileAt::TooLarge(size));
+            continue;
+        }
+        let mut c = git(policy, home.path());
+        c.arg("-C").arg(&dir).args(["cat-file", "blob", &oid]);
+        out.push(FileAt::Content(exec_raw(c, None, "reading a file", TIMEOUT, None).await?));
+    }
+    Ok(out)
+}
+
 fn classify(mut found: Vec<String>) -> PrefixMatch {
     match found.len() {
         0 => PrefixMatch::None,
@@ -540,10 +669,28 @@ async fn update_mirror(
     dir: PathBuf,
     broken: bool,
 ) -> Option<String> {
+    update_mirror_if(policy, url, root, dir, broken, None).await
+}
+
+/// [`update_mirror`]; with `needed`, the update skips the window when those commits (which the repo
+/// just listed, so they exist) aren't in the mirror yet, once the lock is held: a tag pushed a
+/// moment after the last update is read at once, and concurrent callers fetch once.
+async fn update_mirror_if(
+    policy: GitPolicy,
+    url: String,
+    root: PathBuf,
+    dir: PathBuf,
+    broken: bool,
+    needed: Option<Vec<String>>,
+) -> Option<String> {
     let lock = mirror_lock(&dir);
     let task = tokio::spawn(async move {
         let mut state = lock.lock_owned().await;
-        if state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH) {
+        let lacking = match &needed {
+            Some(commits) => lacks_commits(policy, &dir, commits).await,
+            None => false,
+        };
+        if !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH) {
             return state.error.clone();
         }
         let result = async {
