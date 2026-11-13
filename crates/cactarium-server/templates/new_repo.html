@@ -38,10 +38,11 @@
     <input type="hidden" name="owner" value="{{ owner }}">
     <input type="hidden" name="fingerprint" value="{{ p.fingerprint }}">
     <input type="hidden" name="confirm" value="1">
+    {% for e in p.entries %}{% if !e.shown.is_empty() %}<input type="hidden" name="row" value="{{ e.shown }}">{% endif %}{% endfor %}
     <div class="table-box"><table><thead><tr><th scope="col">Register</th><th scope="col">Entry</th><th scope="col">Kind</th><th scope="col">Manifest</th><th scope="col">Starts at</th><th scope="col">Version</th><th scope="col">Tag rule</th><th scope="col">Review</th><th scope="col">Notes</th></tr></thead><tbody>
     {% for e in p.entries %}
     <tr>
-      <td>{% if e.status == "new" %}<input type="checkbox" name="only" value="{{ e.name }}" id="only-{{ e.file }}" checked aria-label="Register {{ e.slug }}">{% else %}<span class="muted small">{% if e.status == "existing" %}already registered{% else if e.status == "fails" %}can't be registered{% else %}skipped{% endif %}</span>{% endif %}</td>
+      <td>{% if e.status == "new" %}<input type="checkbox" name="only" value="{{ e.file }}" id="only-{{ e.file }}" checked aria-label="Register {{ e.slug }}">{% else %}<span class="muted small">{% if e.status == "existing" %}already registered{% else if e.status == "fails" %}can't be registered{% else if e.status == "needs-tag" %}needs a tag: name it in the Tag field above{% else %}skipped{% endif %}</span>{% endif %}</td>
       <td class="mono">{{ e.slug }}</td>
       <td>{{ e.kind }}</td>
       <td class="mono">{{ e.file }}</td>
@@ -53,7 +54,7 @@
     </tr>
     {% endfor %}
     </tbody></table></div>
-    <p class="muted small">Registering is all or nothing for the entries checked; an entry left unchecked can be registered later the same way. A reviewed entry is public once an admin approves it; an auto-approved one is public at once. If the repo changes before you confirm, nothing is registered and the new preview is shown.</p>
+    <p class="muted small">Registering is all or nothing for the entries checked; an entry left unchecked can be registered later the same way. Leaving one out can change which tags the others start from (its tag-pattern no longer claims them): then nothing is registered, and the preview for that choice is shown to confirm instead. A reviewed entry is public once an admin approves it; an auto-approved one is public at once. If the repo changes before you confirm, nothing is registered and the new preview is shown.</p>
     <button class="button" type="submit">Register the checked entries</button>
   </form>
   {% endif %}

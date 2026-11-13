@@ -104,11 +104,13 @@ pub async fn new_repo_page(State(state): State<AppState>, s: SignedIn) -> AppRes
 }
 
 /// The registration form, in two steps: without `confirm`, the preview (a dry run, writing
-/// nothing); with it, registering the new entries checked (`only`, repeated), refused when the
-/// preview's `fingerprint` no longer matches the repo. Read by hand: the checkboxes repeat a key.
+/// nothing); with it, registering the new entries checked (`only`, repeated, by manifest file),
+/// each as it was shown (`row`, repeated), refused when any of that no longer reads the same. Read
+/// by hand: the checkboxes repeat a key.
 pub async fn new_repo(State(state): State<AppState>, s: SignedIn, ip: ClientIp, body: axum::body::Bytes) -> AppResult<Response> {
-    let (mut csrf, mut url, mut owner, mut tag, mut fingerprint, mut confirm, mut only) =
-        (String::new(), String::new(), String::new(), String::new(), String::new(), false, Vec::new());
+    let (mut csrf, mut url, mut owner, mut tag, mut fingerprint, mut confirm) =
+        (String::new(), String::new(), String::new(), String::new(), String::new(), false);
+    let (mut only, mut rows) = (Vec::new(), Vec::new());
     for (k, v) in url::form_urlencoded::parse(&body) {
         match k.as_ref() {
             "_csrf" => csrf = v.into_owned(),
@@ -120,46 +122,48 @@ pub async fn new_repo(State(state): State<AppState>, s: SignedIn, ip: ClientIp, 
             "fingerprint" => fingerprint = v.into_owned(),
             "confirm" => confirm = true,
             "only" => only.push(v.into_owned()),
+            "row" => rows.push(v.into_owned()),
             _ => {}
         }
     }
     s.session.check_csrf(&csrf)?;
-    // A preview reads the repo as registering does, but writes nothing: its own, roomier budget.
-    if confirm {
-        state.limiter.check("register", ip.0, 10)?;
-    } else {
-        state.limiter.check("register-preview", ip.0, 30)?;
-    }
-    let shown = |error: Option<String>| repo_preview_page(&state, &s, &url, &owner, &tag, error);
     if !confirm {
-        return shown(None).await;
+        // A preview reads the repo as registering does, but writes nothing: limited per address
+        // and, over an hour, per user.
+        state.limiter.check("register-preview", ip.0, 60)?;
+        state.limiter.check_user("register-preview", s.user.id, state.cfg.previews_per_hour, std::time::Duration::from_secs(3600))?;
+        let at = if tag.is_empty() { tracker::At::Newest } else { tracker::At::Tag(&tag) };
+        let result = async {
+            let who = tracker::registrant_owner(&state, &s.user, Some(&owner)).await?;
+            tracker::preview(&state, Some(&s.user), Some(&who), &url, at, None).await
+        }
+        .await;
+        return match result {
+            Ok(p) => repo_page(&state, &s, &url, &owner, &tag, None, Some(p.preview)),
+            Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
+                repo_page(&state, &s, &url, &owner, &tag, Some(m), None)
+            }
+            Err(e) => Err(e),
+        };
     }
+    state.limiter.check("register", ip.0, 10)?;
     if only.is_empty() {
-        return shown(Some("Check at least one entry to register.".into())).await;
+        return repo_page(&state, &s, &url, &owner, &tag, Some("Check at least one entry to register, then preview again.".into()), None);
     }
-    match tracker::register(&state, &s.user, &url, Some(&owner), Some(&tag), &only, Some(&fingerprint)).await {
+    let mut refused = None;
+    let choice = tracker::Choice::Shown { files: &only, rows: &rows, fingerprint: &fingerprint };
+    match tracker::register(&state, &s.user, &url, Some(&owner), Some(&tag), choice, &mut refused).await {
         Ok(done) => Ok(Redirect::to(&done.entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into())).into_response()),
-        Err(AppError::Conflict(m)) if m == tracker::PREVIEW_CHANGED => shown(Some(format!("Nothing was registered: {m}."))).await,
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => shown(Some(m)).await,
+        // The preview register worked out is shown as it is: the repo isn't read again.
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
+            repo_page(&state, &s, &url, &owner, &tag, Some(m), refused)
+        }
         Err(e) => Err(e),
     }
 }
 
-/// The registration page with the preview of registering `url` now (or why there is none).
-async fn repo_preview_page(state: &AppState, s: &SignedIn, url: &str, owner: &str, tag: &str, error: Option<String>) -> AppResult<Response> {
-    let at = if tag.is_empty() { tracker::At::Newest } else { tracker::At::Tag(tag) };
-    let result = async {
-        let who = tracker::registrant_owner(state, &s.user, Some(owner)).await?;
-        tracker::preview(state, Some(&s.user), Some(&who), url, at).await
-    }
-    .await;
-    let (preview, error) = match result {
-        Ok(p) => (Some(p.preview), error),
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
-            (None, Some(error.map(|e| format!("{e} {m}")).unwrap_or(m)))
-        }
-        Err(e) => return Err(e),
-    };
+/// The registration page, with a preview to confirm if there is one.
+fn repo_page(state: &AppState, s: &SignedIn, url: &str, owner: &str, tag: &str, error: Option<String>, preview: Option<tracker::Preview>) -> AppResult<Response> {
     Ok(page(&NewRepoPage {
         ctx: PageCtx::new(state, Some(&s.session)),
         url: url.to_owned(),

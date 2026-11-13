@@ -8,7 +8,9 @@ library only. Exits non-zero on the first failure.
     deploy/smoke.py [http://localhost:8000]
 """
 
+import html
 import http.cookiejar
+import hashlib
 import json
 import re
 import subprocess
@@ -74,20 +76,29 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def confirm_body(v, data, text, uncheck=()):
+    """The confirm a preview page posts: every new entry checked (except the manifest files in
+    `uncheck`), each row as shown."""
+    m = re.search(r'name="fingerprint" value="([^"]*)"', text)
+    files = re.findall(r'name="only" value="([^"]*)"', text)
+    rows = [html.unescape(r) for r in re.findall(r'name="row" value="([^"]*)"', text)]
+    return urllib.parse.urlencode(
+        [("_csrf", v.csrf), ("url", data["url"]), ("tag", data.get("tag", "")), ("owner", data.get("owner", "")),
+         ("fingerprint", m.group(1) if m else ""), ("confirm", "1")]
+        + [("only", f) for f in files if f not in uncheck] + [("row", r) for r in rows]).encode()
+
+def confirm_post(v, body):
+    return v.req("POST", "/new/repo", raw=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+
 def web_register(v, data, uncheck=()):
     """/new/repo in its two steps: the preview, then confirming it with every new entry checked
-    (except the manifest names in `uncheck`). Returns the confirm's answer, or the preview's when
+    (except the manifest files in `uncheck`). Returns the confirm's answer, or the preview's when
     there is nothing to confirm."""
     v.get("/new/repo")
     s, text, h = v.post("/new/repo", data)
-    m = re.search(r'name="fingerprint" value="([^"]*)"', text)
-    if s != 200 or not m:
+    if s != 200 or 'name="fingerprint"' not in text:
         return s, text, h
-    names = re.findall(r'name="only" value="([^"]*)"', text)
-    body = [("_csrf", v.csrf), ("url", data["url"]), ("tag", data.get("tag", "")), ("owner", data.get("owner", "")),
-            ("fingerprint", m.group(1)), ("confirm", "1")] + [("only", n) for n in names if n not in uncheck]
-    return v.req("POST", "/new/repo", raw=urllib.parse.urlencode(body).encode(),
-                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return confirm_post(v, confirm_body(v, data, text, uncheck))
 
 def check(what, ok, detail=""):
     print(("ok   " if ok else "FAIL ") + what + ("" if ok else f"  ({detail})"))
@@ -1754,19 +1765,18 @@ wtbare = publish_tree(WT, "webtwo")
 maxv.get("/new/repo")
 s, text, _ = maxv.post("/new/repo", {"url": WTURL, "owner": "max"})
 check("step one previews each new entry, checked, writing nothing",
-      s == 200 and 'name="only" value="webtwo" ' in text and 'name="only" value="webtwo-sims" ' in text
+      s == 200 and 'name="only" value="cactarium.toml" ' in text and 'name="only" value="cactarium-sim.toml" ' in text
       and "auto-approved" in text and "v1.0.0" in text, text[text.find("<table"):][:900])
 page(anon, "/max/webtwo", expect=404)
 # The repo changes before the confirm: refused, with the new preview.
-old_fp = re.search(r'name="fingerprint" value="([^"]*)"', text).group(1)
+old_body = confirm_body(maxv, {"url": WTURL, "owner": "max"}, text, uncheck=("cactarium-sim.toml",))
 commit_tag(WT, "1.1", "v1.1.0")
 push_all(WT, wtbare)
-body = [("_csrf", maxv.csrf), ("url", WTURL), ("tag", ""), ("owner", "max"), ("fingerprint", old_fp), ("confirm", "1"), ("only", "webtwo")]
-s, text, _ = maxv.req("POST", "/new/repo", raw=urllib.parse.urlencode(body).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})
+s, text, _ = confirm_post(maxv, old_body)
 check("a preview that changed before the confirm is refused, showing the new one",
       s == 200 and "the repo changed since the preview" in text and "v1.1.0" in text, text[text.find("alert"):][:400])
 page(anon, "/max/webtwo", expect=404)
-s, text, _ = web_register(maxv, {"url": WTURL, "owner": "max"}, uncheck=("webtwo-sims",))
+s, text, _ = web_register(maxv, {"url": WTURL, "owner": "max"}, uncheck=("cactarium-sim.toml",))
 check("confirming with an entry unchecked registers only the checked one", s == 303 and has_version(anon, "max/webtwo", "1.1.0"), f"{s} {text[text.find('alert'):][:300]}")
 page(anon, "/max/webtwo-sims", expect=404)
 s, text, _ = web_register(maxv, {"url": WTURL, "owner": "max"})
@@ -1774,6 +1784,75 @@ check("and the unchecked one can be registered later", s == 303 and has_version(
 stack_page = page(maxv, "/new/stack")
 check("/new/stack links to /new/repo for stacks from a repo, with no form of its own for it",
       'href="/new/repo"' in stack_page and 'action="/new/repo"' not in stack_page)
+
+# --- A repo with more tags than a preview reads (40 on the dev site): discovery never picks from a
+# partial read; the entry needs a tag named, and registering with it works.
+MT = new_tree("manytags")
+MTURL = REPOS + "/manytags.git"
+thorn_at(MT, "MtArr")
+write(MT, "cactarium.toml", package_toml("manytags", "MtArr"))
+for i in range(45):
+    commit_tag(MT, f"1.{i}", f"v1.{i}.0")
+publish_tree(MT, "manytags")
+ok, out = cli("check", MTURL)
+check("a preview of a repo with more tags than it reads asks for a tag instead of guessing",
+      "needs a tag package cactarium.toml" in out and "not all could be read" in out and "new package" not in out, out[-500:])
+ok, out = cli("register", "max", MTURL)
+check("and registering without one registers nothing", not ok and "name the tag to start from" in out, out[-400:])
+page(anon, "/max/manytags", expect=404)
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": MTURL, "owner": "max"})
+check("the web preview shows the row as needing a tag", s == 200 and "needs a tag: name it in the Tag field above" in text, text[text.find("<table"):][:600])
+ok, out = cli("register", "max", MTURL, "--tag", "v1.44.0")
+check("registering with the tag works", ok and "Registered max/manytags (package" in out and "at v1.44.0" in out, out[-400:])
+
+# --- A preview of a repo nobody registered yet leaves no mirror behind, temporary or kept.
+TM = new_tree("tempmirror")
+TMURL = REPOS + "/tempmirror.git"
+thorn_at(TM, "TmArr")
+write(TM, "cactarium.toml", package_toml("tempmirror", "TmArr"))
+commit_tag(TM, "1.0", "v1.0.0")
+publish_tree(TM, "tempmirror")
+maxv.get("/new/repo")
+s, text, _ = maxv.post("/new/repo", {"url": TMURL, "owner": "max"})
+def in_app(script):
+    return subprocess.run(["docker", "compose", "--project-directory", "deploy", "-f", "deploy/compose.yaml", "-f", "deploy/compose.dev.yaml",
+                           "exec", "-T", "app", "sh", "-c", script], capture_output=True, text=True).stdout.strip()
+kept = hashlib.sha256(TMURL.encode()).hexdigest()
+check("a preview of an unregistered repo leaves no temporary mirror, and keeps none",
+      s == 200 and "v1.0.0" in text and in_app("ls -d /tmp/cactarium-preview-* 2>/dev/null | wc -l") == "0"
+      and in_app(f"ls -d \"${{CACTARIUM_MIRRORS:-/tmp/cactarium-mirrors}}/{kept}\" 2>/dev/null | wc -l") == "0")
+ok, out = cli("register", "max", TMURL)
+check("once registered, the repo's mirror is kept (where the check above looked)",
+      ok and in_app(f"ls -d \"${{CACTARIUM_MIRRORS:-/tmp/cactarium-mirrors}}/{kept}\" 2>/dev/null | wc -l") == "1", out[-300:])
+
+# --- Leaving out a sibling whose own pattern claims a tag changes where the other starts: the confirm
+# is refused with the preview for that choice, on the website and with --only.
+R3 = new_tree("r3repo")
+R3URL = REPOS + "/r3repo.git"
+thorn_at(R3, "R3Arr")
+write(R3, "cactarium.toml", package_toml("r3repo", "R3Arr"))
+r3_c = commit_tag(R3, "2.5", "v2.5.0")
+write(R3, "a.sim", pin_sim("alpha", [("r3repo", "R3Arr", R3URL, r3_c)]))
+write(R3, "cactarium-sim.toml", sims_toml("r3repo-sims", {"alpha": "a.sim"}, pattern="{major}.{minor}.{patch}"))
+commit_tag(R3, "sims on bare tags", "3.0.0")
+publish_tree(R3, "r3repo")
+s, text, _ = web_register(maxv, {"url": R3URL, "owner": "max"}, uncheck=("cactarium-sim.toml",))
+check("unchecking a sibling whose pattern claims a tag is refused, with the preview for that choice",
+      s == 200 and "leaving out cactarium-sim.toml changes them" in text and "now starts at 3.0.0" in text
+      and 'name="only" value="cactarium.toml"' in text, text[text.find("alert"):][:500])
+page(anon, "/max/r3repo", expect=404)
+ok, out = cli("register", "max", R3URL, "--only", "r3repo")
+check("--only is refused the same way", not ok and "leaving out cactarium-sim.toml" in out, out[-400:])
+ok, out = cli("register", "max", R3URL)
+check("registering both starts the package at v2.5.0 and the sims at 3.0.0",
+      ok and "from cactarium.toml at v2.5.0" in out and "from cactarium-sim.toml at 3.0.0" in out, out[-400:])
+
+# --- Previews are limited per user over an hour (20), beside the per-address limit.
+carol = Visitor("carol")
+carol.get("/new/repo")
+codes = [carol.post("/new/repo", {"url": REPOS + "/nowhere.git"})[0] for _ in range(21)]
+check("the 21st preview within the hour is refused for the user", codes[:20] == [200] * 20 and codes[20] == 429, codes)
 
 # --- The seeded multi-sim entry, found at its tag and registered beside its package.
 page(anon, "/max/bbh-demo-sims", contains="Sims in this version")

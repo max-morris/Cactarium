@@ -232,9 +232,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Register { username, url, owner, tag, only } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
-            let done = tracker::register(&state, &user, &url, owner.as_deref(), tag.as_deref(), &only, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let choice = if only.is_empty() { tracker::Choice::All } else { tracker::Choice::Names(&only) };
+            let mut refused = None;
+            let done = match tracker::register(&state, &user, &url, owner.as_deref(), tag.as_deref(), choice, &mut refused).await {
+                Ok(done) => done,
+                Err(e) => {
+                    if let Some(p) = refused {
+                        for l in tracker::preview_lines(&p) {
+                            eprintln!("{l}");
+                        }
+                    }
+                    anyhow::bail!("{e}");
+                }
+            };
             for (e, (file, tag, version)) in done.entries.iter().zip(&done.from) {
                 println!("Registered {} ({}, {}) from {file} at {tag}: version {version}", e.slug(), e.kind, e.visibility);
             }

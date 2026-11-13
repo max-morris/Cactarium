@@ -391,6 +391,8 @@ pub struct Skipped {
     /// Its manifest's name, when one was read.
     pub name: Option<String>,
     pub note: String,
+    /// Left out because not every tag could be read: registering it needs a tag named.
+    pub needs_tag: bool,
 }
 
 /// What registering a repo would do: the entries already on it, the ones it would add, and the
@@ -457,9 +459,14 @@ pub enum At<'a> {
 /// With a tag named, only the manifests there that read it as one of their versions are planned,
 /// at it; the others are left out, with a note (register again without the tag to add them).
 ///
+/// With `files`, only those manifest files are candidates, and the claims among new entries are
+/// those of the chosen ones alone, as their syncs will apply them.
+///
 /// Entries already on the repo stay as they are; they must be `owner`'s. Without an owner (a dry
 /// run), the repo's existing owner is assumed, else the first owner the first new manifest lists.
-pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) -> AppResult<Plan> {
+/// A repo nobody registered yet is read through a temporary mirror, deleted afterward: only a
+/// registration keeps one.
+pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>, files: Option<&[String]>) -> AppResult<Plan> {
     let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
     let existing = entries_on(state, &url).await?;
     if let Some(owner) = owner
@@ -472,7 +479,9 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
         )));
     }
     let have: Vec<&str> = existing.iter().map(|(_, f)| f.as_str()).collect();
+    let chosen = |f: &str| files.is_none_or(|o| o.iter().any(|x| x == f));
     let refs = git::ls_tags(policy(state), &url).await.map_err(AppError::bad)?;
+    let mirrors = if existing.is_empty() { git::Mirrors::temp().map_err(AppError::Internal)? } else { git::Mirrors::Shared };
     let mut new = Vec::new();
     let mut skipped = Vec::new();
     match at {
@@ -490,9 +499,33 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
             }
             let head_rules: BTreeMap<&'static str, TagRule> =
                 on_head.iter().filter_map(|(f, m)| m.as_ref().map(|m| (*f, TagRule::of_manifest(m)))).collect();
-            let files: Vec<&'static str> = MANIFEST_FILES.iter().copied().filter(|f| !have.contains(f)).collect();
+            let files: Vec<&'static str> = MANIFEST_FILES.iter().copied().filter(|f| !have.contains(f) && chosen(f)).collect();
             if !files.is_empty() {
-                let found = discover(state, &url, &refs, &files, &existing, &head_rules).await?;
+                let found = discover(state, &mirrors, &url, &refs, &files, &existing, &head_rules).await?;
+                // A partial read never picks quietly: the newest release may be among the tags
+                // left unread (and with it the entry's name, rule and form), so every candidate
+                // needs a tag named instead.
+                if found.unread > 0 {
+                    let why = format!(
+                        "the repo has {} tags and not all could be read ({} were: at most {} per preview, at most {} of them from a checkout, and only commits already in its history); name the tag to start from",
+                        refs.len(),
+                        found.read,
+                        state.cfg.preview_tags,
+                        state.cfg.preview_checkouts
+                    );
+                    let mut any = false;
+                    for file in &files {
+                        let name = found.seen.get(file).map(|(_, n)| n.clone()).or_else(|| {
+                            on_head.iter().find(|(f, _)| f == file).map(|(_, m)| m.as_ref().map(name_of))
+                        });
+                        let Some(name) = name else { continue };
+                        any = true;
+                        skipped.push(Skipped { file, name, note: format!("{file}: {why}"), needs_tag: true });
+                    }
+                    if !any {
+                        return Err(AppError::bad(why));
+                    }
+                } else {
                 for file in &files {
                     match found.best.get(file) {
                         Some((r, tv)) => {
@@ -535,19 +568,14 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
                                 })
                             });
                             let Some((rule, name)) = read else { continue };
-                            let note = if found.unread > 0 {
-                                format!(
-                                    "{file} follows {}, and none of the {} tags read of the repo's {} is one of its releases: it isn't registered now; register with --tag naming its newest release",
-                                    rule.describe(),
-                                    found.read,
-                                    refs.len()
-                                )
-                            } else {
-                                format!("{file} follows {}, and the repo has none of its tags yet: it isn't registered now; register again once it has one", rule.describe())
-                            };
-                            skipped.push(Skipped { file, name, note });
+                            let note = format!(
+                                "{file} follows {}, and the repo has none of its tags yet: it isn't registered now; register again once it has one",
+                                rule.describe()
+                            );
+                            skipped.push(Skipped { file, name, note, needs_tag: false });
                         }
                     }
+                }
                 }
                 if found.seen.is_empty() && on_head.is_empty() && existing.is_empty() {
                     return Err(AppError::bad(if refs.is_empty() {
@@ -559,14 +587,11 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
             }
         }
         At::Tag(_) | At::Commit { .. } => {
-            plan_at_tag(state, &url, &refs, &existing, &have, at, &mut new, &mut skipped).await?;
+            plan_at_tag(state, &url, &refs, &existing, &have, at, files, &mut new, &mut skipped).await?;
         }
     }
-    if new.is_empty() && !skipped.is_empty() {
-        let notes: Vec<&str> = skipped.iter().map(|s| s.note.as_str()).collect();
-        return Err(AppError::bad(format!("nothing to register now: {}", notes.join("; "))));
-    }
-    if new.is_empty() {
+    drop(mirrors);
+    if new.is_empty() && skipped.is_empty() {
         let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
         return Err(AppError::bad(format!("{url} already has every entry its manifests give: {}; nothing to add", list.join(", "))));
     }
@@ -575,7 +600,7 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
         None => existing
             .first()
             .map(|(e, _)| e.owner.clone())
-            .or_else(|| owners_of(&new[0].manifest).into_iter().next())
+            .or_else(|| new.first().and_then(|p| owners_of(&p.manifest).into_iter().next()))
             .unwrap_or_default(),
     };
     for i in 0..new.len() {
@@ -605,6 +630,7 @@ async fn plan_at_tag(
     existing: &[(Entry, String)],
     have: &[&str],
     at: At<'_>,
+    files: Option<&[String]>,
     new: &mut Vec<Planned>,
     skipped: &mut Vec<Skipped>,
 ) -> AppResult<()> {
@@ -640,7 +666,8 @@ async fn plan_at_tag(
     if found.is_empty() {
         return Err(AppError::bad(format!("no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {}", r.name)));
     }
-    let candidates: Vec<(&'static str, Manifest)> = found.into_iter().filter(|(f, _)| !have.contains(f)).collect();
+    let candidates: Vec<(&'static str, Manifest)> =
+        found.into_iter().filter(|(f, _)| !have.contains(f) && files.is_none_or(|o| o.iter().any(|x| x == f))).collect();
     let all_rules: Vec<TagRule> = candidates.iter().map(|(_, m)| TagRule::of_manifest(m)).collect();
     for (i, (file, m)) in candidates.into_iter().enumerate() {
         let rule = all_rules[i].clone();
@@ -664,6 +691,7 @@ async fn plan_at_tag(
             }
             (_, why) => skipped.push(Skipped {
                 file,
+                needs_tag: false,
                 name: Some(name_of(&m)),
                 note: format!(
                     "{file} at {} follows {}{}, so {} isn't one of its versions: it isn't registered now; register again without --tag to add it",
@@ -691,12 +719,14 @@ struct Discovered {
 /// Finds each manifest file's newest release the way syncing reads tags: a tag is a release of a
 /// file when the file's manifest at the tag's commit reads it as a version under its own rule, and
 /// no sibling's manifest there (an entry already on the repo, or another of `files`) claims it
-/// ([`judge`]). At most the configured number of tags are read (likeliest first: those the
-/// standard form, a default-branch manifest's rule or an existing entry's rule reads, newest
-/// first, then the rest), and at most so many from a checkout. When the repo's manifests can't be
-/// read right now, that is the error.
+/// ([`judge`]). At most the preview's number of tags are read (in version order under any known
+/// rule: the standard form, a default-branch manifest's or an existing entry's, newest first; then
+/// the rest by name), and at most so many from a checkout; how many were left unread is counted,
+/// and the caller treats any as "name a tag" rather than pick from a partial read. When the repo's
+/// manifests can't be read right now, that is the error.
 async fn discover(
     state: &AppState,
+    mirrors: &git::Mirrors,
     url: &str,
     refs: &[RemoteRef],
     files: &[&'static str],
@@ -717,17 +747,17 @@ async fn discover(
         (Some(x), Some(y)) => y.cmp(x).then_with(|| a.1.name.cmp(&b.1.name)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => b.1.name.cmp(&a.1.name),
+        (None, None) => a.1.name.cmp(&b.1.name),
     });
-    let cap = state.cfg.examine_per_sync;
+    let cap = state.cfg.preview_tags;
     let tags: Vec<RemoteRef> = order.iter().take(cap).map(|(_, r)| (*r).clone()).collect();
     let all_files: Vec<String> = files.iter().map(|f| f.to_string()).chain(existing.iter().map(|(_, f)| f.clone())).collect();
-    let mut checkouts = state.cfg.checkouts_per_sync;
+    let mut checkouts = state.cfg.preview_checkouts;
     let mut out = Discovered { best: BTreeMap::new(), seen: BTreeMap::new(), read: 0, unread: refs.len() - tags.len() };
     // Best so far per file: (default track, version, -rank, tag) is largest for the newest.
     let mut rank_of: BTreeMap<&'static str, i32> = BTreeMap::new();
     for group in tags.chunks(25) {
-        for (r, got) in group.iter().zip(read_tags(state, url, group, &all_files, &mut checkouts).await) {
+        for (r, got) in group.iter().zip(read_tags(state, mirrors, url, group, &all_files, &mut checkouts).await) {
             let reads = match got {
                 TagFiles::Reads(reads) => reads,
                 TagFiles::Not { .. } => {
@@ -796,8 +826,9 @@ async fn discover(
 }
 
 /// One row of a registration's preview: an entry it would create (`new`), one already on the
-/// repo (`existing`), a manifest it leaves out (`skipped`), or an entry that can't be registered
-/// as it is (`fails`), with why in `note`. Serialized as the registration API will serve it.
+/// repo (`existing`), a manifest it leaves out (`skipped`), one that needs a tag named to start
+/// from (`needs-tag`: not every tag could be read), or an entry that can't be registered as it is
+/// (`fails`), with why in `note`. Serialized as the registration API will serve it.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PreviewEntry {
     pub slug: String,
@@ -810,15 +841,14 @@ pub struct PreviewEntry {
     pub review: Option<String>,
     pub status: &'static str,
     pub note: Option<String>,
-    /// The manifest's name (what `--only` and the form's checkboxes name).
+    /// The row as shown, for a new or failing entry (`file|tag|commit|version|status`): a confirm
+    /// sends it back, and is refused unless the row still reads the same.
     #[serde(skip)]
-    pub name: String,
-    #[serde(skip)]
-    pub commit: Option<String>,
+    pub shown: String,
 }
 
-/// What registering a repo would do, row by row, and a fingerprint of it: a registration confirmed
-/// from a preview is refused when the repo has changed since.
+/// What registering a repo would do, row by row, and a fingerprint of the entries already on it:
+/// a registration confirmed from a preview is refused when those, or any row chosen, changed since.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Preview {
     pub url: String,
@@ -836,10 +866,11 @@ pub struct Previewed {
 }
 
 /// The dry run of registering `url` under `owner` (as `user`, if known: whether new entries are
-/// reviewed depends on who registers them), writing nothing: [`plan`], then each new entry read at
-/// its tag exactly as its first sync will read it.
-pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>, url: &str, at: At<'_>) -> AppResult<Previewed> {
-    let plan = plan(state, owner, url, at).await?;
+/// reviewed depends on who registers them), writing nothing: [`plan`] (of `files` only, if given),
+/// then each new entry read at its tag exactly as its first sync will read it. Its cost is bounded
+/// like discovery's: at most one checkout per new entry beyond those.
+pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>, url: &str, at: At<'_>, files: Option<&[String]>) -> AppResult<Previewed> {
+    let plan = plan(state, owner, url, at, files).await?;
     let registering: Vec<String> =
         if plan.new.iter().any(|p| p.kind == "package") { vec![git::normalize_url(&plan.url)] } else { vec![] };
     let opts = PrepOpts { defer_pins: true, registering };
@@ -856,8 +887,7 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
             review: None,
             status: "existing",
             note: Some("already registered".to_owned()),
-            name: e.name.clone(),
-            commit: None,
+            shown: String::new(),
         });
     }
     let mut prepared = Vec::with_capacity(plan.new.len());
@@ -884,8 +914,7 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
             review: (status == "new").then(|| if skips { "auto-approved" } else { "reviewed" }.to_owned()),
             status,
             note: Some(note),
-            name: p.name.clone(),
-            commit: Some(p.tag.commit.clone()),
+            shown: format!("{}|{}|{}|{}|{status}", p.file, p.tag.name, p.tag.commit, p.tv),
         });
         prepared.push(ready);
     }
@@ -898,24 +927,14 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
             version: None,
             rule: None,
             review: None,
-            status: "skipped",
+            status: if s.needs_tag { "needs-tag" } else { "skipped" },
             note: Some(s.note.clone()),
-            name: s.name.clone().unwrap_or_default(),
-            commit: None,
+            shown: String::new(),
         });
     }
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
-    for e in &entries {
-        let line = format!(
-            "{}|{}|{}|{}|{}|{}\n",
-            e.status,
-            e.slug,
-            e.file,
-            e.tag.as_deref().unwrap_or(""),
-            e.commit.as_deref().unwrap_or(""),
-            e.version.as_deref().unwrap_or("")
-        );
-        sha2::Digest::update(&mut h, line.as_bytes());
+    for e in entries.iter().filter(|e| e.status == "existing") {
+        sha2::Digest::update(&mut h, format!("{}|{}\n", e.slug, e.file).as_bytes());
     }
     let fingerprint = hex::encode(&sha2::Digest::finalize(h)[..12]);
     Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared })
@@ -954,15 +973,28 @@ pub struct Registered {
     pub notes: Vec<String>,
 }
 
+/// Which new entries a registration makes.
+pub enum Choice<'a> {
+    /// Every new entry.
+    All,
+    /// The new entries with these manifest names (`--only`). They are planned again with only
+    /// them as new siblings, as their syncs will judge their tags; if that changes any of them
+    /// (leaving out a sibling with a pattern of its own, say), nothing is registered.
+    Names(&'a [String]),
+    /// Confirmed from a preview: these manifest files, each row as it was shown (`rows`, as
+    /// [`PreviewEntry::shown`]), and the fingerprint of the entries already on the repo then. Planned
+    /// again with only them as new siblings; if any of that differs, nothing is registered.
+    Shown { files: &'a [String], rows: &'a [String], fingerprint: &'a str },
+}
+
 /// Registers the manifests a repo carries as entries, then syncs their tags. The entries go under
 /// the user's own name, or under `namespace` (an organization of theirs, or for admins, a name
 /// that is no user's, such as `et`). That name must be in each manifest's `owners`: only someone
 /// who can push to the repo can put it there. A repo that already has entries gets only the
-/// missing ones. `only` names the new entries to register (by manifest name; empty: all of them),
-/// and `expect` the fingerprint of the preview they were chosen from: when the repo has changed
-/// since, nothing is registered ([`PREVIEW_CHANGED`]). Each new entry is read at its tag first,
-/// as its first sync will read it; if one chosen can't be registered, nothing is. The entries are
-/// created, attached and audited in one transaction.
+/// missing ones; `choice` says which ([`Choice`]). Each new entry is read at its tag first, as its
+/// first sync will read it; if one chosen can't be registered, nothing is. When it refuses after
+/// working out a preview, that preview is left in `refused`, to show without reading the repo
+/// again. The entries are created, attached and audited in one transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn register(
     state: &AppState,
@@ -970,47 +1002,82 @@ pub async fn register(
     url: &str,
     namespace: Option<&str>,
     tag: Option<&str>,
-    only: &[String],
-    expect: Option<&str>,
+    choice: Choice<'_>,
+    refused: &mut Option<Preview>,
 ) -> AppResult<Registered> {
     let owner = registrant_owner(state, user, namespace).await?;
-    let at = match tag.map(str::trim).filter(|t| !t.is_empty()) {
+    let tag = tag.map(str::trim).filter(|t| !t.is_empty());
+    let at = || match tag {
         Some(t) => At::Tag(t),
         None => At::Newest,
     };
-    let Previewed { preview, plan, prepared } = preview(state, Some(user), Some(&owner), url, at).await?;
-    if expect.is_some_and(|fp| fp != preview.fingerprint) {
-        return Err(AppError::Conflict(PREVIEW_CHANGED.into()));
-    }
-    for name in only {
-        if !plan.new.iter().any(|p| &p.name == name) {
-            let names: Vec<&str> = plan.new.iter().map(|p| p.name.as_str()).collect();
-            return Err(AppError::bad(format!("no new entry named '{name}' to register (new here: {})", names.join(", "))));
+    // The new entries left out, for the notes.
+    let mut left: Vec<String> = Vec::new();
+    let Previewed { preview, plan, prepared } = match choice {
+        Choice::All => preview(state, Some(user), Some(&owner), url, at(), None).await?,
+        Choice::Names(names) => {
+            let full = preview(state, Some(user), Some(&owner), url, at(), None).await?;
+            let mut files = Vec::new();
+            for name in names {
+                match full.plan.new.iter().find(|p| &p.name == name) {
+                    Some(p) => files.push(p.file.to_owned()),
+                    None => {
+                        let new: Vec<&str> = full.plan.new.iter().map(|p| p.name.as_str()).collect();
+                        *refused = Some(full.preview);
+                        return Err(AppError::bad(format!("no new entry named '{name}' to register (new here: {})", new.join(", "))));
+                    }
+                }
+            }
+            left = full.plan.new.iter().filter(|p| !names.contains(&p.name)).map(|p| format!("{}/{} ({})", full.plan.owner, p.name, p.file)).collect();
+            if files.len() == full.plan.new.len() {
+                full
+            } else {
+                let shown: Vec<String> = full.preview.entries.iter().filter(|e| !e.shown.is_empty()).map(|e| e.shown.clone()).collect();
+                let chosen = preview(state, Some(user), Some(&owner), url, at(), Some(&files)).await?;
+                if let Some(why) = differs(&chosen.preview, &files, &shown, &full.preview.fingerprint) {
+                    *refused = Some(chosen.preview);
+                    return Err(AppError::Conflict(why));
+                }
+                chosen
+            }
         }
-    }
-    let chosen = |p: &Planned| only.is_empty() || only.contains(&p.name);
+        Choice::Shown { files, rows, fingerprint } => {
+            left = rows.iter().filter_map(|r| r.split('|').next()).filter(|f| !files.iter().any(|x| x == f)).map(str::to_owned).collect();
+            let chosen = preview(state, Some(user), Some(&owner), url, at(), Some(files)).await?;
+            if let Some(why) = differs(&chosen.preview, files, rows, fingerprint) {
+                *refused = Some(chosen.preview);
+                return Err(AppError::Conflict(why));
+            }
+            chosen
+        }
+    };
     let failing: Vec<String> = preview
         .entries
         .iter()
-        .filter(|e| e.status == "fails" && plan.new.iter().any(|p| p.name == e.name && p.file == e.file && chosen(p)))
+        .filter(|e| e.status == "fails")
         .map(|e| format!("{}@{} (tag {}): {}", e.slug, e.version.as_deref().unwrap_or(""), e.tag.as_deref().unwrap_or(""), e.note.as_deref().unwrap_or("")))
         .collect();
     if !failing.is_empty() {
+        *refused = Some(preview);
         return Err(AppError::bad(format!("nothing was registered: {}", failing.join("; "))));
     }
+    if plan.new.is_empty() {
+        let notes: Vec<&str> = plan.skipped.iter().map(|s| s.note.as_str()).collect();
+        *refused = Some(preview);
+        return Err(AppError::bad(format!("nothing to register now: {}", notes.join("; "))));
+    }
     let mut notes: Vec<String> = plan.skipped.iter().map(|s| s.note.clone()).collect();
+    notes.extend(left.iter().map(|l| format!("{l} isn't registered now: not chosen; register again to add it")));
     for (p, r) in plan.new.iter().zip(&prepared) {
-        let label = format!("{owner}/{}@{}", p.name, p.tv);
-        if !chosen(p) {
-            notes.push(format!("{owner}/{} ({}) isn't registered now: not chosen; register again to add it", p.name, p.file));
-        } else if let Some(r) = r {
+        if let Some(r) = r {
+            let label = format!("{owner}/{}@{}", p.name, p.tv);
             notes.extend(r.deferred.iter().map(|d| format!("{label} waits: {d}")));
         }
     }
     let mut tx = state.db.begin().await?;
     let mut entries = Vec::new();
     let mut from = Vec::new();
-    for p in plan.new.iter().filter(|p| chosen(p)) {
+    for p in &plan.new {
         let entry = publish::create_entry_in(
             &mut tx,
             state,
@@ -1065,6 +1132,54 @@ pub async fn register(
     Ok(Registered { entries, from, notes })
 }
 
+/// Why a preview planned for the files chosen differs from what was shown (`rows`, as
+/// [`PreviewEntry::shown`], for every new or failing entry then; `fingerprint`, of the entries
+/// already on the repo then), if it does: a chosen row reads differently now (the repo changed, or
+/// leaving out a sibling changes whose tags are whose), or isn't a new entry anymore, or the
+/// entries on the repo changed.
+fn differs(now: &Preview, files: &[String], rows: &[String], fingerprint: &str) -> Option<String> {
+    let file_of = |row: &str| row.split('|').next().unwrap_or("").to_owned();
+    let left_out: Vec<String> = rows.iter().map(|r| file_of(r)).filter(|f| !files.contains(f)).collect();
+    let mut changed = Vec::new();
+    for file in files {
+        let was = rows.iter().find(|r| file_of(r) == *file);
+        let is = now.entries.iter().find(|e| &e.file == file && !e.shown.is_empty());
+        match (was, is) {
+            (Some(w), Some(e)) if *w == e.shown => {}
+            (_, Some(e)) => {
+                let old = was.map(|w| {
+                    let parts: Vec<&str> = w.split('|').collect();
+                    format!("{} ({})", parts.get(1).unwrap_or(&""), parts.get(3).unwrap_or(&""))
+                });
+                changed.push(format!(
+                    "{} now starts at {} ({}){}{}",
+                    e.slug,
+                    e.tag.as_deref().unwrap_or(""),
+                    e.version.as_deref().unwrap_or(""),
+                    old.map(|o| format!(", not {o}")).unwrap_or_default(),
+                    if e.status == "fails" { ", and can't be registered" } else { "" }
+                ));
+            }
+            (_, None) => changed.push(format!(
+                "{file} {}",
+                now.entries.iter().find(|e| &e.file == file).and_then(|e| e.note.clone()).unwrap_or_else(|| "is no new entry now".to_owned())
+            )),
+        }
+    }
+    if changed.is_empty() && now.fingerprint == fingerprint {
+        return None;
+    }
+    let what = if changed.is_empty() { "the entries already on the repo changed".to_owned() } else { changed.join("; ") };
+    Some(if left_out.is_empty() || now.fingerprint != fingerprint {
+        format!("nothing was registered: {PREVIEW_CHANGED}: {what}")
+    } else {
+        format!(
+            "nothing was registered: the entries chosen read differently than shown: {what}. Either the repo changed since the preview, or leaving out {} changes them (their syncs judge tags without it); check the new preview and confirm again",
+            left_out.join(", ")
+        )
+    })
+}
+
 /// A preview as lines of text, for the command line.
 pub fn preview_lines(p: &Preview) -> Vec<String> {
     let mut lines = Vec::new();
@@ -1084,6 +1199,7 @@ pub fn preview_lines(p: &Preview) -> Vec<String> {
             }
             "fails" => lines.push(format!("fails {} {} from {} at {tag}: {note}", e.kind, e.slug, e.file)),
             "existing" => lines.push(format!("existing {} {} ({}): {note}", e.kind, e.slug, e.file)),
+            "needs-tag" => lines.push(format!("needs a tag {} {}: {note}", e.kind, e.file)),
             _ => lines.push(format!("skipped {}: {note}", e.file)),
         }
     }
@@ -1111,7 +1227,7 @@ pub async fn check(
     let existing = entries_on(state, &checked_url).await?;
     let mut lines = Vec::new();
     let mut clean = true;
-    match preview(state, None, owner, url, at).await {
+    match preview(state, None, owner, url, at, None).await {
         Ok(p) => {
             clean = !p.preview.entries.iter().any(|e| e.status == "fails");
             lines.extend(preview_lines(&p.preview));
@@ -2384,9 +2500,9 @@ enum TagFiles {
 /// as plain content (a symbolic link, or a host that refuses blobs by id) is read from a checkout,
 /// with `read_in`'s containment rules, while `checkouts` lasts (each one used counts down; past it,
 /// the tag is unexamined). When the repo can't be read at all, every tag is unexamined.
-async fn read_tags(state: &AppState, url: &str, tags: &[RemoteRef], files: &[String], checkouts: &mut usize) -> Vec<TagFiles> {
+async fn read_tags(state: &AppState, mirrors: &git::Mirrors, url: &str, tags: &[RemoteRef], files: &[String], checkouts: &mut usize) -> Vec<TagFiles> {
     let wants: Vec<(String, String)> = tags.iter().flat_map(|r| files.iter().map(|f| (r.commit.clone(), f.clone()))).collect();
-    let got = match git::read_files_at(policy(state), url, &wants).await {
+    let got = match git::read_files_in(policy(state), mirrors, url, &wants).await {
         Ok(f) => f,
         Err(e) => {
             let why = format!("cannot read the repo's manifests right now: {e:#}");
@@ -2458,7 +2574,7 @@ async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[Remote
         sib_newest.push(Some(unreadable_rule(state, e.id).await?));
     }
     let files: Vec<String> = std::iter::once(repo.manifest_file.clone()).chain(sibs.iter().map(|(_, f)| f.clone())).collect();
-    let got = read_tags(state, &repo.url, tags, &files, checkouts).await;
+    let got = read_tags(state, &git::Mirrors::Shared, &repo.url, tags, &files, checkouts).await;
     let newest = Some(unreadable_rule(state, entry.id).await?);
     let mut out = Vec::with_capacity(tags.len());
     for (r, got) in tags.iter().zip(got) {

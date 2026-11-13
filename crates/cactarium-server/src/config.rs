@@ -37,6 +37,13 @@ pub struct Config {
     /// symbolic link, or a host that refuses files by id); the rest wait for later syncs
     /// (`CACTARIUM_CHECKOUTS_PER_SYNC`, default 40).
     pub checkouts_per_sync: usize,
+    /// A registration preview (and a registration's discovery) reads at most this many tags
+    /// (`CACTARIUM_PREVIEW_TAGS`, default 100); a repo with more needs a tag named.
+    pub preview_tags: usize,
+    /// ... and at most this many of them from a checkout (`CACTARIUM_PREVIEW_CHECKOUTS`, default 5).
+    pub preview_checkouts: usize,
+    /// Registration previews per user per hour (`CACTARIUM_PREVIEWS_PER_HOUR`, default 20).
+    pub previews_per_hour: u32,
     /// Where the static files are.
     pub static_dir: String,
     /// The base URL of CactUp's own documentation (its CLI and the `.sim` format), which the
@@ -103,6 +110,9 @@ impl Config {
                 .unwrap_or(4 * 3600),
             examine_per_sync: var("CACTARIUM_EXAMINE_PER_SYNC").map(|s| s.parse()).transpose()?.unwrap_or(300).max(1),
             checkouts_per_sync: var("CACTARIUM_CHECKOUTS_PER_SYNC").map(|s| s.parse()).transpose()?.unwrap_or(40).max(1),
+            preview_tags: var("CACTARIUM_PREVIEW_TAGS").map(|s| s.parse()).transpose()?.unwrap_or(100).max(1),
+            preview_checkouts: var("CACTARIUM_PREVIEW_CHECKOUTS").map(|s| s.parse()).transpose()?.unwrap_or(5),
+            previews_per_hour: var("CACTARIUM_PREVIEWS_PER_HOUR").map(|s| s.parse()).transpose()?.unwrap_or(20).max(1),
             static_dir: var("CACTARIUM_STATIC_DIR").unwrap_or_else(|| "static".into()),
             cactup_docs_url: var("CACTUP_DOCS_URL")
                 .unwrap_or_else(|| DEFAULT_CACTUP_DOCS_URL.into())
