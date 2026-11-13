@@ -59,6 +59,20 @@ organization with `just cli org create et <your-username> --display-name "Einste
   non-curated repo entry again (valid if it reads cleanly now; removed if its tag isn't the
   entry's).
 - `move-repo` moves every entry on the repo together.
+- A database that ran an early build of the multi-sim branch (with `0012_multi_sim.sql`, or
+  `0013_multi_sim.sql` before it was renumbered to 0014) refuses to start: "migration 12 (or 13) was
+  previously applied but has been modified". Production on master or the retry-not-freeze release
+  never ran those builds and is unaffected. For a dev or smoke database, reset it: `just dev-reset`
+  (`just smoke` does). To keep such a database instead, undo what that build's migration did and
+  forget it, so the renumbered migrations reapply it (with
+  `docker compose --project-directory deploy -f deploy/compose.yaml exec -T db psql -U cactarium -d
+  cactarium`, since `just cli` won't start): `DROP TABLE foreign_tags; ALTER TABLE entry_repos DROP
+  COLUMN IF EXISTS sim_form; ALTER TABLE sim_files DROP CONSTRAINT sim_files_pkey; ALTER TABLE
+  sim_files DROP COLUMN name; ALTER TABLE sim_files ADD PRIMARY KEY (version_id); ALTER TABLE
+  source_pins DROP CONSTRAINT source_pins_pkey; ALTER TABLE source_pins DROP COLUMN sim; ALTER TABLE
+  source_pins ADD PRIMARY KEY (version_id, repo); DELETE FROM _sqlx_migrations WHERE description
+  = 'multi sim';`. That works only before any multi-sim version was stored (several rows per
+  version can't go back to one); otherwise reset.
 - Rollback: a binary from the retry-not-freeze release on starts on a database a later release
   migrated; leaves unread (never freezes) the tags it can't read: format-2 manifests, format-4
   sims, a tag without an entry's manifest on a repo with several entries; skips the tags this
@@ -93,7 +107,9 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
    Then the packages that carry their own `cactarium.toml` rather than a curated one:
    `just cli register --owner et <you> https://github.com/EinsteinToolkit/Cottonmouth`.
    Cottonmouth's example sims (`cactarium-sim.toml` with `[sim.files]` and
-   `tag-pattern = "sim-v{major}.{minor}.{patch}"`, not on its `main`): first, before tagging,
+   `tag-pattern = "sim-v{major}.{minor}.{patch}"`, not on its `main`), once `et/cottonmouth` is
+   registered by the plain `register` above (`--tag` registers only the manifests that read the tag
+   it names): first, before tagging,
    `just cli check https://github.com/EinsteinToolkit/Cottonmouth --tag sim-v1.0.0 --commit <commit>`
    (the commit's pins must all be public packages, and `et/cottonmouth`'s stored URL must match the
    pins'), then, once `sim-v1.0.0` is pushed,

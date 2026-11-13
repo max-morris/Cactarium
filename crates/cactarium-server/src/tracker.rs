@@ -115,10 +115,20 @@ impl TagRule {
         }
     }
 
+    /// The pattern as it acts among siblings: one that reads exactly the standard non-track form
+    /// (`v{major}.{minor}.{patch}`) counts as no pattern, so it shares the standard tags with the
+    /// kinds that declare none instead of claiming them.
+    fn distinct_pattern(&self) -> Option<&TagPattern> {
+        self.pattern.as_ref().filter(|p| p.as_str() != STANDARD_PATTERN)
+    }
+
     fn same_pattern(&self, other: &TagRule) -> bool {
-        self.stored().0 == other.stored().0
+        self.distinct_pattern().map(TagPattern::as_str) == other.distinct_pattern().map(TagPattern::as_str)
     }
 }
+
+/// The standard non-track tag form, written as a pattern: declaring it is the same as declaring none.
+const STANDARD_PATTERN: &str = "v{major}.{minor}.{patch}";
 
 /// A tag's form, for telling tag schemes apart: its digits replaced, `sim-v#.#.#` for `sim-v1.2.0`.
 fn tag_form(tag: &str) -> String {
@@ -291,8 +301,7 @@ pub struct Plan {
     pub owner: String,
     pub existing: Vec<(Entry, String)>,
     pub new: Vec<Planned>,
-    /// How the plan came about where it isn't obvious (a manifest planned from its own newest tag
-    /// rather than the tag named).
+    /// What the plan leaves out and why (a manifest at the tag named that doesn't read it).
     pub notes: Vec<String>,
 }
 
@@ -307,8 +316,8 @@ pub enum At<'a> {
 /// Works out what registering `url` under `owner` would add, without writing anything. Each
 /// manifest's own rule finds its own newest tag (leaving out tags another kind's own tag-pattern
 /// reads), and the manifest there must read that tag as that version (self-consistency). With a
-/// tag named, the manifests there that read it as one of their versions are planned at it; the
-/// others from their own newest tags. Entries already on the repo stay as they are; they
+/// tag named, only the manifests there that read it as one of their versions are planned, at it;
+/// the others are left out, with a note (register again without the tag to add them). Entries already on the repo stay as they are; they
 /// must be `owner`'s. Without an owner (a dry run), the repo's existing owner is assumed, else
 /// the first owner the first new manifest lists.
 pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) -> AppResult<Plan> {
@@ -404,17 +413,22 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
                     new.push(Planned { file, kind: kind_of(file), name: name_of(m), manifest: m.clone(), rule, tag: r.clone(), tv, co: co.clone() });
                     continue;
                 }
-                (_, why) => notes.push(format!(
-                    "{file} at {} follows {}{}, so {} isn't one of its versions: it is planned from its own newest tag",
-                    r.name,
-                    rule.describe(),
-                    why.map(|w| format!(" ({w})")).unwrap_or_default(),
-                    r.name
-                )),
+                (_, why) => {
+                    notes.push(format!(
+                        "{file} at {} follows {}{}, so {} isn't one of its versions: it isn't registered now; register again without --tag to add it",
+                        r.name,
+                        rule.describe(),
+                        why.map(|w| format!(" ({w})")).unwrap_or_default(),
+                        r.name
+                    ));
+                    continue;
+                }
             }
         }
+        // Leaving out what others' patterns claim before tags naming one version are deduplicated, so
+        // a claimed bare 1.0.0 can't hide this kind's own v1.0.0.
         let tags: Vec<(RemoteRef, TrackedVersion)> =
-            version_tags(refs.clone(), &rule).into_iter().filter(|(r, _)| claimed(&r.name).is_none()).collect();
+            version_tags(refs.iter().filter(|r| claimed(&r.name).is_none()).cloned().collect(), &rule);
         let Some((r, tv)) = newest(&tags) else {
             if fallback {
                 continue;
@@ -451,6 +465,9 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) 
                 r.name
             )),
         });
+    }
+    if new.is_empty() && !notes.is_empty() {
+        return Err(AppError::bad(format!("nothing to register at that tag: {}", notes.join("; "))));
     }
     if new.is_empty() {
         let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
@@ -812,6 +829,9 @@ pub async fn update_curated(
         None,
     )
     .await?;
+    // The rule may have changed: the repo's "not this entry's" judgments are made again.
+    clear_foreign_on(&mut tx, state, &current).await?;
+    clear_foreign_on(&mut tx, state, &url).await?;
     tx.commit().await?;
     drop(one_at_a_time);
     sync_as(state, entry, Some(admin), Pace::Now).await
@@ -867,6 +887,8 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
         .await?;
     crate::audit::audit_with(&mut tx, Some(admin.id), "curated.hand-over", Some(&entry.slug()), json!({ "head": head }), None)
         .await?;
+    // The rule is the repo manifest's now: the repo's "not this entry's" judgments are made again.
+    clear_foreign_on(&mut tx, state, &repo.url).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1032,7 +1054,7 @@ pub async fn reread_rule(state: &AppState, user: &User, entry: &Entry, tag: Opti
         .bind(&since)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = $1").bind(entry.id).execute(&mut *tx).await?;
+    clear_foreign_on(&mut tx, state, &repo.url).await?;
     crate::audit::audit_with(
         &mut tx,
         Some(user.id),
@@ -1434,6 +1456,31 @@ async fn sync_inner(
             .await?;
     }
 
+    // Tags a sibling's own tag-pattern reads are the sibling's: recorded as not this entry's and left
+    // out before tags naming one version are deduplicated, so a claimed bare 1.0.0 can't hide this
+    // entry's own v1.0.0.
+    let own_rule = TagRule::of(repo)?;
+    let mut sibling_rules = Vec::new();
+    if repo.overlay_manifest.is_none() {
+        for sib in siblings(state, entry.id, &repo.url).await? {
+            if let Some(r) = repo_of(state, sib.id).await? {
+                sibling_rules.push((sib.slug(), TagRule::of(&r)?));
+            }
+        }
+    }
+    let mut refs_left = Vec::new();
+    for r in refs {
+        let claim = sibling_rules.iter().find_map(|(slug, theirs)| claimed_by(&r.name, &own_rule, theirs).map(|why| format!("it is {slug}'s release: {why}")));
+        match claim {
+            Some(why) if own_rule.version(&r.name).is_some() => {
+                if !by_tag.contains_key(r.name.as_str()) && foreign.get(&r.name) != Some(&r.commit) {
+                    record_foreign(state, entry, &r, &why, repo.tag_pattern.as_deref()).await?;
+                }
+            }
+            _ => refs_left.push(r),
+        }
+    }
+    let refs = refs_left;
     // Tags left unread earlier (waiting_tags): tried again after the new ones, with backoff.
     let waiting = waiting_of(state, entry.id, &remote).await?;
     let (mut added, mut read) = (0, 0);
@@ -1671,7 +1718,7 @@ async fn foreign_reason(
     let Ok(m) = Manifest::from_repo_file(&repo.manifest_file, &text) else { return Ok(None) };
     // The form (one file or [sim.files]) is the entry's, fixed when it was registered: a manifest in
     // the other form is another scheme's, not a release of this entry.
-    if let (Some(fixed), Some(here)) = (repo.sim_form.as_deref(), sim_form_of(&m))
+    if let (Some(fixed), Some(here)) = (fixed_form(entry, repo), sim_form_of(&m))
         && fixed != here
     {
         return Ok(Some(format!(
@@ -1688,11 +1735,21 @@ async fn foreign_reason(
 /// `own`: the sibling's pattern reads it and `own`'s pattern (if any) doesn't, and the two patterns
 /// differ (kinds with the same pattern share its tags). Says why.
 fn claimed_by(tag: &str, own: &TagRule, theirs: &TagRule) -> Option<String> {
-    let p = theirs.pattern.as_ref()?;
+    let p = theirs.distinct_pattern()?;
     if own.same_pattern(theirs) || own.pattern.as_ref().is_some_and(|o| o.version(tag).is_some()) {
         return None;
     }
     p.version(tag).map(|_| format!("its tag-pattern {} reads {tag}", p.as_str()))
+}
+
+/// A repo-backed sim entry's fixed form. One without a stored form (registered by an older release,
+/// after a rollback) publishes one file: older releases knew no other form.
+fn fixed_form<'a>(entry: &Entry, repo: &'a RepoRow) -> Option<&'a str> {
+    match repo.sim_form.as_deref() {
+        Some(f) => Some(f),
+        None if entry.kind == "sim" && repo.overlay_manifest.is_none() => Some("file"),
+        None => None,
+    }
 }
 
 /// A sim manifest's form: `file` or `files`; `None` for other manifests.
@@ -1714,6 +1771,15 @@ fn inconsistent(own: &TagRule, file: &str, tag: &str, tv: &TrackedVersion) -> Op
         Some(v) => Some(format!("its {file} reads {tag} as {v}, not {tv}")),
         None => Some(format!("its {file} follows {}, which {tag} isn't one of", own.describe())),
     }
+}
+
+/// Forgets every "not this entry's" judgment on a repo (every entry on its normalized URL): after a
+/// rule changes, this entry's own and those its old pattern claimed from siblings may no longer
+/// hold. Each is judged again at its entry's next sync.
+async fn clear_foreign_on(db: &mut sqlx::PgConnection, state: &AppState, url: &str) -> AppResult<()> {
+    let ids: Vec<i64> = entries_on(state, url).await?.into_iter().map(|(e, _)| e.id).collect();
+    sqlx::query("DELETE FROM foreign_tags WHERE entry_id = ANY($1)").bind(&ids).execute(&mut *db).await?;
+    Ok(())
 }
 
 /// Records `r` as not `entry`'s tag, with why (replacing an earlier judgment of the same tag).
@@ -2169,7 +2235,7 @@ async fn prepare_sims(
     // The form is the entry's, fixed at registration: switching it would change every address
     // (owner/name against owner/name/sim). A tag in the other form is recorded as not the entry's
     // before this runs (`foreign_reason`); here it is only a backstop for other readers.
-    if let Some(fixed) = repo.sim_form.as_deref()
+    if let Some(fixed) = fixed_form(entry, repo)
         && fixed != if named { "files" } else { "file" }
     {
         return Err(AppError::bad(format!(
@@ -2557,6 +2623,11 @@ mod tests {
         assert!(claimed_by("sim/v1.0.0", &plain, &slash).is_some(), "an explicit sim/v pattern is claimed too");
         assert!(claimed_by("2.0.0", &bare, &rule(Some("{major}.{minor}.{patch}"))).is_none(), "the same pattern shares its tags");
         assert!(claimed_by("v2.0.0", &plain, &plain).is_none(), "no pattern claims nothing");
+        // Declaring the standard form is declaring none: it shares the standard tags, never claims.
+        let explicit = rule(Some("v{major}.{minor}.{patch}"));
+        assert!(claimed_by("v1.2.0", &plain, &explicit).is_none());
+        assert!(plain.same_pattern(&explicit) && explicit.same_pattern(&plain));
+        assert!(claimed_by("2.0.0", &explicit, &bare).is_some(), "a different pattern still claims");
     }
 
     /// A tag the stored rule picks is the entry's only if the manifest inside reads it the same way.
