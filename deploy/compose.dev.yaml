@@ -10,6 +10,10 @@ services:
       # checkout) take several syncs.
       CACTARIUM_EXAMINE_PER_SYNC: "25"
       CACTARIUM_CHECKOUTS_PER_SYNC: "1"
+      # Small, so the smoke test sees a registration preview of a repo with more tags ask for one.
+      CACTARIUM_PREVIEW_TAGS: "40"
+      # Room for the smoke test's own registrations through the website, previews and confirms alike.
+      CACTARIUM_PREVIEWS_PER_HOUR: "30"
       CACTARIUM_SUPERADMIN: ${CACTARIUM_SUPERADMIN:-dev:max}
     volumes:
       # The demo repos sit at the same absolute path inside and outside the container, so their
