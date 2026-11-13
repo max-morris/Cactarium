@@ -172,18 +172,41 @@ fn version_tags(refs: Vec<RemoteRef>, rule: &TagRule) -> Vec<(RemoteRef, Tracked
     v
 }
 
-/// How a tag spells its version, best first: with a declared pattern, every tag it reads is its
-/// own spelling; with none, the standard `[track/]vX.Y.Z` beats a bare `X.Y.Z` (say, an old
-/// upstream tag that predates the repo's manifest), so that one never takes the release's version.
+/// How a tag spells its version, best first: the spelling a declared pattern itself writes for it
+/// (`rel-1.0` for `rel-{major}.{minor}`, no leading zeros), then the standard `[track/]vX.Y.Z`,
+/// then any other (a bare `X.Y.Z`, say an old upstream tag that predates the repo's manifest, or
+/// `rel-01.0`), so a stray spelling never takes the release's version by name.
 fn spelling_rank(rule: &TagRule, tag: &str, tv: &TrackedVersion) -> u8 {
-    if rule.pattern.is_some() || tag == tv.conventional_tag() { 0 } else { 1 }
+    if rule.pattern.as_ref().is_some_and(|p| tag == written_by(p.as_str(), tv)) {
+        0
+    } else if tag == tv.conventional_tag() {
+        1
+    } else {
+        2
+    }
+}
+
+/// The tag a pattern writes for a version: its placeholders filled in, without leading zeros.
+fn written_by(pattern: &str, tv: &TrackedVersion) -> String {
+    pattern
+        .replace("{major}", &tv.version.major.to_string())
+        .replace("{minor}", &tv.version.minor.to_string())
+        .replace("{patch}", &tv.version.patch.to_string())
+}
+
+/// Whether an entry has tags in a range that aren't read yet.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Unread {
+    No,
+    Yes,
+    /// Its repo can't be listed right now: wait rather than freeze.
+    CantTell,
 }
 
 /// Whether an entry has tags in `req` that aren't read yet: waiting ones, or ones its rule picks
-/// with neither a version nor a "not this entry's" record. When its repo can't be listed, that can't
-/// be told, and the answer is yes (wait rather than freeze).
-pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosystem_common::version::TrackedReq) -> AppResult<bool> {
-    let Some(repo) = repo_of(state, entry_id).await? else { return Ok(false) };
+/// with neither a version nor a "not this entry's" record.
+pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosystem_common::version::TrackedReq) -> AppResult<Unread> {
+    let Some(repo) = repo_of(state, entry_id).await? else { return Ok(Unread::No) };
     let rule = TagRule::of(&repo)?;
     let in_range = |tag: &str| rule.version(tag).is_some_and(|v| req.matches(&v));
     let waiting: Vec<String> = sqlx::query_scalar("SELECT tag FROM waiting_tags WHERE entry_id = $1")
@@ -191,9 +214,9 @@ pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosy
         .fetch_all(&state.db)
         .await?;
     if waiting.iter().any(|t| in_range(t)) {
-        return Ok(true);
+        return Ok(Unread::Yes);
     }
-    let Ok(refs) = git::ls_tags(policy(state), &repo.url).await else { return Ok(true) };
+    let Ok(refs) = git::ls_tags(policy(state), &repo.url).await else { return Ok(Unread::CantTell) };
     let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
     )
@@ -208,9 +231,10 @@ pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosy
     } else {
         Default::default()
     };
-    Ok(version_tags(refs, &rule)
+    let any = version_tags(refs, &rule)
         .iter()
-        .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && !foreign.contains(&r.name)))
+        .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && !foreign.contains(&r.name));
+    Ok(if any { Unread::Yes } else { Unread::No })
 }
 
 /// What a repo offers, read at its newest version tag.

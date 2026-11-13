@@ -1068,6 +1068,37 @@ cli_sync("max/cob")
 ok, out = cli_sync("max/coa")
 check("once that version is read, it is valid", ok and has_version(anon, "max/coa", "2.0.0") and "invalid" not in versions_page(maxv, "max/coa"), out[-300:])
 
+# When the dependency's repo can't be listed, the wait says so.
+tiny("coa", ["CaThorn"], '\n[[dependency]]\ntarget = "max/cob@^2"\nneeds = ["CbThorn", "CbMore"]\n')
+retag(coa, coabare, "v3.0.0")
+os.rename(cobbare, cobbare + ".away")
+ok, out = cli_sync("max/coa")
+os.rename(cobbare + ".away", cobbare)
+check("a dependency whose repo can't be listed waits, saying so",
+      not ok and "can't be listed right now" in out and not has_version(maxv, "max/coa", "3.0.0"), out[-300:])
+ok, out = cli_sync("max/coa")
+check("once it can be, a needed thorn no version in range has is a fact", "doesn&#39;t have" in versions_page(maxv, "max/coa")
+      and 'href="/max/coa/3.0.0' in versions_page(maxv, "max/coa"), out[-300:])
+
+# With a declared pattern, the spelling the pattern writes wins over another spelling of one version.
+rs = os.path.join(work, "relspell")
+os.makedirs(rs)
+open(os.path.join(rs, "README"), "w").write("old\n")
+sh("git", "init", "-q", "-b", "master", cwd=rs)
+sh("git", "add", "-A", cwd=rs); sh("git", *ident, "commit", "-q", "-m", "old", cwd=rs); sh("git", "tag", "rel-01.0", cwd=rs)
+os.makedirs(os.path.join(rs, "RsArr", "RsThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: RsThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(rs, "RsArr", "RsThorn", f), "w").write(t)
+open(os.path.join(rs, "cactarium.toml"), "w").write('format = 1\n\n[package]\nname = "relspell"\nowners = ["max"]\ndescription = "x"\ntag-pattern = "rel-{major}.{minor}"\n')
+sh("git", "add", "-A", cwd=rs); sh("git", *ident, "commit", "-q", "-m", "release", cwd=rs); sh("git", "tag", "rel-1.0", cwd=rs); sh("git", "tag", "rel-1.1", cwd=rs)
+rsbare = ENV["DEMO_REPOS"] + "/relspell.git"
+subprocess.run(["rm", "-rf", rsbare], check=True)
+sh("git", "clone", "-q", "--bare", rs, rsbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/relspell.git"], capture_output=True, text=True)
+s, r, _ = resolve_q("max/relspell@1.0.0")
+check("rel-1.0, the spelling its pattern writes, is 1.0.0, not an old rel-01.0", s == 200 and r.get("tag") == "rel-1.0", r)
+
+
 
 # A stack override naming a package registered a moment after the stack's tag waits.
 ovp = os.path.join(work, "ovpkg")

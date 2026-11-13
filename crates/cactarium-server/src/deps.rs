@@ -219,16 +219,19 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                             .bind(&alt.name)
                             .fetch_optional(&state.db)
                             .await?;
+                        use crate::tracker::Unread;
                         let unread = match (req, target_id) {
                             (Some(req), Some(id)) => crate::tracker::unread_in_range(state, id, &req).await?,
-                            _ => false,
+                            _ => Unread::No,
                         };
                         for n in missing {
                             let said = format!("the dependency on {} needs {n}, which {}@{} doesn't have", alt.target(), alt.target(), tv.label);
-                            if unread {
-                                waiting.push(format!("{said}, and a version of it in range isn't read yet"));
-                            } else {
-                                problems.push(said);
+                            match unread {
+                                Unread::Yes => waiting.push(format!("{said}, and a version of it in range isn't read yet")),
+                                Unread::CantTell => waiting.push(format!(
+                                    "{said}, and its repo can't be listed right now to see whether a version in range not read yet has it"
+                                )),
+                                Unread::No => problems.push(said),
                             }
                         }
                     }
