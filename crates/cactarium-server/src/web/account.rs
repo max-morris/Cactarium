@@ -96,48 +96,79 @@ pub async fn new_repo_page(State(state): State<AppState>, s: SignedIn) -> AppRes
         ctx: PageCtx::new(&state, Some(&s.session)),
         url: String::new(),
         tag: String::new(),
+        owner: String::new(),
         error: None,
+        preview: None,
     })?
     .into_response())
 }
 
-#[derive(Deserialize)]
-pub struct RepoForm {
-    url: String,
-    /// Admins only: the namespace to publish under, if not their own.
-    #[serde(default)]
-    owner: Option<String>,
-    /// Read the manifests at exactly this tag, instead of each kind's newest.
-    #[serde(default)]
-    tag: Option<String>,
-    #[serde(rename = "_csrf")]
-    csrf: String,
-}
-
-pub async fn new_repo(
-    State(state): State<AppState>,
-    s: SignedIn,
-    ip: ClientIp,
-    Form(f): Form<RepoForm>,
-) -> AppResult<Response> {
-    s.session.check_csrf(&f.csrf)?;
-    state.limiter.check("register", ip.0, 10)?;
-    match tracker::register(&state, &s.user, &f.url, f.owner.as_deref(), f.tag.as_deref()).await {
-        Ok(done) => {
-            Ok(Redirect::to(&done.entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into()))
-                .into_response())
+/// The registration form, in two steps: without `confirm`, the preview (a dry run, writing
+/// nothing); with it, registering the new entries checked (`only`, repeated), refused when the
+/// preview's `fingerprint` no longer matches the repo. Read by hand: the checkboxes repeat a key.
+pub async fn new_repo(State(state): State<AppState>, s: SignedIn, ip: ClientIp, body: axum::body::Bytes) -> AppResult<Response> {
+    let (mut csrf, mut url, mut owner, mut tag, mut fingerprint, mut confirm, mut only) =
+        (String::new(), String::new(), String::new(), String::new(), String::new(), false, Vec::new());
+    for (k, v) in url::form_urlencoded::parse(&body) {
+        match k.as_ref() {
+            "_csrf" => csrf = v.into_owned(),
+            "url" => url = v.trim().to_owned(),
+            // Organizations, or for admins a namespace that is no user's, to publish under.
+            "owner" => owner = v.trim().to_owned(),
+            // Read the manifests at exactly this tag, instead of each kind's newest release.
+            "tag" => tag = v.trim().to_owned(),
+            "fingerprint" => fingerprint = v.into_owned(),
+            "confirm" => confirm = true,
+            "only" => only.push(v.into_owned()),
+            _ => {}
         }
-        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
-            Ok(page(&NewRepoPage {
-                ctx: PageCtx::new(&state, Some(&s.session)),
-                url: f.url,
-                tag: f.tag.unwrap_or_default(),
-                error: Some(m),
-            })?
-            .into_response())
-        }
+    }
+    s.session.check_csrf(&csrf)?;
+    // A preview reads the repo as registering does, but writes nothing: its own, roomier budget.
+    if confirm {
+        state.limiter.check("register", ip.0, 10)?;
+    } else {
+        state.limiter.check("register-preview", ip.0, 30)?;
+    }
+    let shown = |error: Option<String>| repo_preview_page(&state, &s, &url, &owner, &tag, error);
+    if !confirm {
+        return shown(None).await;
+    }
+    if only.is_empty() {
+        return shown(Some("Check at least one entry to register.".into())).await;
+    }
+    match tracker::register(&state, &s.user, &url, Some(&owner), Some(&tag), &only, Some(&fingerprint)).await {
+        Ok(done) => Ok(Redirect::to(&done.entries.first().map(|e| e.url()).unwrap_or_else(|| "/dashboard".into())).into_response()),
+        Err(AppError::Conflict(m)) if m == tracker::PREVIEW_CHANGED => shown(Some(format!("Nothing was registered: {m}."))).await,
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => shown(Some(m)).await,
         Err(e) => Err(e),
     }
+}
+
+/// The registration page with the preview of registering `url` now (or why there is none).
+async fn repo_preview_page(state: &AppState, s: &SignedIn, url: &str, owner: &str, tag: &str, error: Option<String>) -> AppResult<Response> {
+    let at = if tag.is_empty() { tracker::At::Newest } else { tracker::At::Tag(tag) };
+    let result = async {
+        let who = tracker::registrant_owner(state, &s.user, Some(owner)).await?;
+        tracker::preview(state, Some(&s.user), Some(&who), url, at).await
+    }
+    .await;
+    let (preview, error) = match result {
+        Ok(p) => (Some(p.preview), error),
+        Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
+            (None, Some(error.map(|e| format!("{e} {m}")).unwrap_or(m)))
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(page(&NewRepoPage {
+        ctx: PageCtx::new(state, Some(&s.session)),
+        url: url.to_owned(),
+        tag: tag.to_owned(),
+        owner: owner.to_owned(),
+        error,
+        preview,
+    })?
+    .into_response())
 }
 
 // ---------- sims ----------

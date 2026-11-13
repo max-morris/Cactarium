@@ -62,18 +62,21 @@ enum Command {
         url: String,
         #[arg(long)]
         owner: Option<String>,
-        /// Read the manifests at exactly this tag (e.g. when they aren't on the default branch).
+        /// Read the manifests at exactly this tag, instead of each kind's newest release.
         #[arg(long)]
         tag: Option<String>,
+        /// Register only the new entry with this (manifest) name; repeatable. Default: all.
+        #[arg(long = "only")]
+        only: Vec<String>,
     },
-    /// A dry run: what registering URL at TAG would add, and how each entry on the repo (new or
-    /// already registered) would read the tag. Writes nothing. With --commit, a tag that doesn't
+    /// A dry run: the preview registering URL (at TAG, if given) shows, and with a tag, how each
+    /// entry already on the repo would read it. Writes nothing. With --commit, a tag that doesn't
     /// exist yet is read as if it named that commit (a branch or a full commit id).
     Check {
         url: String,
         #[arg(long)]
-        tag: String,
-        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long, requires = "tag")]
         commit: Option<String>,
         /// The entries' owner (default: the repo's existing owner, else the manifest's first).
         #[arg(long)]
@@ -226,14 +229,14 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Admin { action } => admin(&db, action).await,
-        Command::Register { username, url, owner, tag } => {
+        Command::Register { username, url, owner, tag, only } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
-            let done = tracker::register(&state, &user, &url, owner.as_deref(), tag.as_deref())
+            let done = tracker::register(&state, &user, &url, owner.as_deref(), tag.as_deref(), &only, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            for e in &done.entries {
-                println!("Registered {} ({}, {})", e.slug(), e.kind, e.visibility);
+            for (e, (file, tag, version)) in done.entries.iter().zip(&done.from) {
+                println!("Registered {} ({}, {}) from {file} at {tag}: version {version}", e.slug(), e.kind, e.visibility);
             }
             for n in &done.notes {
                 println!("Note: {n}");
@@ -242,13 +245,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Check { url, tag, commit, owner } => {
             let state = make_state(cfg, db)?;
-            let (lines, clean) = tracker::check(&state, &url, &tag, commit.as_deref(), owner.as_deref())
+            let (lines, clean) = tracker::check(&state, &url, tag.as_deref(), commit.as_deref(), owner.as_deref())
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             for l in &lines {
                 println!("{l}");
             }
-            anyhow::ensure!(clean, "{tag} would not be read cleanly");
+            anyhow::ensure!(clean, "{} would not be read cleanly", tag.as_deref().unwrap_or("the repo"));
             Ok(())
         }
         Command::Reread { username, slug, version, tag } => {

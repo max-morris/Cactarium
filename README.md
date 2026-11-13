@@ -45,14 +45,20 @@ migrates and restarts.
 
 Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
-[--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>]`, `check <url> --tag <tag>
-[--commit <ref>]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`), `move-repo`, `reapply`, `token`. Create the `et`
+[--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>] [--only <name>]...`, `check <url> [--tag <tag>
+[--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`), `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
-- `register` reads each new entry at its newest tag (or exactly `--tag`) before writing anything,
-  and creates every new entry in one transaction; on a repo that already has entries it adds only
-  the missing ones. `check` is the same reading as a dry run (nothing written), also for tags that
-  don't exist yet (`--commit` names the commit or branch they would name).
+- `register` finds each manifest file's newest release among the repo's tags (the newest tag its
+  own manifest reads as a version, with siblings' claims applied; the default branch decides
+  nothing), or reads exactly `--tag`; a manifest with no release tag yet is skipped with a note. It
+  reads each new entry at its tag before writing anything, creates the entries in one transaction
+  (only those named by `--only`, if given, by manifest name), and prints one line per entry
+  registered; on a repo that already has entries it adds only the missing ones. An entry is named
+  by its manifest's `name`, under `--owner` (default: the registering user), which the manifest's
+  `owners` must list. `check` prints the same preview as a dry run (nothing written), also for tags
+  that don't exist yet (`--commit` names the commit or branch they would name). The website's
+  Register a repo is the same, in two steps: the preview, then confirming the entries checked.
 - Each tag is read by the entry's manifest in the tag's commit (`tag-pattern`, else
   `[track/]vX.Y.Z`, and its `since`): a manifest change applies to the tags carrying it, with no
   admin step. `reread` reads an invalid version of a non-curated repo entry again (valid if it
@@ -128,14 +134,14 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
    Then the packages that carry their own `cactarium.toml` rather than a curated one:
    `just cli register --owner et <you> https://github.com/EinsteinToolkit/Cottonmouth`.
    Cottonmouth's example sims (`cactarium-sim.toml` with `[sim.files]` and
-   `tag-pattern = "sim-v{major}.{minor}.{patch}"`, not on its `main`), once `et/cottonmouth` is
-   registered by the plain `register` above (`--tag` registers only the manifests that read the tag
-   it names): first, before tagging,
-   `just cli check https://github.com/EinsteinToolkit/Cottonmouth --tag sim-v1.0.0 --commit <commit>`
+   `tag-pattern = "sim-v{major}.{minor}.{patch}"`, not on its `main`; each `sim-vX.Y.Z` sits on top
+   of the package's `vX.Y.Z` and pins it): the plain `register` finds them at their newest
+   `sim-v` tag too. To check a sims release before tagging it:
+   `just cli check https://github.com/EinsteinToolkit/Cottonmouth --tag sim-v2026.6.0 --commit <commit>`
    (the commit's pins must all be public packages, and `et/cottonmouth`'s stored URL must match the
-   pins'), then, once `sim-v1.0.0` is pushed,
-   `just cli register --owner et --tag sim-v1.0.0 <you> https://github.com/EinsteinToolkit/Cottonmouth`,
-   which adds only `et/cottonmouth-sims`.
+   pins'). Production registered `et/cottonmouth-sims` with
+   `just cli register --owner et --tag sim-v2026.5.1 <you> https://github.com/EinsteinToolkit/Cottonmouth`,
+   which adds only the entries that read that tag.
 7. The starter sim: create a token on the site's Settings page, `cactup login --token <token>`, then,
    in cactarium-curate, `cactup sim publish sims/wavetoy.sim et/wavetoy`. CactUp talks to
    `https://cactarium.cct.lsu.edu` unless `CACTARIUM_URL` or the `cactarium-url` knob says otherwise.
