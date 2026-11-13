@@ -1447,8 +1447,10 @@ os.rename(depbare, depbare + ".away")
 for i in range(1, 13):
     retag(stk, stkbare, f"v1.2.{i}")
 ok, out = cli_sync("max/flakystack")
-check("new tags that can't be read wait, each with its next automatic try",
-      not ok and "next automatic try after" in out and not has_version(maxv, "max/flakystack", "1.2.1"), out[-300:])
+check("new tags that can't be read wait, each with its next automatic try, at most ten per sync",
+      not ok and "next automatic try after" in out and "2 more new tag(s) not tried this time" in out
+      and not has_version(maxv, "max/flakystack", "1.2.1"), out[-300:])
+cli_sync("max/flakystack")  # the ten waiting are tried again, the two new ones now too
 ok, out = cli_sync("max/flakystack")
 check("waiting tags are tried again at most ten per sync", not ok and "2 more waiting tag(s) not tried this time" in out, out[-300:])
 os.rename(depbare + ".away", depbare)
@@ -1479,6 +1481,88 @@ sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "d-2", 
 sh("git", "push", "-q", depbare, "master", "--tags", cwd=dep)
 ok, out = cli_sync("max/pinstack")
 check("and is read once the tag is there", ok and has_version(anon, "max/pinstack", "1.1.0"), out[-300:])
+# A tag that has waited a very long time (its backoff long capped) doesn't break the sync: other
+# waiting tags are still tried and read.
+def psql(sql):
+    here = os.path.dirname(os.path.abspath(__file__))
+    return subprocess.run(["docker", "compose", "--project-directory", here, "-f", here + "/compose.yaml", "-f", here + "/compose.dev.yaml",
+                           "exec", "-T", "db", "psql", "-U", "cactarium", "-d", "cactarium", "-tAc", sql],
+                          check=True, capture_output=True, text=True).stdout.strip()
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("never"))
+retag(pst, pstbare, "v1.2.0")
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-3"))
+retag(pst, pstbare, "v1.3.0")
+ok, out = cli_sync("max/pinstack")
+check("two stack tags wait for source tags", not ok and not has_version(maxv, "max/pinstack", "1.3.0"), out[-300:])
+psql("UPDATE waiting_tags SET tries = 34, next_try_at = now() - interval '1 minute' WHERE tag = 'v1.2.0' AND entry_id = (SELECT id FROM entries WHERE name = 'pinstack')")
+open(os.path.join(dep, "README"), "w").write("3\n")
+sh("git", "add", "-A", cwd=dep); sh("git", *ident, "commit", "-q", "-m", "d-3", cwd=dep); sh("git", "tag", "d-3", cwd=dep)
+sh("git", "push", "-q", depbare, "master", "--tags", cwd=dep)
+ok, out = cli_sync("max/pinstack")
+check("a tag that waited about a week doesn't break the sync: a later waiting tag is read",
+      "out of range" not in out and has_version(anon, "max/pinstack", "1.3.0"), out[-300:])
+open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-4"))
+retag(pst, pstbare, "v1.4.0")
+cli_sync("max/pinstack")
+sh("git", "tag", "d-4", cwd=dep); sh("git", "push", "-q", depbare, "--tags", cwd=dep)
+psql("UPDATE waiting_tags SET next_try_at = now() - interval '1 minute'")
+ok, out = cli_sync("max/pinstack")
+check("and the syncs after it keep working", "out of range" not in out and has_version(anon, "max/pinstack", "1.4.0")
+      and int(psql("SELECT tries FROM waiting_tags WHERE tag = 'v1.2.0' AND entry_id = (SELECT id FROM entries WHERE name = 'pinstack')") or 0) >= 35, out[-300:])
+
+# An old bare tag (no manifest) naming the same version as the real v release doesn't take it.
+yb = os.path.join(work, "baretag")
+os.makedirs(yb)
+open(os.path.join(yb, "README"), "w").write("old\n")
+sh("git", "init", "-q", "-b", "master", cwd=yb)
+sh("git", "add", "-A", cwd=yb); sh("git", *ident, "commit", "-q", "-m", "old upstream release", cwd=yb); sh("git", "tag", "1.0.0", cwd=yb)
+os.makedirs(os.path.join(yb, "YbArr", "YbThorn"))
+for f, t in [("interface.ccl", "IMPLEMENTS: YbThorn\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+    open(os.path.join(yb, "YbArr", "YbThorn", f), "w").write(t)
+open(os.path.join(yb, "cactarium.toml"), "w").write('format = 1\n\n[package]\nname = "baretag"\nowners = ["max"]\ndescription = "x"\n')
+sh("git", "add", "-A", cwd=yb); sh("git", *ident, "commit", "-q", "-m", "release", cwd=yb); sh("git", "tag", "v1.0.0", cwd=yb); sh("git", "tag", "v1.1.0", cwd=yb)
+ybbare = ENV["DEMO_REPOS"] + "/baretag.git"
+subprocess.run(["rm", "-rf", ybbare], check=True)
+sh("git", "clone", "-q", "--bare", yb, ybbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/baretag.git"], capture_output=True, text=True)
+s, r, _ = resolve_q("max/baretag@1.0.0")
+check("v1.0.0, not an old bare 1.0.0, is version 1.0.0", s == 200 and r.get("tag") == "v1.0.0", r)
+
+# A dependency released together with this package: its needed thorn comes in a version tagged but
+# not read yet, so this version waits instead of freezing.
+def tiny(name, thorns, deps=""):
+    d = os.path.join(work, name)
+    for t in thorns:
+        os.makedirs(os.path.join(d, "CoArr", t), exist_ok=True)
+        for f, txt in [("interface.ccl", f"IMPLEMENTS: {t}\n"), ("param.ccl", "\n"), ("schedule.ccl", "\n")]:
+            open(os.path.join(d, "CoArr", t, f), "w").write(txt)
+    open(os.path.join(d, "cactarium.toml"), "w").write(f'format = 1\n\n[package]\nname = "{name}"\nowners = ["max"]\ndescription = "x"\n{deps}')
+    return d
+cob = tiny("cob", ["CbThorn"])
+sh("git", "init", "-q", "-b", "master", cwd=cob)
+sh("git", "add", "-A", cwd=cob); sh("git", *ident, "commit", "-q", "-m", "cob 2.0", cwd=cob); sh("git", "tag", "v2.0.0", cwd=cob)
+cobbare = ENV["DEMO_REPOS"] + "/cob.git"
+subprocess.run(["rm", "-rf", cobbare], check=True)
+sh("git", "clone", "-q", "--bare", cob, cobbare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/cob.git"], capture_output=True, text=True)
+coa = tiny("coa", ["CaThorn"])
+sh("git", "init", "-q", "-b", "master", cwd=coa)
+sh("git", "add", "-A", cwd=coa); sh("git", *ident, "commit", "-q", "-m", "coa 1.0", cwd=coa); sh("git", "tag", "v1.0.0", cwd=coa)
+coabare = ENV["DEMO_REPOS"] + "/coa.git"
+subprocess.run(["rm", "-rf", coabare], check=True)
+sh("git", "clone", "-q", "--bare", coa, coabare, cwd=work)
+subprocess.run(["just", "cli", "register", "max", REPOS + "/coa.git"], capture_output=True, text=True)
+tiny("coa", ["CaThorn"], '\n[[dependency]]\ntarget = "max/cob@^2"\nneeds = ["CbThorn", "CbExtra"]\n')
+retag(coa, coabare, "v2.0.0")       # coa 2.0 needs CbExtra, which cob gets in 2.1
+tiny("cob", ["CbThorn", "CbExtra"])
+retag(cob, cobbare, "v2.1.0")       # tagged, not read yet
+ok, out = cli_sync("max/coa")
+check("a dependency whose needed thorn comes in a version not read yet makes the version wait",
+      not ok and "isn't read yet" in out and not has_version(maxv, "max/coa", "2.0.0"), out[-300:])
+cli_sync("max/cob")
+ok, out = cli_sync("max/coa")
+check("once that version is read, it is valid", ok and has_version(anon, "max/coa", "2.0.0") and "invalid" not in versions_page(maxv, "max/coa"), out[-300:])
+
 
 # A stack override naming a package registered a moment after the stack's tag waits.
 ovp = os.path.join(work, "ovpkg")

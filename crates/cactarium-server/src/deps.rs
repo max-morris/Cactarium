@@ -201,14 +201,35 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                             alt.target()
                         ));
                     }
-                    for n in alt.needs.iter().filter(|_| !tv.flesh && !tv.library) {
-                        if !tv.thorns.iter().any(|(t, _)| t == n) {
-                            problems.push(format!(
-                                "the dependency on {} needs {n}, which {}@{} doesn't have",
-                                alt.target(),
-                                alt.target(),
-                                tv.label
-                            ));
+                    let missing: Vec<&String> = alt
+                        .needs
+                        .iter()
+                        .filter(|n| !tv.flesh && !tv.library && !tv.thorns.iter().any(|(t, _)| t == *n))
+                        .collect();
+                    if !missing.is_empty() {
+                        // A version of the target in range that isn't read yet (released together
+                        // with this one, say) may have them: then this waits rather than freezing.
+                        let req = match (&alt.sha, &alt.range) {
+                            (Some(_), _) => None,
+                            (None, Some(r)) => r.parse::<TrackedReq>().ok(),
+                            (None, None) => Some(TrackedReq::any()),
+                        };
+                        let target_id: Option<i64> = sqlx::query_scalar("SELECT id FROM entries WHERE owner = $1 AND name = $2")
+                            .bind(&alt.owner)
+                            .bind(&alt.name)
+                            .fetch_optional(&state.db)
+                            .await?;
+                        let unread = match (req, target_id) {
+                            (Some(req), Some(id)) => crate::tracker::unread_in_range(state, id, &req).await?,
+                            _ => false,
+                        };
+                        for n in missing {
+                            let said = format!("the dependency on {} needs {n}, which {}@{} doesn't have", alt.target(), alt.target(), tv.label);
+                            if unread {
+                                waiting.push(format!("{said}, and a version of it in range isn't read yet"));
+                            } else {
+                                problems.push(said);
+                            }
                         }
                     }
                     resolved.push((alt, tv));

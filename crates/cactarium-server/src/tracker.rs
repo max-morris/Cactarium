@@ -197,10 +197,55 @@ async fn store_since(state: &AppState, entry_id: i64, since: Option<String>, pat
 
 fn version_tags(refs: Vec<RemoteRef>, rule: &TagRule) -> Vec<(RemoteRef, TrackedVersion)> {
     let mut v: Vec<_> = refs.into_iter().filter_map(|r| rule.version(&r.name).map(|t| (r, t))).collect();
-    v.sort_by(|a, b| (&a.1.track, &a.1.version).cmp(&(&b.1.track, &b.1.version)));
-    // Two tags naming one version: the first wins.
+    // Two tags naming one version: the one written the rule's own way wins (see `spelling_rank`),
+    // then the first by name.
+    v.sort_by(|a, b| {
+        (&a.1.track, &a.1.version, spelling_rank(rule, &a.0.name, &a.1), &a.0.name)
+            .cmp(&(&b.1.track, &b.1.version, spelling_rank(rule, &b.0.name, &b.1), &b.0.name))
+    });
     v.dedup_by(|b, a| a.1 == b.1);
     v
+}
+
+/// How a tag spells its version, best first: with a declared pattern, every tag it reads is its
+/// own spelling; with none, the standard `[track/]vX.Y.Z` beats a bare `X.Y.Z` (say, an old
+/// upstream tag that predates the repo's manifest), so that one never takes the release's version.
+fn spelling_rank(rule: &TagRule, tag: &str, tv: &TrackedVersion) -> u8 {
+    if rule.pattern.is_some() || tag == tv.conventional_tag() { 0 } else { 1 }
+}
+
+/// Whether an entry has tags in `req` that aren't read yet: waiting ones, or ones its rule picks
+/// with neither a version nor a "not this entry's" record. When its repo can't be listed, that can't
+/// be told, and the answer is yes (wait rather than freeze).
+pub async fn unread_in_range(state: &AppState, entry_id: i64, req: &cactup_ecosystem_common::version::TrackedReq) -> AppResult<bool> {
+    let Some(repo) = repo_of(state, entry_id).await? else { return Ok(false) };
+    let rule = TagRule::of(&repo)?;
+    let in_range = |tag: &str| rule.version(tag).is_some_and(|v| req.matches(&v));
+    let waiting: Vec<String> = sqlx::query_scalar("SELECT tag FROM waiting_tags WHERE entry_id = $1")
+        .bind(entry_id)
+        .fetch_all(&state.db)
+        .await?;
+    if waiting.iter().any(|t| in_range(t)) {
+        return Ok(true);
+    }
+    let Ok(refs) = git::ls_tags(policy(state), &repo.url).await else { return Ok(true) };
+    let have: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT CASE WHEN track = '' THEN version ELSE track || ':' || version END FROM versions WHERE entry_id = $1",
+    )
+    .bind(entry_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let has_foreign: bool = sqlx::query_scalar("SELECT to_regclass('foreign_tags') IS NOT NULL").fetch_one(&state.db).await?;
+    let foreign: std::collections::BTreeSet<String> = if has_foreign {
+        sqlx::query_scalar("SELECT tag FROM foreign_tags WHERE entry_id = $1").bind(entry_id).fetch_all(&state.db).await?.into_iter().collect()
+    } else {
+        Default::default()
+    };
+    Ok(version_tags(refs, &rule)
+        .iter()
+        .any(|(r, tv)| req.matches(tv) && !have.contains(&tv.to_string()) && !foreign.contains(&r.name)))
 }
 
 fn read_manifests(co: &git::Checkout, at: &str) -> AppResult<Vec<(&'static str, Manifest)>> {
@@ -1495,9 +1540,16 @@ async fn sync_inner(
         .collect();
     let (retry, fresh): (Vec<_>, Vec<_>) =
         candidates.into_iter().partition(|(r, _)| waiting.get(&r.name).is_some_and(|w| w.commit == r.commit));
+    // New tags that turn out to wait are capped too, so one sync (a registration's, say) never
+    // tries hundreds of them; the rest are new again at the next sync.
+    let (mut new_waiting, mut new_later) = (0, 0);
     for (r, tv) in &fresh {
         if read == MAX_NEW_PER_SYNC {
             break;
+        }
+        if new_waiting == MAX_WAITING_PER_SYNC {
+            new_later += 1;
+            continue;
         }
         match ingest(state, entry, repo, r, tv, actor).await {
             Ok(outcome) => {
@@ -1508,9 +1560,15 @@ async fn sync_inner(
                 // A tag that waited at another commit and moved since.
                 done_waiting(state, entry.id, &r.name).await?;
             }
-            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await?),
+            Err(AppError::Upstream(why)) => {
+                new_waiting += 1;
+                unfetched.push(wait(state, entry, r, why).await);
+            }
             Err(e) => return Err(e),
         }
+    }
+    if new_later > 0 {
+        unfetched.push(format!("{new_later} more new tag(s) not tried this time (at most {MAX_WAITING_PER_SYNC} new tags wait per check)"));
     }
     let (mut tried, mut later) = (0, 0);
     for (r, tv) in &retry {
@@ -1527,7 +1585,7 @@ async fn sync_inner(
                 }
                 done_waiting(state, entry.id, &r.name).await?;
             }
-            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await?),
+            Err(AppError::Upstream(why)) => unfetched.push(wait(state, entry, r, why).await),
             Err(e) => return Err(e),
         }
     }
@@ -1597,24 +1655,36 @@ async fn waiting_of(state: &AppState, entry_id: i64, remote: &BTreeMap<String, S
 
 /// Records that a tag is still waiting: its retry backs off exponentially (5 minutes, doubling, at
 /// most 6 hours apart), starting over when the tag moves. Returns `why` with the next try's time.
-async fn wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: String) -> AppResult<String> {
+/// Bookkeeping only: if recording fails, that is logged and `why` returned as it is, so the sync
+/// goes on to the other tags.
+async fn wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: String) -> String {
+    match record_wait(state, entry, r, &why).await {
+        Ok(next) => format!("{why} (next automatic try after {})", model::fmt_time(next)),
+        Err(e) => {
+            tracing::error!("recording that {} waits at {}: {e}", entry.slug(), r.name);
+            why
+        }
+    }
+}
+
+async fn record_wait(state: &AppState, entry: &Entry, r: &RemoteRef, why: &str) -> AppResult<time::OffsetDateTime> {
     let next: time::OffsetDateTime = sqlx::query_scalar(
         "INSERT INTO waiting_tags (entry_id, tag, commit, tries, reason, next_try_at)
          VALUES ($1, $2, $3, 1, $4, now() + interval '5 minutes')
          ON CONFLICT (entry_id, tag) DO UPDATE SET
-           tries = CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN waiting_tags.tries + 1 ELSE 1 END,
+           tries = CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN LEAST(waiting_tags.tries + 1, 1000) ELSE 1 END,
            commit = EXCLUDED.commit, reason = EXCLUDED.reason,
            next_try_at = now() + LEAST(interval '6 hours', interval '5 minutes' *
-             power(2, CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN waiting_tags.tries ELSE 0 END))
+             power(2, LEAST(CASE WHEN waiting_tags.commit = EXCLUDED.commit THEN waiting_tags.tries ELSE 0 END, 7)))
          RETURNING next_try_at",
     )
     .bind(entry.id)
     .bind(&r.name)
     .bind(&r.commit)
-    .bind(&why)
+    .bind(why)
     .fetch_one(&state.db)
     .await?;
-    Ok(format!("{why} (next automatic try after {})", model::fmt_time(next)))
+    Ok(next)
 }
 
 async fn done_waiting(state: &AppState, entry_id: i64, tag: &str) -> AppResult<()> {
