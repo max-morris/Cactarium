@@ -446,8 +446,10 @@ pub fn stamped(entry: &Entry, name: &str, label: &str, sim: &SimFile) -> AppResu
 }
 
 /// Stores a checked sim as version `vid` (`label`) of `entry`, as its sim `name` ("" for the
-/// entry's only sim): stamps it ([`stamped`]), keeps the file, its pins and the thorns it builds
-/// (the version's thorn index is the union of its sims'). Returns the stored file's sha256.
+/// entry's only sim): labels its pins with the versions that froze their commits
+/// ([`model::label_pins`]: `owner/pkg@X.Y.Z`, format 1, never `#<sha>`), stamps it ([`stamped`]),
+/// keeps the file, its pins and the thorns it builds (the version's thorn index is the union of
+/// its sims'). Returns the stored file's sha256.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_version(
     db: &mut sqlx::PgConnection,
@@ -459,9 +461,12 @@ pub async fn store_version(
     checked: Checked,
     text: EntryText<'_>,
 ) -> AppResult<String> {
-    let Checked { sim, index } = checked;
-    let (stored, sha) = stamped(entry, name, label, &sim)?;
+    let Checked { mut sim, index } = checked;
     let mut tx = sqlx::Connection::begin(&mut *db).await?;
+    // Each pin says which package version it is, as the Cactarium knows it now (a label: the
+    // commit is what gets fetched). Only files stored from now on; stored ones never change.
+    model::label_pins(&mut tx, &mut sim.repos).await?;
+    let (stored, sha) = stamped(entry, name, label, &sim)?;
     sqlx::query("INSERT INTO sim_files (version_id, name, sha256, content, index) VALUES ($1, $2, $3, $4, $5)")
         .bind(vid)
         .bind(name)
@@ -582,5 +587,38 @@ commit = "{SHA}"
         let unpinned = sim(false, "").replace(&format!("commit = \"{SHA}\"\n"), "");
         let e = check(unpinned.as_bytes()).err().unwrap().to_string();
         assert!(e.contains("fully specified"), "{e}");
+    }
+
+    /// A pin's label (`owner/pkg@X.Y.Z`, on a track too) needs nothing past `.sim` format 1, so a
+    /// stored sim keeps the format its content needs; a sha256 pin can't carry one.
+    #[test]
+    fn pin_labels_keep_format_1() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let entry = Entry {
+            id: 1,
+            kind: "sim".into(),
+            owner: "max".into(),
+            name: "qc0".into(),
+            summary: None,
+            description: None,
+            visibility: "public".into(),
+            verified: false,
+            trusted: false,
+            curated: false,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut parsed = SimFile::from_toml(&sim(false, "x = 1")).unwrap();
+        for label in ["max/carpetx@1.0.0", "max/carpetx@mixed-precision:1.2.0", "max/carpetx"] {
+            parsed.repos[0].cactarium = Some(label.parse().unwrap());
+            let (stored, _) = stamped(&entry, "", "2.0.0", &parsed).unwrap();
+            assert!(stored.starts_with("format = 1\n"), "{label}: {stored}");
+            assert!(stored.contains(&format!("cactarium = \"{label}\"")), "{stored}");
+            assert_eq!(SimFile::from_toml(&stored).unwrap().repos[0].cactarium, parsed.repos[0].cactarium);
+        }
+        parsed.repos[0].commit = None;
+        parsed.repos[0].sha256 = Some("ab".repeat(32));
+        assert!(stamped(&entry, "", "2.0.0", &parsed).is_err(), "a download carries no label");
     }
 }

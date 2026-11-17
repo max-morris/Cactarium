@@ -239,17 +239,7 @@ async fn version_at_commit(state: &AppState, e: &Entry, commit: &str, reviewer: 
     Ok(frozen_at(&versions, commit).cloned())
 }
 
-/// Among `versions`, the one that names `commit` when several froze it: the newest on the default
-/// track; with none there, the newest on any track, ties going to the track name first in byte
-/// order (the rule `PinInfo::version` documents). Yanked versions count.
-pub fn frozen_at<'a>(versions: &'a [Version], commit: &str) -> Option<&'a Version> {
-    let at = versions.iter().filter(|v| v.commit.as_deref() == Some(commit));
-    let key = |v: &Version| model::tracked(v).map(|t| t.version);
-    at.clone()
-        .filter(|v| v.track.is_empty())
-        .max_by(|a, b| key(a).cmp(&key(b)))
-        .or_else(|| at.max_by(|a, b| key(a).cmp(&key(b)).then_with(|| b.track.cmp(&a.track))))
-}
+pub use crate::model::frozen_at;
 
 #[derive(Deserialize)]
 pub struct ResolveQ {
@@ -737,8 +727,9 @@ pub async fn stack_release(
             .filter(|v| servable(v, &reviewer))
             .ok_or(AppError::NotFound)?;
         let marked = unreviewed_header(&e, Some(&v));
-        return Ok((axum::response::AppendHeaders(marked), [contact_header], Json(stacks::frozen_of(&state, &v).await?))
-            .into_response());
+        let mut frozen = stacks::frozen_of(&state, &v).await?;
+        label_stack_pins(&state, &mut frozen).await?;
+        return Ok((axum::response::AppendHeaders(marked), [contact_header], Json(frozen)).into_response());
     };
     // A tip is whatever the branches hold now and never passes review: only a trusted stack's is
     // served freely. Otherwise the site setting refuses it, or serves it marked untrusted.
@@ -769,7 +760,17 @@ pub async fn stack_release(
         header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
     );
     let marked = axum::response::AppendHeaders(unreviewed_header(&e, None));
-    Ok((marked, [unpinned, contact_header, untrusted], Json(&*frozen)).into_response())
+    let mut frozen = (*frozen).clone();
+    label_stack_pins(&state, &mut frozen).await?;
+    Ok((marked, [unpinned, contact_header, untrusted], Json(frozen)).into_response())
+}
+
+/// A stack's pins as served: each labeled with the package version that froze its commit
+/// ([`model::label_pins`]), filled in now rather than stored, so frozen releases never change.
+async fn label_stack_pins(state: &AppState, frozen: &mut FrozenStack) -> ApiResult<()> {
+    let mut db = state.db.acquire().await.map_err(AppError::from)?;
+    model::label_pins(&mut db, &mut frozen.repos).await?;
+    Ok(())
 }
 
 /// The stack's definition as it stands now: its repo's default branch for a manifest repo, else

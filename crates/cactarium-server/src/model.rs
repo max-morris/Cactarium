@@ -103,6 +103,72 @@ impl Version {
     }
 }
 
+/// Among `versions`, the one that names `commit` when several froze it: the newest on the default
+/// track; with none there, the newest on any track, ties going to the track name first in byte
+/// order (the rule the crate's `PinInfo::version` documents). Yanked versions count; the caller
+/// chooses which versions may be named.
+pub fn frozen_at<'a>(versions: &'a [Version], commit: &str) -> Option<&'a Version> {
+    let at = versions.iter().filter(|v| v.commit.as_deref() == Some(commit));
+    let key = |v: &Version| tracked(v).map(|t| t.version);
+    at.clone()
+        .filter(|v| v.track.is_empty())
+        .max_by(|a, b| key(a).cmp(&key(b)))
+        .or_else(|| at.max_by(|a, b| key(a).cmp(&key(b)).then_with(|| b.track.cmp(&a.track))))
+}
+
+/// The label a pin at `commit` of the package `owner/name` carries (`RepoPin::cactarium`):
+/// `owner/name@<version>` when an approved, valid version froze the commit ([`frozen_at`] among
+/// them), else none. Never `owner/name#<sha>`: older CactUp can't read one, and the pin's commit
+/// already says it.
+pub async fn pin_label(
+    db: &mut sqlx::PgConnection,
+    entry_id: i64,
+    slug: &str,
+    commit: &str,
+) -> AppResult<Option<cactup_ecosystem_common::slug::Slug>> {
+    let versions: Vec<Version> = sqlx::query_as::<_, Version>(&format!(
+        "SELECT {VERSION_COLS} FROM versions WHERE entry_id = $1 AND commit = $2 AND review = 'approved'"
+    ))
+    .bind(entry_id)
+    .bind(commit)
+    .fetch_all(&mut *db)
+    .await?;
+    let valid: Vec<Version> = versions.into_iter().filter(Version::valid).collect();
+    Ok(frozen_at(&valid, commit).and_then(|v| format!("{slug}@{}", v.label()).parse().ok()))
+}
+
+/// Labels each git pin of `pins` with the version of its package that froze its commit
+/// ([`pin_label`]), matching repos as a sim's pins are matched ([`find_repo`] among public
+/// packages). A label the pin carries is replaced by the derived one; one the Cactarium can't
+/// confirm is dropped, except a bare `owner/name` naming the package matched. Downloads (sha256
+/// pins) carry none. Returns whether anything changed.
+pub async fn label_pins(db: &mut sqlx::PgConnection, pins: &mut [cactup_ecosystem_common::sim::RepoPin]) -> AppResult<bool> {
+    let packages: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT e.id, e.owner, e.name, r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.kind = 'package' AND e.visibility = 'public' ORDER BY e.created_at, e.id",
+    )
+    .fetch_all(&mut *db)
+    .await?;
+    let mut changed = false;
+    for pin in pins.iter_mut() {
+        let label = match (&pin.commit, find_repo(&pin.url, &packages, |p| &p.3)) {
+            (Some(commit), Some((id, owner, name, _))) => {
+                let slug = format!("{owner}/{name}");
+                match pin_label(db, *id, &slug, commit).await? {
+                    Some(l) => Some(l),
+                    None => pin.cactarium.clone().filter(|l| l.at.is_none() && l.sha.is_none() && l.thorn.is_none() && l.entry() == slug),
+                }
+            }
+            _ => None,
+        };
+        if pin.cactarium != label {
+            pin.cactarium = label;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// A key that sorts versions within a track by semver precedence (release after its pre-releases).
 pub fn semver_sort_key(v: &semver::Version) -> String {
     let pre = if v.pre.is_empty() { "~".to_owned() } else { format!("-{}", v.pre) };
