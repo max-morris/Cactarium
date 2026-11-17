@@ -282,9 +282,9 @@ pub async fn verify(state: &AppState, id: i64) -> AppResult<()> {
         Err(e) => Err(format!("cannot fetch it: {e:#}")),
     };
     let mut tx = state.db.begin().await?;
-    let (action, details) = match &outcome {
+    let (action, applied) = match &outcome {
         Ok(size) => {
-            sqlx::query(
+            let r = sqlx::query(
                 "UPDATE downloads SET fetch_state = 'ok', fetch_error = NULL, size = $2, fetched_at = now(),
                         review = CASE WHEN auto_approve THEN 'approved' ELSE review END,
                         reviewer = CASE WHEN auto_approve THEN submitter ELSE reviewer END,
@@ -295,16 +295,22 @@ pub async fn verify(state: &AppState, id: i64) -> AppResult<()> {
             .bind(i64::try_from(*size).unwrap_or(i64::MAX))
             .execute(&mut *tx)
             .await?;
-            ("download.verified", json!({ "id": id, "size": size }))
+            ("download.verified", r.rows_affected() > 0)
         }
         Err(why) => {
-            sqlx::query("UPDATE downloads SET fetch_state = 'failed', fetch_error = $2 WHERE id = $1 AND fetch_state = 'fetching'")
+            let r = sqlx::query("UPDATE downloads SET fetch_state = 'failed', fetch_error = $2 WHERE id = $1 AND fetch_state = 'fetching'")
                 .bind(id)
                 .bind(why)
                 .execute(&mut *tx)
                 .await?;
-            ("download.fetch-failed", json!({ "id": id, "error": why }))
+            ("download.fetch-failed", r.rows_affected() > 0)
         }
+    };
+    // `applied` is false when an admin vouched for the row while it was being fetched: the outcome
+    // changed nothing, but is still recorded (a mismatch is worth an admin's look).
+    let details = match &outcome {
+        Ok(size) => json!({ "id": id, "size": size, "applied": applied }),
+        Err(why) => json!({ "id": id, "error": why, "applied": applied }),
     };
     audit_with(&mut tx, None, action, Some(&url), details, None).await?;
     tx.commit().await?;
@@ -336,7 +342,8 @@ async fn requeue_where(state: &AppState, cond: &str) -> AppResult<usize> {
 
 /// Approves a download without the server fetching it, as `admin` vouching for it (one too big
 /// for the fetch, or on a host the server can't reach): a new row, or one awaiting review, whose
-/// fetch failed or that was rejected, becomes approved with `fetch_state = 'vouched'` and no size.
+/// fetch failed or that was rejected, becomes approved with `fetch_state = 'vouched'` and no size
+/// (one the server already verified keeps `ok` and its size, and is simply approved).
 /// The audit log says it wasn't verified. Returns the row's id.
 pub async fn vouch(state: &AppState, admin: &User, url: &str, sha256: &str, note: Option<&str>) -> AppResult<i64> {
     if !admin.is_admin() {
@@ -346,13 +353,16 @@ pub async fn vouch(state: &AppState, admin: &User, url: &str, sha256: &str, note
     let note = note.map(str::trim).filter(|n| !n.is_empty());
     validate(url, sha256, note)?;
     let mut tx = state.db.begin().await?;
-    let id: Option<i64> = sqlx::query_scalar(
+    let row: Option<(i64, bool)> = sqlx::query_as(
         "INSERT INTO downloads (url, sha256, note, fetch_state, review, submitter, reviewer, review_note, decided_at)
          VALUES ($1, $2, $3, 'vouched', 'approved', $4, $4, $3, now())
-         ON CONFLICT (url, sha256) DO UPDATE SET fetch_state = 'vouched', fetch_error = NULL, review = 'approved',
+         ON CONFLICT (url, sha256) DO UPDATE SET
+             -- A row the server verified stays verified: vouching only approves it.
+             fetch_state = CASE WHEN downloads.fetch_state = 'ok' THEN 'ok' ELSE 'vouched' END,
+             fetch_error = NULL, review = 'approved',
              reviewer = $4, review_note = COALESCE($3, downloads.review_note), decided_at = now()
          WHERE downloads.review <> 'approved'
-         RETURNING id",
+         RETURNING id, fetch_state = 'ok'",
     )
     .bind(url)
     .bind(sha256)
@@ -360,10 +370,10 @@ pub async fn vouch(state: &AppState, admin: &User, url: &str, sha256: &str, note
     .bind(admin.id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(id) = id else {
+    let Some((id, verified)) = row else {
         return Err(AppError::Conflict(format!("{url} with that sha256 is approved already")));
     };
-    audit_with(&mut tx, Some(admin.id), "download.vouch", Some(url), json!({ "id": id, "sha256": sha256, "verified": false, "note": note }), None)
+    audit_with(&mut tx, Some(admin.id), "download.vouch", Some(url), json!({ "id": id, "sha256": sha256, "verified": verified, "note": note }), None)
         .await?;
     tx.commit().await?;
     Ok(id)
