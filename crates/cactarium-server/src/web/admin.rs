@@ -455,7 +455,7 @@ pub struct EntryAction {
     action: String,
     new_owner: Option<String>,
     new_url: Option<String>,
-    /// For "reread-version": the invalid version to read again.
+    /// For "reread-version" and "reread-moved": the version to read again.
     version: Option<String>,
     /// For "reexamine-tag": the tag recorded as not a version, to examine again.
     tag: Option<String>,
@@ -510,6 +510,18 @@ pub async fn entry_action(
         "reread-version" => {
             let v = f.version.as_deref().unwrap_or("").trim().to_owned();
             return match tracker::reread_invalid(&state, &a.user, &e, &v).await {
+                Ok(m) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
+                Err(AppError::BadRequest(m) | AppError::Upstream(m) | AppError::Conflict(m)) => {
+                    entries_page(&state, &a, e.name.clone(), Some(m)).await
+                }
+                Err(err) => Err(err),
+            };
+        }
+        // A sim's or stack's version whose tag moved, read at the tag's new commit, which it
+        // takes only if it reads cleanly there.
+        "reread-moved" => {
+            let v = f.version.as_deref().unwrap_or("").trim().to_owned();
+            return match tracker::reread_moved(&state, &a.user, &e, &v).await {
                 Ok(m) => entries_page(&state, &a, e.name.clone(), Some(m)).await,
                 Err(AppError::BadRequest(m) | AppError::Upstream(m) | AppError::Conflict(m)) => {
                     entries_page(&state, &a, e.name.clone(), Some(m)).await

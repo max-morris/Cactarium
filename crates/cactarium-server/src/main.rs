@@ -87,12 +87,17 @@ enum Command {
     /// it becomes valid if it reads cleanly now (also from another tag of that version), or is
     /// removed if its tag isn't a version of the entry at all. With `--tag` instead of a version: a
     /// tag recorded as not a version of the entry is examined again under the rules as they are now.
+    /// With `--moved`: a version of a sim or stack whose tag moved is read at the tag's new commit,
+    /// and takes it (with everything stored from it) only if it reads cleanly there.
     Reread {
         username: String,
         slug: String,
         version: Option<String>,
         #[arg(long, conflicts_with = "version")]
         tag: Option<String>,
+        /// Read the version's moved tag at the commit it names now, replacing the frozen commit.
+        #[arg(long, requires = "version")]
+        moved: bool,
     },
     /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
     /// as the given admin.
@@ -266,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(clean, "{} would not be read cleanly", tag.as_deref().unwrap_or("the repo"));
             Ok(())
         }
-        Command::Reread { username, slug, version, tag } => {
+        Command::Reread { username, slug, version, tag, moved } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
             let (owner, name) = slug.split_once('/').context("give owner/name")?;
@@ -275,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .context("no such entry")?;
             let said = match (version, tag) {
+                (Some(version), None) if moved => tracker::reread_moved(&state, &user, &e, &version).await,
                 (Some(version), None) => tracker::reread_invalid(&state, &user, &e, &version).await,
                 (None, Some(tag)) => tracker::reexamine_tag(&state, &user, &e, &tag).await,
                 _ => anyhow::bail!("give an invalid version, or --tag <tag>"),

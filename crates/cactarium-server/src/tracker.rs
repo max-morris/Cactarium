@@ -1697,6 +1697,12 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     let v = model::any_version_by_label(state, entry.id, label.trim())
         .await?
         .ok_or_else(|| AppError::bad(format!("{} has no version {label}", entry.slug())))?;
+    if v.state == "tag-moved" {
+        return Err(AppError::bad(format!(
+            "{}@{label} isn't invalid: its tag moved, and the frozen commit is still served (to read the tag at its new commit instead, re-read the moved tag)",
+            entry.slug()
+        )));
+    }
     if v.state != "invalid" {
         return Err(AppError::bad(format!("{}@{label} isn't invalid", entry.slug())));
     }
@@ -1814,6 +1820,189 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     publish::touch(state, entry.id).await?;
     let from = if r.name == tag { String::new() } else { format!(", from {} (instead of {tag})", r.name) };
     Ok(format!("{}@{label} reads cleanly now{from}{}", entry.slug(), if review == "pending" { "; it awaits review" } else { "" }))
+}
+
+/// Admin-only: a version of a sim or stack entry whose tag moved (`tag-moved`: the tag names
+/// another commit now, and the frozen one is still served) read again at the tag's current commit.
+/// A moved tag is never followed on its own; this is the admin's deliberate exception, for a
+/// release found broken and fixed under the same tag before anyone relied on it. The tag at its new
+/// commit must be the same version of the entry and pass every check a new tag passes (the closure
+/// check included); then the version takes the new commit and tree, and everything stored from the
+/// old one is replaced in one transaction: manifest, readme, smells, claims, a stack's frozen
+/// release (thornlist, pins, diff, the thorn index), every sim of a sim entry (the stamped stored
+/// copies, their pins and the thorn index). The mark goes, the tag's open alerts are acknowledged,
+/// and it is reviewed as a pushed tag is (the admin re-reading it doesn't vouch for it). Audited
+/// (`version.reread-moved`). Anything less and nothing changes: the reasons are the error.
+/// Packages are refused: sims and stacks pin a package version's commit, which must never change
+/// under them.
+pub async fn reread_moved(state: &AppState, admin: &User, entry: &Entry, label: &str) -> AppResult<String> {
+    if !admin.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    if entry.kind == "package" {
+        return Err(AppError::bad(format!(
+            "{} is a package: sims and stacks pin its versions' commits, so a version's commit never changes; tag a new version instead",
+            entry.slug()
+        )));
+    }
+    let repo = repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} isn't released from a repo", entry.slug())))?;
+    let label = label.trim();
+    let v = model::any_version_by_label(state, entry.id, label)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no version {label}", entry.slug())))?;
+    if v.state != "tag-moved" {
+        return Err(AppError::bad(format!(
+            "{}@{label} isn't marked as having a moved tag ({}){}",
+            entry.slug(),
+            v.state,
+            if v.state == "invalid" { ": re-read it as an invalid version" } else { "" }
+        )));
+    }
+    let (Some(tag), Some(was)) = (v.tag.clone(), v.commit.clone()) else {
+        return Err(AppError::bad(format!("{}@{label} has no tag and commit to read", entry.slug())));
+    };
+    let tv: TrackedVersion = v.label().parse().map_err(AppError::bad)?;
+    let remote = git::ls_tags(policy(state), &repo.url)
+        .await
+        .map_err(|e| AppError::Upstream(format!("cannot list the repo's tags: {e:#}")))?;
+    let Some(now) = remote.into_iter().find(|r| r.name == tag).map(|r| r.commit) else {
+        return Err(AppError::bad(format!("{tag} is no longer in the repo: there is nothing to read")));
+    };
+    if now == was {
+        // Moved back where it was frozen: nothing to read, only the mark to clear.
+        let mut tx = state.db.begin().await?;
+        sqlx::query("UPDATE versions SET state = 'ok' WHERE id = $1 AND state = 'tag-moved'").bind(v.id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE tag_events SET acknowledged_by = $2, acknowledged_at = now() WHERE version_id = $1 AND acknowledged_at IS NULL")
+            .bind(v.id)
+            .bind(admin.id)
+            .execute(&mut *tx)
+            .await?;
+        crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread-moved", Some(&entry.slug()), json!({ "version": label, "tag": tag, "was": was, "now": now, "back": true }), None).await?;
+        tx.commit().await?;
+        return Ok(format!("{tag} is back at the frozen commit {}: {}@{label} is no longer marked as moved", short(&was), entry.slug()));
+    }
+    let r = RemoteRef { name: tag.clone(), commit: now.clone() };
+    let mut unlimited = usize::MAX;
+    let exam = examine(state, entry, &repo, std::slice::from_ref(&r), &mut unlimited).await?.into_iter().next();
+    moved_tag_reads_as(exam, &tv, &tag, &now)?;
+    let co = git::checkout(policy(state), &repo.url, &now, Some(&tag))
+        .await
+        .map_err(|e| AppError::Upstream(format!("cannot fetch {}: {e:#}", short(&now))))?;
+    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts::default()).await.map_err(|e| match e {
+        AppError::BadRequest(m) => AppError::BadRequest(format!("{tag} at {} doesn't read cleanly, so {}@{label} stays at {}: {m}", short(&now), entry.slug(), short(&was))),
+        other => other,
+    })?;
+    // Reviewed as the tag would be if pushed now: the admin re-reading it doesn't vouch for it.
+    let review = publish::release_review(state, entry, None).await?;
+    let lock = entry_sync_lock(entry.id);
+    let _one_at_a_time = lock.lock().await;
+    let mut tx = state.db.begin().await?;
+    let n = sqlx::query(
+        "UPDATE versions SET state = 'ok', commit = $3, tree = $4, manifest = $5, readme_html = $6, review = $7
+         WHERE id = $1 AND state = 'tag-moved' AND commit = $2",
+    )
+    .bind(v.id)
+    .bind(&was)
+    .bind(&now)
+    .bind(&co.tree)
+    .bind(&p.manifest_json)
+    .bind(&p.readme_html)
+    .bind(review)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(AppError::Conflict(format!("{}@{label} changed while this ran; reload and try again", entry.slug())));
+    }
+    // Everything stored from the old commit goes, and is stored again from the new one.
+    for table in ["thorns", "claims", "stack_releases", "sim_files", "source_pins", "release_thorns"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE version_id = $1")).bind(v.id).execute(&mut *tx).await?;
+    }
+    store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
+    if entry.kind == "stack" {
+        refresh_next_diff(&mut tx, entry, v.id, &v.track).await?;
+    }
+    let open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM submissions WHERE version_id = $1 AND status IN ('open', 'changes-requested'))")
+        .bind(v.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !open {
+        publish::submit_release(&mut tx, entry, v.id, review, None).await?;
+    }
+    sqlx::query("UPDATE tag_events SET acknowledged_by = $2, acknowledged_at = now() WHERE version_id = $1 AND acknowledged_at IS NULL")
+        .bind(v.id)
+        .bind(admin.id)
+        .execute(&mut *tx)
+        .await?;
+    for table in ["foreign_tags", "tag_reads", "waiting_tags"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE entry_id = $1 AND tag = $2")).bind(entry.id).bind(&tag).execute(&mut *tx).await?;
+    }
+    crate::audit::audit_with(
+        &mut tx,
+        Some(admin.id),
+        "version.reread-moved",
+        Some(&entry.slug()),
+        json!({ "version": label, "tag": tag, "was": was, "now": now, "review": review }),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    publish::touch(state, entry.id).await?;
+    Ok(format!(
+        "{}@{label} now reads {tag} at {} (it was frozen at {}){}",
+        entry.slug(),
+        short(&now),
+        short(&was),
+        if review == "pending" { "; it awaits review" } else { "" }
+    ))
+}
+
+/// Whether a moved tag, examined at its new commit (`exam`), is still exactly version `tv` of the
+/// entry, readable: else why not, as [`reread_moved`] refuses.
+fn moved_tag_reads_as(exam: Option<Exam>, tv: &TrackedVersion, tag: &str, now: &str) -> AppResult<()> {
+    let at = short(now);
+    match exam {
+        Some(Exam::Version { tv: read, error: None, .. }) if read == *tv => Ok(()),
+        Some(Exam::Version { error: Some(why), .. }) => Err(AppError::bad(format!("{tag} at {at} can't be read: {why}"))),
+        Some(Exam::Version { tv: read, .. }) => {
+            Err(AppError::bad(format!("{tag} at {at} reads as version {read}, not {tv}: the version can't change its number")))
+        }
+        Some(Exam::Not { why, .. } | Exam::Claimed { why, .. }) => {
+            Err(AppError::bad(format!("{tag} at {at} isn't a version of this entry any more: {why}")))
+        }
+        Some(Exam::Wait(why) | Exam::Unexamined(why)) => Err(AppError::Upstream(format!("{tag} at {at} can't be examined right now: {why}"))),
+        None => Err(AppError::Upstream(format!("{tag} at {at} wasn't examined"))),
+    }
+}
+
+/// The stored diff of the release after `vid` on its track (the next approved one), against the
+/// release `vid` is now: what [`store_release`] would have stored had `vid` read this way first.
+async fn refresh_next_diff(db: &mut sqlx::PgConnection, entry: &Entry, vid: i64, track: &str) -> AppResult<()> {
+    let next: Option<(i64, String)> = sqlx::query_as(
+        "SELECT s.version_id, s.frozen FROM stack_releases s JOIN versions v ON v.id = s.version_id
+         WHERE v.entry_id = $1 AND v.track = $2 AND v.id <> $3 AND v.review = 'approved'
+           AND v.sort_key > (SELECT sort_key FROM versions WHERE id = $3)
+         ORDER BY v.sort_key LIMIT 1",
+    )
+    .bind(entry.id)
+    .bind(track)
+    .bind(vid)
+    .fetch_optional(&mut *db)
+    .await?;
+    let Some((next_id, next_frozen)) = next else { return Ok(()) };
+    let this: Option<String> = sqlx::query_scalar("SELECT frozen FROM stack_releases WHERE version_id = $1").bind(vid).fetch_optional(&mut *db).await?;
+    let (Some(Ok(this)), Ok(next)) = (this.map(|t| toml::from_str::<FrozenStack>(&t)), toml::from_str::<FrozenStack>(&next_frozen)) else {
+        return Ok(());
+    };
+    let diff = stacks::diff(Some(&this), &next);
+    sqlx::query("UPDATE stack_releases SET diff = $2 WHERE version_id = $1")
+        .bind(next_id)
+        .bind(serde_json::to_value(&diff).map_err(anyhow::Error::from)?)
+        .execute(&mut *db)
+        .await?;
+    Ok(())
 }
 
 /// Checks that `url` holds the history the entry's published versions froze: every tagged version
@@ -4273,6 +4462,25 @@ mod tests {
         // Against a manifest here that can't be read either, it takes what its rule reads at all.
         assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &shared, None), Exam::Claimed { by: 2, .. }));
         assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &simv, None), Exam::Version { error: Some(_), .. }));
+    }
+
+    /// A moved tag is re-read only when, at its new commit, it is still exactly that version and
+    /// readable; anything else says why, and what can't be judged now is Upstream.
+    #[test]
+    fn a_moved_tag_must_still_be_its_version() {
+        let tv = |s: &str| s.parse::<TrackedVersion>().unwrap();
+        let version = |v: &str, error: Option<&str>| Exam::Version { tv: tv(v), rank: 1, error: error.map(Into::into), note: None, pattern: None };
+        let now = "0123456789abcdef0123456789abcdef01234567";
+        let at = |exam| moved_tag_reads_as(Some(exam), &tv("2026.5.0"), "v2026.5.0", now);
+        assert!(at(version("2026.5.0", None)).is_ok());
+        let e = at(version("2026.5.1", None)).unwrap_err().to_string();
+        assert!(e.contains("reads as version 2026.5.1, not 2026.5.0") && e.contains("0123456789"), "{e}");
+        assert!(at(version("2026.5.0", Some("bad toml"))).unwrap_err().to_string().contains("can't be read: bad toml"));
+        let e = at(Exam::Not { kind: "absent", why: "no manifest".into() }).unwrap_err().to_string();
+        assert!(e.contains("isn't a version of this entry any more: no manifest"), "{e}");
+        assert!(matches!(at(Exam::Wait("newer format".into())), Err(AppError::Upstream(_))));
+        assert!(matches!(at(Exam::Unexamined("offline".into())), Err(AppError::Upstream(_))));
+        assert!(matches!(moved_tag_reads_as(None, &tv("2026.5.0"), "v2026.5.0", now), Err(AppError::Upstream(_))));
     }
 
     /// Among tags read as one version, the spelling the manifest's pattern writes wins, then the
