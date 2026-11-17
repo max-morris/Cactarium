@@ -1,7 +1,9 @@
 pub mod account;
 pub mod admin;
 pub mod api;
+pub mod downloads;
 pub mod hooks;
+pub mod lookup;
 pub mod orgs;
 pub mod public;
 
@@ -20,6 +22,8 @@ use crate::state::AppState;
 
 /// Uploads are small: a .sim is at most 1 MB.
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// A lookup of [`cactup_ecosystem_common::api::MAX_LOOKUP_PINS`] pins with the longest URLs.
+const LOOKUP_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
@@ -32,6 +36,11 @@ pub fn router(state: AppState) -> Router {
         .route("/stacks/{owner}/{name}/releases/{version}", get(api::stack_release))
         .route("/sims/{owner}/{name}", post(api::sim_publish))
         .route("/sims/{owner}/{name}/{version}/download", get(api::sim_download))
+        // At most 1000 pins and downloads of up to 2 kB each.
+        .route("/lookup", post(lookup::lookup).layer(DefaultBodyLimit::max(LOOKUP_BODY_LIMIT)))
+        .route("/providers", get(lookup::providers))
+        .route("/whoami", get(api::whoami))
+        .route("/downloads", post(downloads::submit))
         .fallback(api::not_found)
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static(cactup_ecosystem_common::api::API_GENERATION_HEADER),
@@ -71,6 +80,8 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/curated/{id}/version", post(admin::add_virtual))
         .route("/admin/curated/{id}/hand-over", post(admin::hand_over))
         .route("/admin/curated/{id}/reapply", post(admin::reapply))
+        .route("/admin/downloads", get(downloads::admin_page))
+        .route("/admin/downloads/{id}", post(downloads::admin_decide))
         .route("/admin/tags", get(admin::tags))
         .route("/admin/tags/{id}/ack", post(admin::ack_tag))
         .route("/admin/users", get(admin::users))

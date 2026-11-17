@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
     API_GENERATION, CONTACT_HEADER, EntryInfo, INCLUDE_UNREVIEWED_HEADER, PackageVersion, PackageVersions,
     Published, Refreshed, ReleaseRequest, Resolved, SHA256_HEADER, StackReleases, ThornInfo,
-    UNPINNED_HEADER, UNREVIEWED_HEADER, UNTRUSTED_HEADER, VersionInfo,
+    UNPINNED_HEADER, UNREVIEWED_HEADER, UNTRUSTED_HEADER, VersionInfo, WhoAmI,
 };
 use cactup_ecosystem_common::ccl::ThornFacts;
 use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
@@ -99,7 +99,6 @@ pub fn servable(v: &Version, reviewer: &Reviewer) -> bool {
 
 /// An entry this request may see: a public one, or for an admin reviewer one awaiting its first
 /// review too.
-#[allow(dead_code)] // the lookup and providers use it
 pub fn entry_servable(e: &Entry, reviewer: &Reviewer) -> bool {
     e.visibility == "public" || (reviewer.entries && e.visibility == "pending")
 }
@@ -938,6 +937,12 @@ pub async fn package_refresh(
         new_versions,
         awaiting_review: usize::try_from(awaiting).unwrap_or(0),
     }))
+}
+
+/// `GET /whoami`: who the bearer token belongs to.
+pub async fn whoami(TokenUser(user): TokenUser) -> Json<WhoAmI> {
+    let admin = user.is_admin();
+    Json(WhoAmI { user: user.username, orgs: user.orgs, admin })
 }
 
 pub async fn not_found() -> ApiError {

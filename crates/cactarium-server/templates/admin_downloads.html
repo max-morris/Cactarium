@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Downloads · Admin · Cactarium{% endblock %}
+{% block body_class %}admin{% endblock %}
+{% block content %}
+{% include "_admin_nav.html" %}
+<section class="stack">
+  <p class="muted">Files a sim pins by sha256 (a tarball component, an input's download), submitted with <code>cactup download submit &lt;url&gt;</code>. The Cactarium fetched each once and checked its sha256; it keeps no copy. A sim pinning a download that isn't approved isn't published. Trusted users' and admins' submissions are approved at once.</p>
+  {% for d in downloads %}
+  <div class="card stack-sm">
+    <span class="small"><strong class="{% if d.review == "pending" %}warn-text{% else if d.review == "approved" %}good-text{% endif %}">{{ d.review }}</strong> · #{{ d.id }} · {{ d.size }} · by <span class="mono">{{ d.submitter }}</span> · {{ d.when }}{% if !d.reviewer.is_empty() %} · decided by <span class="mono">{{ d.reviewer }}</span>{% endif %}</span>
+    <a class="mono strong break" href="{{ d.url }}" rel="nofollow noopener">{{ d.url }}</a>
+    <span class="mono small break">sha256 {{ d.sha256 }}</span>
+    {% if !d.note.is_empty() %}<p class="small">{{ d.note }}</p>{% endif %}
+    {% if !d.review_note.is_empty() %}<p class="small muted">Review note: {{ d.review_note }}</p>{% endif %}
+    {% if d.review == "pending" %}
+    <form method="post" action="/admin/downloads/{{ d.id }}" class="stack-sm">
+      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+      <label for="note-{{ d.id }}">Note</label>
+      <input id="note-{{ d.id }}" name="note" type="text">
+      <div class="row-wrap">
+        <button class="button small" name="decision" value="approve" type="submit">Approve</button>
+        <button class="button small danger" name="decision" value="reject" type="submit">Reject</button>
+      </div>
+    </form>
+    {% endif %}
+  </div>
+  {% else %}<p class="muted">No downloads submitted yet.</p>{% endfor %}
+</section>
+{% endblock %}

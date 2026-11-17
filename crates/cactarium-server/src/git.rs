@@ -66,19 +66,40 @@ pub async fn check_url(policy: GitPolicy, raw: &str) -> anyhow::Result<String> {
 
 async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
     let url = url::Url::parse(raw.trim()).with_context(|| format!("'{raw}' is not a URL"))?;
+    if url.scheme() == "file" && policy.allow_local {
+        return Ok(Target { url: url.to_string(), resolve: None });
+    }
+    let (url, address) = vet(policy, url, "repo URLs").await?;
+    let normalized = url.as_str().trim_end_matches('/').to_owned();
+    Ok(Target {
+        url: normalized,
+        resolve: address.map(|(host, addr)| {
+            let ip = match addr.ip() {
+                IpAddr::V4(v) => v.to_string(),
+                IpAddr::V6(v) => format!("[{v}]"),
+            };
+            format!("{host}:{}:{ip}", addr.port())
+        }),
+    })
+}
+
+/// The outbound-fetch policy every URL the server reads goes through: https only (plus http, and
+/// private hosts, when local repos are allowed, for development and tests), no credentials, and a
+/// host that resolves only to public addresses. Returns the URL and, unless local repos are
+/// allowed, the host (without brackets) and the checked address to connect to, so the fetch can't
+/// be sent elsewhere by a second lookup (DNS rebinding). `what` names the URLs in messages.
+async fn vet(policy: GitPolicy, url: url::Url, what: &str) -> anyhow::Result<(url::Url, Option<(String, std::net::SocketAddr)>)> {
     if !url.username().is_empty() || url.password().is_some() {
-        bail!("repo URLs must not contain credentials");
+        bail!("{what} must not contain credentials");
     }
     match url.scheme() {
         "https" => {}
-        "file" if policy.allow_local => return Ok(Target { url: url.to_string(), resolve: None }),
         "http" if policy.allow_local => {}
-        _ => bail!("repo URLs must be https://"),
+        _ => bail!("{what} must be https://"),
     }
-    let host = url.host_str().ok_or_else(|| anyhow!("'{raw}' has no host"))?.to_owned();
-    let normalized = url.as_str().trim_end_matches('/').to_owned();
+    let host = url.host_str().ok_or_else(|| anyhow!("'{url}' has no host"))?.to_owned();
     if policy.allow_local {
-        return Ok(Target { url: normalized, resolve: None });
+        return Ok((url, None));
     }
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
@@ -88,12 +109,72 @@ async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
     if addrs.is_empty() || addrs.iter().any(|a| private(a.ip())) {
         bail!("'{host}' is not a public host");
     }
-    let ip = match addrs[0].ip() {
-        IpAddr::V4(v) => v.to_string(),
-        IpAddr::V6(v) => format!("[{v}]"),
-    };
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    Ok(Target { url: normalized, resolve: Some(format!("{bare}:{port}:{ip}")) })
+    let bare = host.trim_start_matches('[').trim_end_matches(']').to_owned();
+    Ok((url, Some((bare, addrs[0]))))
+}
+
+/// What fetching a download read: its content's sha256 (hex) and size.
+#[derive(Debug)]
+pub struct Fetched {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Fetches `raw` once, under the outbound-fetch policy ([`vet`], applied again to every redirect,
+/// at most 5), hashing the body as it streams and stopping past `max_bytes`. Nothing is kept.
+pub async fn fetch_and_hash(policy: GitPolicy, raw: &str, max_bytes: u64, time_limit: Duration) -> anyhow::Result<Fetched> {
+    use sha2::Digest;
+    let mut url = url::Url::parse(raw.trim()).with_context(|| format!("'{raw}' is not a URL"))?;
+    let started = std::time::Instant::now();
+    for _ in 0..=5 {
+        let (checked, address) = vet(policy, url, "download URLs").await?;
+        let mut client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(60))
+            .user_agent("cactarium");
+        if let Some((host, addr)) = &address {
+            client = client.resolve(host, *addr);
+        }
+        let client = client.build()?;
+        let left = time_limit.saturating_sub(started.elapsed());
+        let mut resp = tokio::time::timeout(left, client.get(checked.clone()).send())
+            .await
+            .map_err(|_| anyhow!("it took over {} minutes", time_limit.as_secs() / 60))??;
+        if resp.status().is_redirection() {
+            let to = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .ok_or_else(|| anyhow!("a redirect without a location"))?;
+            url = checked.join(to).with_context(|| format!("a redirect to '{to}'"))?;
+            continue;
+        }
+        if !resp.status().is_success() {
+            bail!("the server answered {}", resp.status());
+        }
+        if let Some(n) = resp.content_length()
+            && n > max_bytes
+        {
+            bail!("it is {n} bytes, more than the {max_bytes} the Cactarium reads");
+        }
+        let mut h = sha2::Sha256::new();
+        let mut size: u64 = 0;
+        loop {
+            let left = time_limit.saturating_sub(started.elapsed());
+            let chunk = tokio::time::timeout(left, resp.chunk())
+                .await
+                .map_err(|_| anyhow!("it took over {} minutes", time_limit.as_secs() / 60))??;
+            let Some(chunk) = chunk else { break };
+            size += chunk.len() as u64;
+            if size > max_bytes {
+                bail!("it is more than the {max_bytes} bytes the Cactarium reads");
+            }
+            h.update(&chunk);
+        }
+        return Ok(Fetched { sha256: hex::encode(h.finalize()), size });
+    }
+    bail!("more than 5 redirects")
 }
 
 fn git_to(policy: GitPolicy, home: &Path, target: &Target) -> Command {
@@ -647,6 +728,39 @@ async fn object_types(policy: GitPolicy, dir: &Path, commits: &[String]) -> Vec<
 /// Whether the mirror is missing (or lacks any of) `commits`.
 async fn lacks_commits(policy: GitPolicy, dir: &Path, commits: &[String]) -> bool {
     object_types(policy, dir, commits).await.iter().any(Option::is_none)
+}
+
+/// What a kept mirror says of some commits ([`mirror_has_commits`]).
+pub struct MirrorAnswer {
+    /// For each commit asked: `Some(true)` when the mirror has it, `Some(false)` when it doesn't
+    /// after an update (or one within [`MIRROR_REFRESH`]), `None` when it can't tell just now (the
+    /// update failed, or none was allowed).
+    pub has: Vec<Option<bool>>,
+    /// Whether an update was asked for (whether or not one ran: the window may have answered).
+    pub updated: bool,
+}
+
+/// Whether the repo's kept history mirror has each of `commits` (full ids), as commits. `None`
+/// when no mirror is kept for the repo yet: this never clones one. With `refresh`, a mirror that
+/// lacks some is brought up to date first, at most once per [`MIRROR_REFRESH`], as
+/// [`resolve_commit_prefix`] does.
+pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String], refresh: bool) -> Option<MirrorAnswer> {
+    let (root, key, dir) = mirror_of(url).await.ok()?;
+    if !mirror_complete(&dir).await {
+        return None;
+    }
+    let is_commit = |types: Vec<Option<String>>| types.into_iter().map(|t| t.as_deref() == Some("commit")).collect::<Vec<bool>>();
+    let first = is_commit(object_types(policy, &dir, commits).await);
+    if first.iter().all(|&b| b) {
+        return Some(MirrorAnswer { has: first.into_iter().map(Some).collect(), updated: false });
+    }
+    if !refresh {
+        return Some(MirrorAnswer { has: first.into_iter().map(|b| b.then_some(true)).collect(), updated: false });
+    }
+    let error = update_mirror(policy, key, root, dir.clone(), false).await;
+    let after = is_commit(object_types(policy, &dir, commits).await);
+    let has = after.into_iter().map(|b| if b { Some(true) } else if error.is_none() { Some(false) } else { None }).collect();
+    Some(MirrorAnswer { has, updated: true })
 }
 
 /// A file as a commit has it.

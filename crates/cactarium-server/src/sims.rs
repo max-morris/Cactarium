@@ -183,9 +183,10 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
 
 /// Every repo a sim pins must be a registered package's, at a commit that package's repo has: a
 /// downstream user must be able to rebuild the sim from the Cactarium alone. The pin's identity is
-/// then `owner/pkg@version` (a commit a version froze) or `owner/pkg#sha` (any other commit of
-/// the repo). A tarball pin (sha256 only) has no package identity. Refuses with every pin that
-/// fails, and what to do about it. For an upload, where the uploader sees the answer and can try
+/// then `owner/pkg@version` (a commit a version froze) or `owner/pkg` at that commit (any other
+/// commit of the repo). A download (a tarball component pinned by sha256) has no package identity:
+/// it must be one the Cactarium's reviewers approved (`cactup download submit <url>`). Refuses
+/// with every pin that fails, and what to do about it. For an upload, where the uploader sees the answer and can try
 /// again; a tag read from a repo uses [`check_pins_at_tag`].
 pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
     let p = pin_problems(state, sim, &[]).await?;
@@ -197,12 +198,13 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// sim's repo.
 #[derive(Default)]
 pub struct PinProblems {
-    /// Facts about the commit: a tarball pin (it has no package identity, and never will).
+    /// Facts about the commit: a download the Cactarium's reviewers rejected.
     pub facts: Vec<String>,
     /// Things the world can change: no package for the repo is registered yet, or it is but isn't
     /// public yet (awaiting review, a sibling entry not yet approved, or being registered along
-    /// with this one), its history can't be read right now (the network, the host), or the pinned
-    /// commit isn't in its repo yet (pushed after the tag).
+    /// with this one), its history can't be read right now (the network, the host), the pinned
+    /// commit isn't in its repo yet (pushed after the tag), or a download isn't approved yet
+    /// (never submitted, or awaiting review).
     pub passing: Vec<String>,
 }
 
@@ -224,10 +226,13 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     let mut out = PinProblems::default();
     for pin in &sim.repos {
         let Some(commit) = pin.commit.as_deref() else {
-            out.facts.push(format!(
-                "{}: a tarball pin has no package identity; every repo a sim builds from must be a registered package's",
-                pin.name
-            ));
+            // A download (a tarball component pinned by sha256) belongs to no package: it must be
+            // one the Cactarium's reviewers approved, at exactly this content.
+            if let Some(sha) = &pin.sha256 {
+                download_problem(state, &pin.name, &pin.url, sha, &mut out).await?;
+            } else {
+                out.facts.push(format!("{}: pinned to neither a commit nor a sha256", pin.name));
+            }
             continue;
         };
         let Some((owner, name, url, public)) = model::find_repo(&pin.url, &packages, |(_, _, u, _)| u) else {
@@ -282,6 +287,29 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
         }
     }
     Ok(out)
+}
+
+/// What is wrong with a download a sim pins (`url` with content `sha256`), if anything: it must be
+/// approved on the Cactarium. Never submitted, or awaiting review, may change (an upload is refused
+/// saying how to submit it; a tag waits); rejected is a fact.
+async fn download_problem(state: &AppState, name: &str, url: &str, sha: &str, out: &mut PinProblems) -> AppResult<()> {
+    let submit = crate::web::downloads::submit_command(url);
+    match crate::web::downloads::review_of(state, url, sha).await?.as_deref() {
+        Some("approved") => {}
+        Some("rejected") => out.facts.push(format!(
+            "{name}: the download {url} (sha256 {}) was rejected by the Cactarium's reviewers",
+            &sha[..12]
+        )),
+        Some(_) => out.passing.push(format!(
+            "{name}: the download {url} (sha256 {}) awaits review on the Cactarium; publish once it is approved",
+            &sha[..12]
+        )),
+        None => out.passing.push(format!(
+            "{name}: the download {url} (sha256 {}) hasn't been reviewed by the Cactarium: submit it with `{submit}`, and publish once it is approved",
+            &sha[..12]
+        )),
+    }
+    Ok(())
 }
 
 /// Publishes a checked sim as a version of `owner/name`: `owner` is the user or one of their
