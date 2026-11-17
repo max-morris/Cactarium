@@ -395,7 +395,11 @@ pub struct NewRepoPage {
     pub ctx: PageCtx,
     pub url: String,
     pub tag: String,
+    /// The "Publish under" chosen (empty: the user).
+    pub owner: String,
     pub error: Option<String>,
+    /// Step two: what registering would do, to confirm.
+    pub preview: Option<crate::tracker::Preview>,
 }
 
 #[derive(Template)]

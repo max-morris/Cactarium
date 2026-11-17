@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Register a repo · Cactarium{% endblock %}
 {% block content %}
-<section class="narrow stack-lg">
+<section class="stack-lg">
   <h1>Register a repo</h1>
-  <p class="lead">Your code stays in your repo. The Cactarium reads it at every version tag and freezes the commit the tag names.</p>
+  <p class="lead">Your code stays in your repo. The Cactarium reads it at every release tag and freezes the commit the tag names. Packages, stacks and sims are all registered here.</p>
   <ol class="steps">
-    <li>Commit <span class="mono">cactarium.toml</span> (a package), <span class="mono">cactarium-stack.toml</span> (a stack) and/or <span class="mono">cactarium-sim.toml</span> (sims: it names the <span class="mono">.sim</span> file, or several in <span class="mono">[sim.files]</span>) at the repo root, each with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span> (or the organization you publish under). Only someone who can push to the repo can put that name there; that is the proof you control it. Each manifest becomes its own entry.</li>
+    <li>Commit <span class="mono">cactarium.toml</span> (a package), <span class="mono">cactarium-stack.toml</span> (a stack) and/or <span class="mono">cactarium-sim.toml</span> (sims: it names the <span class="mono">.sim</span> file, or several in <span class="mono">[sim.files]</span>) at the repo root, each with <span class="mono">owners = ["{% if let Some(u) = ctx.user %}{{ u.username }}{% endif %}"]</span> (or the organization you publish under). Only someone who can push to the repo can put that name there; that is the proof you control it. Each manifest becomes its own entry, named by its <span class="mono">name</span>.</li>
     <li>Tag a release: <span class="mono">v1.0.0</span>, or on a track, <span class="mono">mixed-precision/v1.0.0</span>, or whatever the manifest's <span class="mono">tag-pattern</span> says. Without patterns, one tag releases every kind the repo carries; see <a href="/docs/publishing#tags">how tags become versions</a>.</li>
-    <li>Paste the repo's https URL below. A repo that already has entries gets only the missing ones.</li>
+    <li>Paste the repo's https URL below and preview: the Cactarium finds each manifest's newest release among the repo's tags and shows what it would register, writing nothing. Then confirm the entries you want. A repo that already has entries gets only the missing ones.</li>
   </ol>
   {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
   <form class="card stack" method="post" action="/new/repo">
@@ -16,10 +16,48 @@
     <input id="url" name="url" class="mono" value="{{ url }}" placeholder="https://github.com/you/YourArrangement" required>
     <label for="tag">Tag <span class="muted small">(optional)</span></label>
     <input id="tag" name="tag" class="mono" value="{{ tag }}" placeholder="sim-v1.0.0">
-    <p class="muted small">Reads the manifests at exactly this tag, instead of at each kind's newest tag: needed when a manifest isn't on the default branch yet, and it is the very commit that becomes the first version. Every new entry is read at its tag before anything is registered; if one fails, nothing is.</p>
-    {% let owner_id = "owner" %}{% include "_publish_under.html" %}
-    <button class="button" type="submit">Register</button>
+    <p class="muted small">Reads the manifests at exactly this tag, instead of at each kind's newest release: it is the very commit that becomes the first version. Only the manifests there that read the tag as one of their versions are registered.</p>
+    {% if let Some(u) = ctx.user %}{% if ctx.has_namespaces() %}
+    <label for="owner">Publish under</label>
+    {% if u.is_admin %}
+    <input id="owner" name="owner" class="mono" list="owner-choices" value="{% if owner.is_empty() %}{{ u.username }}{% else %}{{ owner }}{% endif %}">
+    <datalist id="owner-choices"><option value="{{ u.username }}">{% for o in u.orgs %}<option value="{{ o }}">{% endfor %}</datalist>
+    <p class="small muted">Admins may also name a namespace that is no user's.</p>
+    {% else %}
+    <select id="owner" name="owner" class="mono"><option value="{{ u.username }}"{% if owner.is_empty() || owner == u.username.as_str() %} selected{% endif %}>{{ u.username }}</option>{% for o in u.orgs %}<option value="{{ o }}"{% if owner == o.as_str() %} selected{% endif %}>{{ o }}</option>{% endfor %}</select>
+    {% endif %}
+    {% endif %}{% endif %}
+    <button class="button{% if preview.is_some() %} ghost{% endif %}" type="submit">Preview</button>
   </form>
-  <p class="muted small">See the <a href="/docs/packages">manifest reference</a>. New entries, and each new version tag, are reviewed by an admin before they are public, unless you, the organization you publish under, or the entry is trusted.</p>
+  {% if let Some(p) = preview %}
+  <form class="card stack" method="post" action="/new/repo" id="confirm">
+    <h2 class="h-small">What registering <span class="mono">{{ p.url }}</span> under <span class="mono">{{ p.owner }}</span> would do</h2>
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <input type="hidden" name="url" value="{{ url }}">
+    <input type="hidden" name="tag" value="{{ tag }}">
+    <input type="hidden" name="owner" value="{{ owner }}">
+    <input type="hidden" name="fingerprint" value="{{ p.fingerprint }}">
+    <input type="hidden" name="confirm" value="1">
+    {% for e in p.entries %}{% if !e.shown.is_empty() %}<input type="hidden" name="row" value="{{ e.shown }}">{% endif %}{% endfor %}
+    <div class="table-box"><table><thead><tr><th scope="col">Register</th><th scope="col">Entry</th><th scope="col">Kind</th><th scope="col">Manifest</th><th scope="col">Starts at</th><th scope="col">Version</th><th scope="col">Tag rule</th><th scope="col">Review</th><th scope="col">Notes</th></tr></thead><tbody>
+    {% for e in p.entries %}
+    <tr>
+      <td>{% if e.status == "new" %}<input type="checkbox" name="only" value="{{ e.file }}" id="only-{{ e.file }}" checked aria-label="Register {{ e.slug }}">{% else %}<span class="muted small">{% if e.status == "existing" %}already registered{% else if e.status == "fails" %}can't be registered{% else if e.status == "needs-tag" %}needs a tag: name it in the Tag field above{% else %}skipped{% endif %}</span>{% endif %}</td>
+      <td class="mono">{{ e.slug }}</td>
+      <td>{{ e.kind }}</td>
+      <td class="mono">{{ e.file }}</td>
+      <td class="mono">{% if let Some(t) = e.tag %}{{ t }}{% endif %}</td>
+      <td class="mono">{% if let Some(v) = e.version %}{{ v }}{% endif %}</td>
+      <td class="small">{% if let Some(r) = e.rule %}{{ r }}{% endif %}</td>
+      <td class="small">{% if let Some(r) = e.review %}{{ r }}{% endif %}</td>
+      <td class="small">{% if let Some(n) = e.note %}{{ n }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody></table></div>
+    <p class="muted small">Registering is all or nothing for the entries checked; an entry left unchecked can be registered later the same way. Leaving one out can change which tags the others start from (its tag-pattern no longer claims them): then nothing is registered, and the preview for that choice is shown to confirm instead. A reviewed entry is public once an admin approves it; an auto-approved one is public at once. If the repo changes before you confirm, nothing is registered and the new preview is shown.</p>
+    <button class="button" type="submit">Register the checked entries</button>
+  </form>
+  {% endif %}
+  <p class="muted small">See the manifest references for <a href="/docs/packages">packages</a>, <a href="/docs/stacks">stacks</a> and <a href="/docs/sims">sims</a>. New entries, and each new version tag, are reviewed by an admin before they are public, unless you, the organization you publish under, or the entry is trusted.</p>
 </section>
 {% endblock %}

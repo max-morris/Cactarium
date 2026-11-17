@@ -60,7 +60,7 @@ pub fn namespaces(user: &User) -> Vec<String> {
         .collect()
 }
 
-fn skips_review(user: &User) -> bool {
+pub fn skips_review(user: &User) -> bool {
     user.trusted || user.is_admin()
 }
 

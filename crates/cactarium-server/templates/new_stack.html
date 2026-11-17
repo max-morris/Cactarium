@@ -4,18 +4,8 @@
 <section class="stack-lg">
   {% if release_of.is_empty() %}
   <h1>Publish a stack</h1>
-  <p class="lead">A stack is a versioned thornlist. Publish it from a repo, where each version tag becomes a release, or upload its definition here and name the version yourself. Either way, every release pins each repo to a commit and never changes. One stack uses one way, not both.</p>
-  <section class="card stack-sm">
-    <h2 class="h-small">From a repo</h2>
-    <p class="small">Commit <span class="mono">cactarium-stack.toml</span> (and its thornlist) at the repo root, listing your name or organization in <span class="mono">owners</span>, and push a version tag such as <span class="mono">v1.0.0</span>. Then register the repo; later tags become new releases by themselves. See <a href="/docs/stacks">the stack reference</a>.</p>
-    <form class="row-wrap" method="post" action="/new/repo">
-      <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
-      <label class="sr-only" for="rurl">Repo URL</label>
-      <input id="rurl" name="url" class="mono" placeholder="https://github.com/you/your-stack" required>
-      {% let owner_id = "rowner" %}{% include "_publish_under.html" %}
-      <button class="button" type="submit">Register the repo</button>
-    </form>
-  </section>
+  <p class="lead">A stack is a versioned thornlist. Upload its definition here and name the version yourself, or publish it from a repo, where each release tag becomes a release. Either way, every release pins each repo to a commit and never changes. One stack uses one way, not both.</p>
+  <p class="card small">From a repo, where each release tag becomes a release: commit <span class="mono">cactarium-stack.toml</span> (and its thornlist) at the repo root, listing your name or organization in <span class="mono">owners</span>, push a release tag such as <span class="mono">v1.0.0</span>, then <a href="/new/repo">register the repo</a>. See <a href="/docs/stacks">the stack reference</a>.</p>
   <h2 class="h-small">By upload</h2>
   <p class="small muted">Give the definition directly. The Cactarium merges its sources, pins every repo (its pins first, then each branch's current commit) and freezes the result as the version you name.</p>
   {% else %}

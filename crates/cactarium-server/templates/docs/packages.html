@@ -1,7 +1,7 @@
 {% extends "docs/_layout.html" %}
 {% block doc %}
 <h1>Packages: cactarium.toml</h1>
-<p>A package is a git repo of thorns. Its manifest, <code>cactarium.toml</code> at the repo root, says what the package is called, who may publish it, and which tags are versions. The Cactarium reads it at every version tag, so each version carries the manifest it was tagged with.</p>
+<p>A package is a git repo of thorns. Its manifest, <code>cactarium.toml</code> at the repo root, says what the package is called, who may publish it, and which tags are versions. The Cactarium reads it at every version tag, so each version carries the manifest it was tagged with. To publish one, <a href="/new/repo">register its repo</a>: the preview shows the entry it would make (named by <code>name</code>, under the name you publish under, which <code>owners</code> must list) and the release it starts from (<a href="/docs/publishing#registering">what registering does</a>).</p>
 
 <h2 id="example">An example</h2>
 <pre class="code">format = 1

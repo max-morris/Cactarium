@@ -105,6 +105,8 @@ impl axum::extract::FromRequestParts<AppState> for ClientIp {
 /// /64, which one machine usually controls whole.
 pub struct RateLimiter {
     windows: Mutex<Windows>,
+    /// Per (bucket, user): the times of their requests within the bucket's window.
+    users: Mutex<HashMap<(&'static str, i64), std::collections::VecDeque<Instant>>>,
 }
 
 type Counts = HashMap<(&'static str, IpAddr), (Instant, u32)>;
@@ -125,6 +127,7 @@ impl Default for RateLimiter {
                 current: HashMap::new(),
                 previous: HashMap::new(),
             }),
+            users: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -160,6 +163,23 @@ impl RateLimiter {
         w.current.insert(key, hit);
         if count > limit { Err(AppError::TooManyRequests) } else { Ok(()) }
     }
+
+    /// Allows `limit` requests per `window` per signed-in user in `bucket` (a sliding window). Users
+    /// with nothing left in their window are forgotten as others come by.
+    pub fn check_user(&self, bucket: &'static str, user_id: i64, limit: u32, window: Duration) -> Result<(), AppError> {
+        let mut users = self.users.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        users.retain(|_, times| times.back().is_some_and(|t| now.duration_since(*t) < window));
+        let times = users.entry((bucket, user_id)).or_default();
+        while times.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            times.pop_front();
+        }
+        if times.len() >= limit as usize {
+            return Err(AppError::TooManyRequests);
+        }
+        times.push_back(now);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +201,18 @@ mod limiter_tests {
         let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
         assert!(l.check("x", Some(v4), 1).is_ok());
         assert!(l.check("x", Some(mapped), 1).is_err(), "a mapped v4 is the v4");
+    }
+
+    #[test]
+    fn limits_per_user_over_a_window() {
+        let l = RateLimiter::default();
+        let hour = Duration::from_secs(3600);
+        assert!(l.check_user("p", 1, 2, hour).is_ok());
+        assert!(l.check_user("p", 1, 2, hour).is_ok());
+        assert!(l.check_user("p", 1, 2, hour).is_err(), "third in the hour");
+        assert!(l.check_user("p", 2, 2, hour).is_ok(), "another user");
+        assert!(l.check_user("q", 1, 2, hour).is_ok(), "another bucket");
+        assert!(l.check_user("r", 1, 1, Duration::ZERO).is_ok());
+        assert!(l.check_user("r", 1, 1, Duration::ZERO).is_ok(), "an empty window forgets at once");
     }
 }

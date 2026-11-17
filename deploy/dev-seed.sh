@@ -303,7 +303,8 @@ cli publish-sim max /demo/qc0.sim
 # A repo carrying a package and a multi-sim entry (Cottonmouth's shape): the package releases with
 # vX.Y.Z tags; its example sims, listed in [sim.files], with their own sim-vX.Y.Z tags (a
 # tag-pattern, never sim/v..., which reads as a track). The sims manifest lives on a branch, not on
-# master, so it is registered from its tag: `register --tag`, which adds only the missing entry.
+# master; registering finds it at its tag all the same (each manifest's newest release among the
+# tags), so one registration adds both.
 new_repo bbh-demo
 R=$WORK/bbh-demo
 thorn "$R/BBHDemo" BBHDemo ''
@@ -339,7 +340,6 @@ commit "$R" "Example sims"; g "$R" tag sim-v1.0.0
 g "$R" checkout master
 publish bbh-demo
 cli register max $U/bbh-demo.git
-cli register max $U/bbh-demo.git --tag sim-v1.0.0
 
 # Move a frozen tag upstream: the site keeps serving the frozen commit and raises an alert.
 R=$WORK/carpetx

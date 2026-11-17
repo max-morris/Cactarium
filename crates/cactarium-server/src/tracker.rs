@@ -345,13 +345,6 @@ fn kind_of(file: &str) -> &'static str {
     }
 }
 
-/// The newest of `tags` on the default track, else the newest of any track.
-fn newest(tags: &[(RemoteRef, TrackedVersion)]) -> Option<&(RemoteRef, TrackedVersion)> {
-    tags.iter()
-        .filter(|(_, t)| t.track.is_none())
-        .max_by(|a, b| a.1.version.cmp(&b.1.version))
-        .or_else(|| tags.iter().max_by(|a, b| a.1.version.cmp(&b.1.version)))
-}
 
 /// Every entry whose repo is `url`, compared normalized (`https://github.com/x/y.git` and
 /// `https://github.com/x/y` are one repo): the entries on one repo are each other's siblings.
@@ -384,213 +377,32 @@ pub struct Planned {
     pub tag: RemoteRef,
     pub tv: TrackedVersion,
     co: Arc<git::Checkout>,
+    /// Why it can't be registered as it is (its manifest doesn't list the owner, its name is
+    /// taken): shown in the preview; registering it is refused.
+    pub problem: Option<String>,
+    /// For the preview only: its manifest file isn't on the default branch (a kind the repo may
+    /// have dropped; leave it unchecked to leave it out). Decides nothing.
+    pub off_head: bool,
 }
 
-/// What registering a repo would do: the entries already on it, and the ones it would add.
+/// A manifest a registration leaves out, and why (registering again later adds it).
+pub struct Skipped {
+    pub file: &'static str,
+    /// Its manifest's name, when one was read.
+    pub name: Option<String>,
+    pub note: String,
+    /// Left out because not every tag could be read: registering it needs a tag named.
+    pub needs_tag: bool,
+}
+
+/// What registering a repo would do: the entries already on it, the ones it would add, and the
+/// manifests it leaves out.
 pub struct Plan {
     pub url: String,
     pub owner: String,
     pub existing: Vec<(Entry, String)>,
     pub new: Vec<Planned>,
-    /// What the plan leaves out and why (a manifest at the tag named that doesn't read it).
-    pub notes: Vec<String>,
-}
-
-/// Where a registration reads its manifests: the newest tag of each entry's own rule, or one named
-/// tag. A dry run can also name a tag that doesn't exist yet, with the commit it would name.
-pub enum At<'a> {
-    Newest,
-    Tag(&'a str),
-    Commit { tag: &'a str, commit: &'a str },
-}
-
-/// Works out what registering `url` under `owner` would add, without writing anything. Each
-/// manifest's own rule finds its own newest tag (leaving out tags another kind's own tag-pattern
-/// reads), and the manifest there must read that tag as that version (self-consistency). With a
-/// tag named, only the manifests there that read it as one of their versions are planned, at it;
-/// the others are left out, with a note (register again without the tag to add them). Entries already on the repo stay as they are; they
-/// must be `owner`'s. Without an owner (a dry run), the repo's existing owner is assumed, else
-/// the first owner the first new manifest lists.
-pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>) -> AppResult<Plan> {
-    let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
-    let existing = entries_on(state, &url).await?;
-    if let Some(owner) = owner
-        && let Some((e, _)) = existing.iter().find(|(e, _)| e.owner != owner)
-    {
-        return Err(AppError::bad(format!(
-            "{url} is already registered, as {} under '{}'; only that owner can add its other manifests",
-            e.slug(),
-            e.owner
-        )));
-    }
-    let have: Vec<&str> = existing.iter().map(|(_, f)| f.as_str()).collect();
-    let refs = git::ls_tags(policy(state), &url).await.map_err(AppError::bad)?;
-    let mut new = Vec::new();
-    let mut notes = Vec::new();
-    // The rules of the entries already on the repo: a tag another kind's own pattern reads isn't a
-    // candidate for a kind without that pattern.
-    let mut sibling_rules = Vec::new();
-    for (e, _) in &existing {
-        if let Some(r) = repo_of(state, e.id).await? {
-            sibling_rules.push(TagRule::of(&r)?);
-        }
-    }
-    // The tag to read, and a ref to fetch it by when a host won't serve a bare commit.
-    let named = match &at {
-        At::Newest => None,
-        At::Tag(tag) => {
-            let r = refs
-                .iter()
-                .find(|r| r.name == *tag)
-                .cloned()
-                .ok_or_else(|| AppError::bad(format!("{url} has no tag '{tag}'")))?;
-            let via = r.name.clone();
-            Some((r, via))
-        }
-        At::Commit { tag, commit } => match refs.iter().find(|r| r.name == *tag) {
-            Some(r) => Some((r.clone(), r.name.clone())),
-            None => {
-                let full = git::resolve_ref(policy(state), &url, Some(commit))
-                    .await
-                    .or_else(|_| if commit.len() >= 40 { Ok(commit.to_string()) } else { Err(()) })
-                    .map_err(|_| AppError::bad(format!("'{commit}' is no branch, tag or full commit id of {url}")))?;
-                Some((RemoteRef { name: tag.to_string(), commit: full }, commit.to_string()))
-            }
-        },
-    };
-    // Each manifest to register, with its own rule (and its manifest at the named tag, if one).
-    // With a tag named, the manifests at that tag; else those on the default branch, or with none
-    // there, whatever the newest vX.Y.Z tag carries.
-    let mut candidates: Vec<(&'static str, TagRule, Option<Manifest>)> = Vec::new();
-    let mut named_co = None;
-    let mut fallback = false;
-    match &named {
-        Some((r, via)) => {
-            let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(via)).await.map_err(AppError::bad)?);
-            let found = read_manifests(&co, &r.name)?;
-            if found.is_empty() {
-                return Err(AppError::bad(format!("no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {}", r.name)));
-            }
-            for (file, m) in found {
-                if !have.contains(&file) {
-                    candidates.push((file, TagRule::of_manifest(&m), Some(m)));
-                }
-            }
-            named_co = Some(co);
-        }
-        None => {
-            let head = git::resolve_ref(policy(state), &url, None).await.map_err(AppError::bad)?;
-            let at_head = git::checkout(policy(state), &url, &head, None).await.map_err(AppError::bad)?;
-            let on_head = read_manifests(&at_head, "the default branch")?;
-            fallback = on_head.is_empty();
-            if fallback {
-                candidates.extend(MANIFEST_FILES.iter().filter(|f| !have.contains(*f)).map(|f| (*f, TagRule::default(), None)));
-            } else {
-                candidates.extend(
-                    on_head.iter().filter(|(f, _)| !have.contains(f)).map(|(f, m)| (*f, TagRule::of_manifest(m), None)),
-                );
-            }
-        }
-    }
-    let all_rules: Vec<TagRule> = candidates.iter().map(|(_, r, _)| r.clone()).collect();
-    for (i, (file, rule, at_named)) in candidates.into_iter().enumerate() {
-        let others: Vec<&TagRule> =
-            sibling_rules.iter().chain(all_rules.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, r)| r)).collect();
-        let claimed = |tag: &str| others.iter().find_map(|o| claimed_by(tag, &rule, o));
-        // At the named tag, when the manifest there reads it as one of its own versions.
-        if let (Some(m), Some((r, _)), Some(co)) = (at_named.as_ref(), &named, &named_co) {
-            match (rule.version(&r.name), claimed(&r.name)) {
-                (Some(tv), None) => {
-                    new.push(Planned { file, kind: kind_of(file), name: name_of(m), manifest: m.clone(), rule, tag: r.clone(), tv, co: co.clone() });
-                    continue;
-                }
-                (_, why) => {
-                    notes.push(format!(
-                        "{file} at {} follows {}{}, so {} isn't one of its versions: it isn't registered now; register again without --tag to add it",
-                        r.name,
-                        rule.describe(),
-                        why.map(|w| format!(" ({w})")).unwrap_or_default(),
-                        r.name
-                    ));
-                    continue;
-                }
-            }
-        }
-        // Leaving out what others' patterns claim before tags naming one version are deduplicated, so
-        // a claimed bare 1.0.0 can't hide this kind's own v1.0.0.
-        let tags: Vec<(RemoteRef, TrackedVersion)> =
-            version_tags(refs.iter().filter(|r| claimed(&r.name).is_none()).cloned().collect(), &rule);
-        let Some((r, tv)) = newest(&tags) else {
-            if fallback {
-                continue;
-            }
-            return Err(AppError::bad(format!("{file} follows {}, and the repo has none of its tags yet", rule.describe())));
-        };
-        let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(&r.name)).await.map_err(AppError::bad)?);
-        let Some(text) = git::read_in(&co, file).map_err(AppError::bad)? else {
-            if fallback {
-                continue;
-            }
-            return Err(AppError::bad(format!(
-                "{file} isn't at {}, its newest version tag; register with --tag naming a tag that has it",
-                r.name
-            )));
-        };
-        let m = Manifest::from_repo_file(file, &text).map_err(|e| AppError::bad(format!("{file} at {}: {e}", r.name)))?;
-        let own = TagRule::of_manifest(&m);
-        if own.version(&r.name).as_ref() != Some(tv) {
-            return Err(AppError::bad(format!(
-                "{file} at {} follows {}, not {}; register with --tag naming one of its own tags",
-                r.name,
-                own.describe(),
-                rule.describe()
-            )));
-        }
-        new.push(Planned { file, kind: kind_of(file), name: name_of(&m), manifest: m, rule: own, tag: r.clone(), tv: tv.clone(), co });
-    }
-    if named.is_none() && fallback && new.is_empty() && existing.is_empty() {
-        return Err(match newest(&version_tags(refs, &TagRule::default())) {
-            None => AppError::bad(format!("the repo has no {} yet", TagRule::default().describe())),
-            Some((r, _)) => AppError::bad(format!(
-                "no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {} (the newest version tag)",
-                r.name
-            )),
-        });
-    }
-    if new.is_empty() && !notes.is_empty() {
-        return Err(AppError::bad(format!("nothing to register at that tag: {}", notes.join("; "))));
-    }
-    if new.is_empty() {
-        let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
-        return Err(AppError::bad(format!("{url} already has every entry its manifests give: {}; nothing to add", list.join(", "))));
-    }
-    let owner = match owner {
-        Some(o) => o.to_owned(),
-        None => existing
-            .first()
-            .map(|(e, _)| e.owner.clone())
-            .or_else(|| owners_of(&new[0].manifest).into_iter().next())
-            .unwrap_or_default(),
-    };
-    for (i, p) in new.iter().enumerate() {
-        if !owners_of(&p.manifest).contains(&owner) {
-            return Err(AppError::bad(format!(
-                "{} at {} does not list '{owner}' in owners; add it there to prove you control the repo",
-                p.file, p.tag.name
-            )));
-        }
-        // Every entry needs its own name: two manifests naming one would collide.
-        if let Some(q) = new[..i].iter().find(|q| q.name == p.name) {
-            return Err(AppError::bad(format!(
-                "{} and {} both name '{}': each manifest becomes its own entry, so give them different names",
-                q.file, p.file, p.name
-            )));
-        }
-        if let Some(e) = model::find_entry(state, &owner, &p.name).await? {
-            return Err(AppError::bad(format!("{} already exists (a {}), so {} can't be registered under that name", e.slug(), e.kind, p.file)));
-        }
-    }
-    Ok(Plan { url, owner, existing, new, notes })
+    pub skipped: Vec<Skipped>,
 }
 
 impl Plan {
@@ -626,66 +438,645 @@ impl Plan {
             },
         )
     }
+}
 
-    /// Reads each planned entry at its tag exactly as its first sync will, without storing anything.
-    /// A sim pin that can't be checked yet (its package registered here, or not public yet) is
-    /// returned as a note: the tag will wait for it rather than freeze. Any other failure is
-    /// returned, naming the entry and tag.
-    async fn prepare_all(&self, state: &AppState) -> AppResult<Vec<(String, Prepared)>> {
-        let registering: Vec<String> =
-            if self.new.iter().any(|p| p.kind == "package") { vec![git::normalize_url(&self.url)] } else { vec![] };
-        let opts = PrepOpts { defer_pins: true, registering };
-        let mut out = Vec::new();
-        for p in &self.new {
-            let (entry, repo) = self.provisional(p);
-            let label = format!("{}@{}", entry.slug(), p.tv);
-            let prepared = prepare(state, &entry, &repo, &p.co, &p.tag, &p.tv, &opts)
-                .await
-                .map_err(|e| AppError::bad(format!("{label} (tag {}): {e}", p.tag.name)))?;
-            out.push((label, prepared));
+/// Where a registration reads its manifests: each entry's newest release tag, or one named tag. A
+/// dry run can also name a tag that doesn't exist yet, with the commit it would name.
+pub enum At<'a> {
+    Newest,
+    Tag(&'a str),
+    Commit { tag: &'a str, commit: &'a str },
+}
+
+/// Works out what registering `url` under `owner` would add, without writing anything.
+///
+/// Without a tag named, each manifest file found at any tag starts from its newest release, found
+/// the way syncing reads tags ([`discover`]): the newest tag whose own manifest at that commit
+/// reads it as a version, with the claims of the siblings' manifests there (the entries already on
+/// the repo, and the other new ones). The default branch decides nothing: a manifest there with no
+/// release tag yet is left out with a note, and a release whose file isn't there is only marked.
+///
+/// With a tag named, only the manifests there that read it as one of their versions are planned,
+/// at it; the others are left out, with a note (register again without the tag to add them).
+///
+/// With `files`, only those manifest files are candidates, and the claims among new entries are
+/// those of the chosen ones alone, as their syncs will apply them.
+///
+/// Entries already on the repo stay as they are; they must be `owner`'s. Without an owner (a dry
+/// run), the repo's existing owner is assumed, else the first owner the first new manifest lists.
+/// A repo nobody registered yet is read through a temporary mirror, deleted afterward: only a
+/// registration keeps one.
+pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>, files: Option<&[String]>) -> AppResult<Plan> {
+    let url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
+    let existing = entries_on(state, &url).await?;
+    if let Some(owner) = owner
+        && let Some((e, _)) = existing.iter().find(|(e, _)| e.owner != owner)
+    {
+        return Err(AppError::bad(format!(
+            "{url} is already registered, as {} under '{}'; only that owner can add its other manifests",
+            e.slug(),
+            e.owner
+        )));
+    }
+    let have: Vec<&str> = existing.iter().map(|(_, f)| f.as_str()).collect();
+    let chosen = |f: &str| files.is_none_or(|o| o.iter().any(|x| x == f));
+    let refs = git::ls_tags(policy(state), &url).await.map_err(AppError::bad)?;
+    let mirrors = if existing.is_empty() { git::Mirrors::temp().map_err(AppError::Internal)? } else { git::Mirrors::Shared };
+    let mut new = Vec::new();
+    let mut skipped = Vec::new();
+    match at {
+        At::Newest => {
+            // The default branch decides nothing here: what it carries is only shown (a manifest
+            // there with no release yet is listed as skipped; a release whose file isn't there
+            // anymore is marked), and its rules only order which tags are read first.
+            let head = git::resolve_ref(policy(state), &url, None).await.map_err(AppError::bad)?;
+            let at_head = git::checkout(policy(state), &url, &head, None).await.map_err(AppError::bad)?;
+            let mut on_head: Vec<(&'static str, Option<Manifest>)> = Vec::new();
+            for file in MANIFEST_FILES {
+                if let Ok(Some(text)) = git::read_in(&at_head, file) {
+                    on_head.push((file, Manifest::from_repo_file(file, &text).ok()));
+                }
+            }
+            let head_rules: BTreeMap<&'static str, TagRule> =
+                on_head.iter().filter_map(|(f, m)| m.as_ref().map(|m| (*f, TagRule::of_manifest(m)))).collect();
+            let files: Vec<&'static str> = MANIFEST_FILES.iter().copied().filter(|f| !have.contains(f) && chosen(f)).collect();
+            if !files.is_empty() {
+                let found = discover(state, &mirrors, &url, &refs, &files, &existing, &head_rules).await?;
+                // A partial read never picks quietly: the newest release may be among the tags
+                // left unread (and with it the entry's name, rule and form), so every candidate
+                // needs a tag named instead.
+                if found.unread > 0 {
+                    let why = format!(
+                        "the repo has {} tags and not all could be read ({} were: at most {} per preview, at most {} of them from a checkout, and only commits already in its history); name the tag to start from",
+                        refs.len(),
+                        found.read,
+                        state.cfg.preview_tags,
+                        state.cfg.preview_checkouts
+                    );
+                    let mut any = false;
+                    for file in &files {
+                        let name = found.seen.get(file).map(|(_, n)| n.clone()).or_else(|| {
+                            on_head.iter().find(|(f, _)| f == file).map(|(_, m)| m.as_ref().map(name_of))
+                        });
+                        let Some(name) = name else { continue };
+                        any = true;
+                        skipped.push(Skipped { file, name, note: format!("{file}: {why}"), needs_tag: true });
+                    }
+                    if !any {
+                        return Err(AppError::bad(why));
+                    }
+                } else {
+                for file in &files {
+                    match found.best.get(file) {
+                        Some((r, tv)) => {
+                            let co = Arc::new(git::checkout(policy(state), &url, &r.commit, Some(&r.name)).await.map_err(AppError::bad)?);
+                            // The manifest at the tag, read as its first sync will read it, must read the
+                            // tag as this version.
+                            let Some(text) = git::read_in(&co, file).map_err(AppError::bad)? else {
+                                return Err(AppError::bad(format!("{file} isn't at {} after all; register with --tag", r.name)));
+                            };
+                            let m = Manifest::from_repo_file(file, &text).map_err(|e| AppError::bad(format!("{file} at {}: {e}", r.name)))?;
+                            let own = TagRule::of_manifest(&m);
+                            if own.version(&r.name).as_ref() != Some(tv) {
+                                return Err(AppError::bad(format!(
+                                    "{file} at {} follows {}, which doesn't read {} as {tv}; register with --tag naming one of its own tags",
+                                    r.name,
+                                    own.describe(),
+                                    r.name
+                                )));
+                            }
+                            new.push(Planned {
+                                file,
+                                kind: kind_of(file),
+                                name: name_of(&m),
+                                manifest: m,
+                                rule: own,
+                                tag: r.clone(),
+                                tv: tv.clone(),
+                                co,
+                                problem: None,
+                                off_head: !on_head.iter().any(|(f, _)| f == file),
+                            });
+                        }
+                        None => {
+                            // Found at a tag, or on the default branch, with no release yet (or none
+                            // among the tags read): shown, so the author sees it.
+                            let read = found.seen.get(file).cloned().or_else(|| {
+                                on_head.iter().find(|(f, _)| f == file).map(|(_, m)| match m {
+                                    Some(m) => (TagRule::of_manifest(m), Some(name_of(m))),
+                                    None => (TagRule::default(), None),
+                                })
+                            });
+                            let Some((rule, name)) = read else { continue };
+                            let note = format!(
+                                "{file} follows {}, and the repo has none of its tags yet: it isn't registered now; register again once it has one",
+                                rule.describe()
+                            );
+                            skipped.push(Skipped { file, name, note, needs_tag: false });
+                        }
+                    }
+                }
+                }
+                if found.seen.is_empty() && on_head.is_empty() && existing.is_empty() {
+                    return Err(AppError::bad(if refs.is_empty() {
+                        "the repo has no tags yet, and no manifest on its default branch".to_owned()
+                    } else {
+                        format!("no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at any tag read, nor on the default branch")
+                    }));
+                }
+            }
         }
-        Ok(out)
+        At::Tag(_) | At::Commit { .. } => {
+            plan_at_tag(state, &url, &refs, &existing, &have, at, files, &mut new, &mut skipped).await?;
+        }
+    }
+    drop(mirrors);
+    if new.is_empty() && skipped.is_empty() {
+        let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
+        return Err(AppError::bad(format!("{url} already has every entry its manifests give: {}; nothing to add", list.join(", "))));
+    }
+    let owner = match owner {
+        Some(o) => o.to_owned(),
+        None => existing
+            .first()
+            .map(|(e, _)| e.owner.clone())
+            .or_else(|| new.first().and_then(|p| owners_of(&p.manifest).into_iter().next()))
+            .unwrap_or_default(),
+    };
+    for i in 0..new.len() {
+        let p = &new[i];
+        let problem = if !owners_of(&p.manifest).contains(&owner) {
+            Some(format!("{} at {} does not list '{owner}' in owners; add it there to prove you control the repo", p.file, p.tag.name))
+        } else if let Some(q) = new[..i].iter().find(|q| q.name == p.name) {
+            // Every entry needs its own name: two manifests naming one would collide.
+            Some(format!("{} and {} both name '{}': each manifest becomes its own entry, so give them different names", q.file, p.file, p.name))
+        } else if let Some(e) = model::find_entry(state, &owner, &p.name).await? {
+            Some(format!("{} already exists (a {}), so {} can't be registered under that name", e.slug(), e.kind, p.file))
+        } else {
+            None
+        };
+        new[i].problem = problem;
+    }
+    Ok(Plan { url, owner, existing, new, skipped })
+}
+
+/// The manifests at a named tag (or a commit a dry run names) that read it as one of their
+/// versions, without a sibling's pattern claiming it; the others are left out with a note.
+#[allow(clippy::too_many_arguments)]
+async fn plan_at_tag(
+    state: &AppState,
+    url: &str,
+    refs: &[RemoteRef],
+    existing: &[(Entry, String)],
+    have: &[&str],
+    at: At<'_>,
+    files: Option<&[String]>,
+    new: &mut Vec<Planned>,
+    skipped: &mut Vec<Skipped>,
+) -> AppResult<()> {
+    // The rules of the entries already on the repo: a tag another kind's own pattern reads isn't a
+    // candidate for a kind without that pattern.
+    let mut sibling_rules = Vec::new();
+    for (e, _) in existing {
+        if let Some(r) = repo_of(state, e.id).await? {
+            sibling_rules.push(TagRule::of(&r)?);
+        }
+    }
+    // The tag to read, and a ref to fetch it by when a host won't serve a bare commit.
+    let (r, via) = match at {
+        At::Newest => return Ok(()),
+        At::Tag(tag) => {
+            let r = refs.iter().find(|r| r.name == tag).cloned().ok_or_else(|| AppError::bad(format!("{url} has no tag '{tag}'")))?;
+            let via = r.name.clone();
+            (r, via)
+        }
+        At::Commit { tag, commit } => match refs.iter().find(|r| r.name == tag) {
+            Some(r) => (r.clone(), r.name.clone()),
+            None => {
+                let full = git::resolve_ref(policy(state), url, Some(commit))
+                    .await
+                    .or_else(|_| if commit.len() >= 40 { Ok(commit.to_string()) } else { Err(()) })
+                    .map_err(|_| AppError::bad(format!("'{commit}' is no branch, tag or full commit id of {url}")))?;
+                (RemoteRef { name: tag.to_string(), commit: full }, commit.to_string())
+            }
+        },
+    };
+    let co = Arc::new(git::checkout(policy(state), url, &r.commit, Some(&via)).await.map_err(AppError::bad)?);
+    let found = read_manifests(&co, &r.name)?;
+    if found.is_empty() {
+        return Err(AppError::bad(format!("no {PACKAGE_FILE}, {STACK_FILE} or {SIM_FILE} at {}", r.name)));
+    }
+    let candidates: Vec<(&'static str, Manifest)> =
+        found.into_iter().filter(|(f, _)| !have.contains(f) && files.is_none_or(|o| o.iter().any(|x| x == f))).collect();
+    let all_rules: Vec<TagRule> = candidates.iter().map(|(_, m)| TagRule::of_manifest(m)).collect();
+    for (i, (file, m)) in candidates.into_iter().enumerate() {
+        let rule = all_rules[i].clone();
+        let others: Vec<&TagRule> =
+            sibling_rules.iter().chain(all_rules.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, r)| r)).collect();
+        let claimed = others.iter().find_map(|o| claimed_by(&r.name, &rule, o));
+        match (rule.version(&r.name), claimed) {
+            (Some(tv), None) => {
+                new.push(Planned {
+                    file,
+                    kind: kind_of(file),
+                    name: name_of(&m),
+                    manifest: m,
+                    rule,
+                    tag: r.clone(),
+                    tv,
+                    co: co.clone(),
+                    problem: None,
+                    off_head: false,
+                });
+            }
+            (_, why) => skipped.push(Skipped {
+                file,
+                needs_tag: false,
+                name: Some(name_of(&m)),
+                note: format!(
+                    "{file} at {} follows {}{}, so {} isn't one of its versions: it isn't registered now; register again without --tag to add it",
+                    r.name,
+                    rule.describe(),
+                    why.map(|w| format!(" ({w})")).unwrap_or_default(),
+                    r.name
+                ),
+            }),
+        }
+    }
+    Ok(())
+}
+
+/// What [`discover`] found: each file's newest release (tag and version), and for each file seen
+/// at some tag, the rule and name of its manifest there (the likeliest newest first).
+struct Discovered {
+    best: BTreeMap<&'static str, (RemoteRef, TrackedVersion)>,
+    seen: BTreeMap<&'static str, (TagRule, Option<String>)>,
+    /// Tags read, and tags left unread (past the cap, or needing a checkout past its cap).
+    read: usize,
+    unread: usize,
+}
+
+/// Finds each manifest file's newest release the way syncing reads tags: a tag is a release of a
+/// file when the file's manifest at the tag's commit reads it as a version under its own rule, and
+/// no sibling's manifest there (an entry already on the repo, or another of `files`) claims it
+/// ([`judge`]). At most the preview's number of tags are read (in version order under any known
+/// rule: the standard form, a default-branch manifest's or an existing entry's, newest first; then
+/// the rest by name), and at most so many from a checkout; how many were left unread is counted,
+/// and the caller treats any as "name a tag" rather than pick from a partial read. When the repo's
+/// manifests can't be read right now, that is the error.
+async fn discover(
+    state: &AppState,
+    mirrors: &git::Mirrors,
+    url: &str,
+    refs: &[RemoteRef],
+    files: &[&'static str],
+    existing: &[(Entry, String)],
+    head_rules: &BTreeMap<&'static str, TagRule>,
+) -> AppResult<Discovered> {
+    let mut sib_rules: Vec<TagRule> = Vec::with_capacity(existing.len());
+    for (e, _) in existing {
+        sib_rules.push(unreadable_rule(state, e.id).await?);
+    }
+    let likely: Vec<TagRule> =
+        std::iter::once(TagRule::default()).chain(head_rules.values().cloned()).chain(sib_rules.iter().cloned()).collect();
+    let mut order: Vec<(Option<(bool, semver::Version)>, &RemoteRef)> = refs
+        .iter()
+        .map(|r| (likely.iter().filter_map(|rule| rule.version(&r.name)).map(|tv| (tv.track.is_none(), tv.version)).max(), r))
+        .collect();
+    order.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(x), Some(y)) => y.cmp(x).then_with(|| a.1.name.cmp(&b.1.name)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.name.cmp(&b.1.name),
+    });
+    let cap = state.cfg.preview_tags;
+    let tags: Vec<RemoteRef> = order.iter().take(cap).map(|(_, r)| (*r).clone()).collect();
+    let all_files: Vec<String> = files.iter().map(|f| f.to_string()).chain(existing.iter().map(|(_, f)| f.clone())).collect();
+    let mut checkouts = state.cfg.preview_checkouts;
+    let mut out = Discovered { best: BTreeMap::new(), seen: BTreeMap::new(), read: 0, unread: refs.len() - tags.len() };
+    // Best so far per file: (default track, version, -rank, tag) is largest for the newest.
+    let mut rank_of: BTreeMap<&'static str, i32> = BTreeMap::new();
+    for group in tags.chunks(25) {
+        for (r, got) in group.iter().zip(read_tags(state, mirrors, url, group, &all_files, &mut checkouts).await) {
+            let reads = match got {
+                TagFiles::Reads(reads) => reads,
+                TagFiles::Not { .. } => {
+                    out.read += 1;
+                    continue;
+                }
+                TagFiles::Unexamined(why) if why == CHECKOUTS_USED || why.ends_with("isn't in the repo's history yet") => {
+                    out.unread += 1;
+                    continue;
+                }
+                TagFiles::Unexamined(why) => return Err(AppError::Upstream(why)),
+            };
+            out.read += 1;
+            for (i, file) in files.iter().enumerate() {
+                let Read::Text(text) = &reads[i] else { continue };
+                let Ok(m) = Manifest::from_repo_file(file, text) else { continue };
+                out.seen.entry(file).or_insert_with(|| (TagRule::of_manifest(&m), Some(name_of(&m))));
+                // The entry it would be: named by its manifest, its owner checked later.
+                let now = time::OffsetDateTime::now_utc();
+                let provisional = Entry {
+                    id: 0,
+                    kind: kind_of(file).to_owned(),
+                    owner: String::new(),
+                    name: name_of(&m),
+                    summary: None,
+                    description: None,
+                    visibility: "pending".to_owned(),
+                    verified: false,
+                    trusted: false,
+                    curated: true,
+                    created_by: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let others: Vec<Sib> = files
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(j, f)| Sib { id: 0, slug: format!("the new entry from {f}"), file: f, read: reads[j].clone(), newest: head_rules.get(f).cloned() })
+                    .chain(existing.iter().zip(&sib_rules).enumerate().map(|(k, ((e, f), rule))| Sib {
+                        id: e.id,
+                        slug: e.slug(),
+                        file: f.as_str(),
+                        read: reads[files.len() + k].clone(),
+                        newest: Some(rule.clone()),
+                    }))
+                    .collect();
+                let Exam::Version { tv, rank, error: None, .. } = judge(&provisional, file, None, &r.name, &reads[i], &others, None) else {
+                    continue;
+                };
+                let better = match out.best.get(file) {
+                    None => true,
+                    Some((br, btv)) => {
+                        let key = |tv: &TrackedVersion, rank: i32, name: &str| (tv.track.is_none(), tv.version.clone(), -rank, std::cmp::Reverse(name.to_owned()));
+                        key(&tv, rank, &r.name) > key(btv, rank_of[file], &br.name)
+                    }
+                };
+                if better {
+                    out.best.insert(file, (r.clone(), tv));
+                    rank_of.insert(file, rank);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One row of a registration's preview: an entry it would create (`new`), one already on the
+/// repo (`existing`), a manifest it leaves out (`skipped`), one that needs a tag named to start
+/// from (`needs-tag`: not every tag could be read), or an entry that can't be registered as it is
+/// (`fails`), with why in `note`. Serialized as the registration API will serve it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PreviewEntry {
+    pub slug: String,
+    pub kind: String,
+    pub file: String,
+    pub tag: Option<String>,
+    pub version: Option<String>,
+    pub rule: Option<String>,
+    /// For a new entry: `reviewed` or `auto-approved`.
+    pub review: Option<String>,
+    pub status: &'static str,
+    pub note: Option<String>,
+    /// The row as shown, for a new or failing entry (`file|tag|commit|version|status`): a confirm
+    /// sends it back, and is refused unless the row still reads the same.
+    #[serde(skip)]
+    pub shown: String,
+}
+
+/// What registering a repo would do, row by row, and a fingerprint of the entries already on it:
+/// a registration confirmed from a preview is refused when those, or any row chosen, changed since.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Preview {
+    pub url: String,
+    pub owner: String,
+    pub entries: Vec<PreviewEntry>,
+    #[serde(skip)]
+    pub fingerprint: String,
+}
+
+/// A preview, with the plan behind it and each new entry's reading (aligned with `plan.new`).
+pub struct Previewed {
+    pub preview: Preview,
+    plan: Plan,
+    prepared: Vec<Option<Prepared>>,
+}
+
+/// The dry run of registering `url` under `owner` (as `user`, if known: whether new entries are
+/// reviewed depends on who registers them), writing nothing: [`plan`] (of `files` only, if given),
+/// then each new entry read at its tag exactly as its first sync will read it. Its cost is bounded
+/// like discovery's: at most one checkout per new entry beyond those.
+pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>, url: &str, at: At<'_>, files: Option<&[String]>) -> AppResult<Previewed> {
+    let plan = plan(state, owner, url, at, files).await?;
+    let registering: Vec<String> =
+        if plan.new.iter().any(|p| p.kind == "package") { vec![git::normalize_url(&plan.url)] } else { vec![] };
+    let opts = PrepOpts { defer_pins: true, registering };
+    let skips = user.is_some_and(publish::skips_review) || publish::owner_trusted(state, &plan.owner).await?;
+    let mut entries = Vec::new();
+    for (e, file) in &plan.existing {
+        entries.push(PreviewEntry {
+            slug: e.slug(),
+            kind: e.kind.clone(),
+            file: file.clone(),
+            tag: None,
+            version: None,
+            rule: None,
+            review: None,
+            status: "existing",
+            note: Some("already registered".to_owned()),
+            shown: String::new(),
+        });
+    }
+    let mut prepared = Vec::with_capacity(plan.new.len());
+    for p in &plan.new {
+        let slug = format!("{}/{}", plan.owner, p.name);
+        let (status, note, ready) = match &p.problem {
+            Some(why) => ("fails", why.clone(), None),
+            None => {
+                let (entry, repo) = plan.provisional(p);
+                match prepare(state, &entry, &repo, &p.co, &p.tag, &p.tv, &opts).await {
+                    Ok(r) if r.deferred.is_empty() => ("new", format!("reads cleanly{}{}", sims_note(&r), off_head_note(p)), Some(r)),
+                    Ok(r) => ("new", format!("would wait (left unread, tried again): {}{}", r.deferred.join("; "), off_head_note(p)), Some(r)),
+                    Err(e) => ("fails", e.to_string(), None),
+                }
+            }
+        };
+        entries.push(PreviewEntry {
+            slug,
+            kind: p.kind.to_owned(),
+            file: p.file.to_owned(),
+            tag: Some(p.tag.name.clone()),
+            version: Some(p.tv.to_string()),
+            rule: Some(p.rule.describe_with_since()),
+            review: (status == "new").then(|| if skips { "auto-approved" } else { "reviewed" }.to_owned()),
+            status,
+            note: Some(note),
+            shown: format!("{}|{}|{}|{}|{status}", p.file, p.tag.name, p.tag.commit, p.tv),
+        });
+        prepared.push(ready);
+    }
+    for s in &plan.skipped {
+        entries.push(PreviewEntry {
+            slug: s.name.as_ref().map(|n| format!("{}/{n}", plan.owner)).unwrap_or_default(),
+            kind: kind_of(s.file).to_owned(),
+            file: s.file.to_owned(),
+            tag: None,
+            version: None,
+            rule: None,
+            review: None,
+            status: if s.needs_tag { "needs-tag" } else { "skipped" },
+            note: Some(s.note.clone()),
+            shown: String::new(),
+        });
+    }
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    for e in entries.iter().filter(|e| e.status == "existing") {
+        sha2::Digest::update(&mut h, format!("{}|{}\n", e.slug, e.file).as_bytes());
+    }
+    let fingerprint = hex::encode(&sha2::Digest::finalize(h)[..12]);
+    Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared })
+}
+
+/// The preview's mark on a release whose manifest file isn't on the default branch anymore.
+fn off_head_note(p: &Planned) -> String {
+    if p.off_head {
+        format!("; {} isn't on the default branch (a kind the repo dropped? leave it unchecked, or use --only)", p.file)
+    } else {
+        String::new()
     }
 }
+
+/// The namespace a user registers under: `namespace` (theirs to publish under), else their own
+/// name.
+pub async fn registrant_owner(state: &AppState, user: &User, namespace: Option<&str>) -> AppResult<String> {
+    match namespace.map(str::trim).filter(|n| !n.is_empty()) {
+        None => Ok(user.username.clone()),
+        Some(ns) => {
+            ns.parse::<cactup_ecosystem_common::name::Owner>().map_err(AppError::bad)?;
+            publish::check_namespace(state, user, ns).await?;
+            Ok(ns.to_owned())
+        }
+    }
+}
+
+/// Why a registration confirmed from a preview is refused: the preview is out of date.
+pub const PREVIEW_CHANGED: &str = "the repo changed since the preview (its tags or manifests, or the entries on it); check the new preview and confirm again";
 
 /// What a registration made, and what its first versions wait for.
 pub struct Registered {
     pub entries: Vec<Entry>,
+    /// For each entry made: its manifest file, tag and version.
+    pub from: Vec<(String, String, String)>,
     pub notes: Vec<String>,
 }
 
+/// Which new entries a registration makes.
+pub enum Choice<'a> {
+    /// Every new entry.
+    All,
+    /// The new entries with these manifest names (`--only`). They are planned again with only
+    /// them as new siblings, as their syncs will judge their tags; if that changes any of them
+    /// (leaving out a sibling with a pattern of its own, say), nothing is registered.
+    Names(&'a [String]),
+    /// Confirmed from a preview: these manifest files, each row as it was shown (`rows`, as
+    /// [`PreviewEntry::shown`]), and the fingerprint of the entries already on the repo then. Planned
+    /// again with only them as new siblings; if any of that differs, nothing is registered.
+    Shown { files: &'a [String], rows: &'a [String], fingerprint: &'a str },
+}
+
 /// Registers the manifests a repo carries as entries, then syncs their tags. The entries go under
-/// the user's own name, or (admins only) under `namespace`, a name that is no user's, such as
-/// `et`. That name must be in each manifest's `owners`: only someone who can push to the repo can
-/// put it there. A repo that already has entries gets only the missing ones. Each new entry is
-/// read at its newest tag (or `tag`) first, as its first sync will read it; if one fails, nothing
-/// is written. The entries are created, attached and audited in one transaction.
+/// the user's own name, or under `namespace` (an organization of theirs, or for admins, a name
+/// that is no user's, such as `et`). That name must be in each manifest's `owners`: only someone
+/// who can push to the repo can put it there. A repo that already has entries gets only the
+/// missing ones; `choice` says which ([`Choice`]). Each new entry is read at its tag first, as its
+/// first sync will read it; if one chosen can't be registered, nothing is. When it refuses after
+/// working out a preview, that preview is left in `refused`, to show without reading the repo
+/// again. The entries are created, attached and audited in one transaction.
+#[allow(clippy::too_many_arguments)]
 pub async fn register(
     state: &AppState,
     user: &User,
     url: &str,
     namespace: Option<&str>,
     tag: Option<&str>,
+    choice: Choice<'_>,
+    refused: &mut Option<Preview>,
 ) -> AppResult<Registered> {
-    let owner = match namespace.map(str::trim).filter(|n| !n.is_empty()) {
-        None => user.username.clone(),
-        Some(ns) => {
-            ns.parse::<cactup_ecosystem_common::name::Owner>().map_err(AppError::bad)?;
-            publish::check_namespace(state, user, ns).await?;
-            ns.to_owned()
-        }
-    };
-    let at = match tag.map(str::trim).filter(|t| !t.is_empty()) {
+    let owner = registrant_owner(state, user, namespace).await?;
+    let tag = tag.map(str::trim).filter(|t| !t.is_empty());
+    let at = || match tag {
         Some(t) => At::Tag(t),
         None => At::Newest,
     };
-    let plan = plan(state, Some(&owner), url, at).await?;
-    let mut notes = plan.notes.clone();
-    for (label, p) in plan.prepare_all(state).await? {
-        notes.extend(p.deferred.iter().map(|d| format!("{label} waits: {d}")));
+    // The new entries left out, for the notes.
+    let mut left: Vec<String> = Vec::new();
+    let Previewed { preview, plan, prepared } = match choice {
+        Choice::All => preview(state, Some(user), Some(&owner), url, at(), None).await?,
+        Choice::Names(names) => {
+            let full = preview(state, Some(user), Some(&owner), url, at(), None).await?;
+            let mut files = Vec::new();
+            for name in names {
+                match full.plan.new.iter().find(|p| &p.name == name) {
+                    Some(p) => files.push(p.file.to_owned()),
+                    None => {
+                        let new: Vec<&str> = full.plan.new.iter().map(|p| p.name.as_str()).collect();
+                        *refused = Some(full.preview);
+                        return Err(AppError::bad(format!("no new entry named '{name}' to register (new here: {})", new.join(", "))));
+                    }
+                }
+            }
+            left = full.plan.new.iter().filter(|p| !names.contains(&p.name)).map(|p| format!("{}/{} ({})", full.plan.owner, p.name, p.file)).collect();
+            if files.len() == full.plan.new.len() {
+                full
+            } else {
+                let shown: Vec<String> = full.preview.entries.iter().filter(|e| !e.shown.is_empty()).map(|e| e.shown.clone()).collect();
+                let chosen = preview(state, Some(user), Some(&owner), url, at(), Some(&files)).await?;
+                if let Some(why) = differs(&chosen.preview, &files, &shown, &full.preview.fingerprint) {
+                    *refused = Some(chosen.preview);
+                    return Err(AppError::Conflict(why));
+                }
+                chosen
+            }
+        }
+        Choice::Shown { files, rows, fingerprint } => {
+            left = rows.iter().filter_map(|r| r.split('|').next()).filter(|f| !files.iter().any(|x| x == f)).map(str::to_owned).collect();
+            let chosen = preview(state, Some(user), Some(&owner), url, at(), Some(files)).await?;
+            if let Some(why) = differs(&chosen.preview, files, rows, fingerprint) {
+                *refused = Some(chosen.preview);
+                return Err(AppError::Conflict(why));
+            }
+            chosen
+        }
+    };
+    let failing: Vec<String> = preview
+        .entries
+        .iter()
+        .filter(|e| e.status == "fails")
+        .map(|e| format!("{}@{} (tag {}): {}", e.slug, e.version.as_deref().unwrap_or(""), e.tag.as_deref().unwrap_or(""), e.note.as_deref().unwrap_or("")))
+        .collect();
+    if !failing.is_empty() {
+        *refused = Some(preview);
+        return Err(AppError::bad(format!("nothing was registered: {}", failing.join("; "))));
+    }
+    if plan.new.is_empty() {
+        let notes: Vec<&str> = plan.skipped.iter().map(|s| s.note.as_str()).collect();
+        *refused = Some(preview);
+        return Err(AppError::bad(format!("nothing to register now: {}", notes.join("; "))));
+    }
+    let mut notes: Vec<String> = plan.skipped.iter().map(|s| s.note.clone()).collect();
+    notes.extend(left.iter().map(|l| format!("{l} isn't registered now: not chosen; register again to add it")));
+    for (p, r) in plan.new.iter().zip(&prepared) {
+        if let Some(r) = r {
+            let label = format!("{owner}/{}@{}", p.name, p.tv);
+            notes.extend(r.deferred.iter().map(|d| format!("{label} waits: {d}")));
+        }
     }
     let mut tx = state.db.begin().await?;
     let mut entries = Vec::new();
+    let mut from = Vec::new();
     for p in &plan.new {
         let entry = publish::create_entry_in(
             &mut tx,
@@ -703,6 +1094,7 @@ pub async fn register(
         .await?;
         attach_repo(&mut tx, &entry, &plan.url, p.file, None, &p.rule, sim_form_of(&p.manifest).as_deref()).await?;
         entries.push(entry);
+        from.push((p.file.to_owned(), p.tag.name.clone(), p.tv.to_string()));
     }
     // The entries already on the repo judge their tags again with the new ones as siblings (a new
     // sibling's pattern may claim tags they have read but not frozen).
@@ -722,7 +1114,7 @@ pub async fn register(
         Some(&plan.url),
         json!({
             "entries": entries.iter().map(Entry::slug).collect::<Vec<_>>(),
-            "from": plan.new.iter().map(|p| json!({ "file": p.file, "tag": p.tag.name })).collect::<Vec<_>>(),
+            "from": from.iter().map(|(file, tag, _)| json!({ "file": file, "tag": tag })).collect::<Vec<_>>(),
             "beside": plan.existing.iter().map(|(e, _)| e.slug()).collect::<Vec<_>>(),
         }),
         None,
@@ -737,59 +1129,108 @@ pub async fn register(
             notes.push(format!("{}: its first check of tags: {err}", e.slug()));
         }
     }
-    Ok(Registered { entries, notes })
+    Ok(Registered { entries, from, notes })
 }
 
-/// A dry run of registering `url` at `tag`: what each new entry would be and how its version
-/// would read, and for each entry already on the repo, whether the tag is one of its versions and
-/// how it would read. Nothing is written. With `commit`, a tag that doesn't exist yet is read as if
-/// it named that commit (a branch or a full commit id), so a release can be checked before it is
-/// tagged. Returns the report's lines and whether everything would be read cleanly.
+/// Why a preview planned for the files chosen differs from what was shown (`rows`, as
+/// [`PreviewEntry::shown`], for every new or failing entry then; `fingerprint`, of the entries
+/// already on the repo then), if it does: a chosen row reads differently now (the repo changed, or
+/// leaving out a sibling changes whose tags are whose), or isn't a new entry anymore, or the
+/// entries on the repo changed.
+fn differs(now: &Preview, files: &[String], rows: &[String], fingerprint: &str) -> Option<String> {
+    let file_of = |row: &str| row.split('|').next().unwrap_or("").to_owned();
+    let left_out: Vec<String> = rows.iter().map(|r| file_of(r)).filter(|f| !files.contains(f)).collect();
+    let mut changed = Vec::new();
+    for file in files {
+        let was = rows.iter().find(|r| file_of(r) == *file);
+        let is = now.entries.iter().find(|e| &e.file == file && !e.shown.is_empty());
+        match (was, is) {
+            (Some(w), Some(e)) if *w == e.shown => {}
+            (_, Some(e)) => {
+                let old = was.map(|w| {
+                    let parts: Vec<&str> = w.split('|').collect();
+                    format!("{} ({})", parts.get(1).unwrap_or(&""), parts.get(3).unwrap_or(&""))
+                });
+                changed.push(format!(
+                    "{} now starts at {} ({}){}{}",
+                    e.slug,
+                    e.tag.as_deref().unwrap_or(""),
+                    e.version.as_deref().unwrap_or(""),
+                    old.map(|o| format!(", not {o}")).unwrap_or_default(),
+                    if e.status == "fails" { ", and can't be registered" } else { "" }
+                ));
+            }
+            (_, None) => changed.push(format!(
+                "{file} {}",
+                now.entries.iter().find(|e| &e.file == file).and_then(|e| e.note.clone()).unwrap_or_else(|| "is no new entry now".to_owned())
+            )),
+        }
+    }
+    if changed.is_empty() && now.fingerprint == fingerprint {
+        return None;
+    }
+    let what = if changed.is_empty() { "the entries already on the repo changed".to_owned() } else { changed.join("; ") };
+    Some(if left_out.is_empty() || now.fingerprint != fingerprint {
+        format!("nothing was registered: {PREVIEW_CHANGED}: {what}")
+    } else {
+        format!(
+            "nothing was registered: the entries chosen read differently than shown: {what}. Either the repo changed since the preview, or leaving out {} changes them (their syncs judge tags without it); check the new preview and confirm again",
+            left_out.join(", ")
+        )
+    })
+}
+
+/// A preview as lines of text, for the command line.
+pub fn preview_lines(p: &Preview) -> Vec<String> {
+    let mut lines = Vec::new();
+    for e in &p.entries {
+        let (tag, version, rule) = (e.tag.as_deref().unwrap_or(""), e.version.as_deref().unwrap_or(""), e.rule.as_deref().unwrap_or(""));
+        let note = e.note.as_deref().unwrap_or("");
+        match e.status {
+            "new" => {
+                lines.push(format!(
+                    "new {} {} from {} at {tag}: version {version} (its rule: {rule}; {})",
+                    e.kind,
+                    e.slug,
+                    e.file,
+                    e.review.as_deref().unwrap_or("")
+                ));
+                lines.push(format!("  {}@{version}: {note}", e.slug));
+            }
+            "fails" => lines.push(format!("fails {} {} from {} at {tag}: {note}", e.kind, e.slug, e.file)),
+            "existing" => lines.push(format!("existing {} {} ({}): {note}", e.kind, e.slug, e.file)),
+            "needs-tag" => lines.push(format!("needs a tag {} {}: {note}", e.kind, e.file)),
+            _ => lines.push(format!("skipped {}: {note}", e.file)),
+        }
+    }
+    lines
+}
+
+/// A dry run of registering `url` (at `tag`, if one): the preview registering shows, and with a
+/// tag, for each entry already on the repo, whether the tag is one of its versions and how it would
+/// read. Nothing is written. With `commit`, a tag that doesn't exist yet is read as if it named
+/// that commit (a branch or a full commit id), so a release can be checked before it is tagged.
+/// Returns the report's lines and whether everything would be read cleanly.
 pub async fn check(
     state: &AppState,
     url: &str,
-    tag: &str,
+    tag: Option<&str>,
     commit: Option<&str>,
     owner: Option<&str>,
 ) -> AppResult<(Vec<String>, bool)> {
-    let at = match commit {
-        Some(c) => At::Commit { tag, commit: c },
-        None => At::Tag(tag),
+    let at = match (tag, commit) {
+        (Some(tag), Some(c)) => At::Commit { tag, commit: c },
+        (Some(tag), None) => At::Tag(tag),
+        (None, _) => At::Newest,
     };
     let checked_url = git::check_url(policy(state), url).await.map_err(AppError::bad)?;
     let existing = entries_on(state, &checked_url).await?;
     let mut lines = Vec::new();
     let mut clean = true;
-    match plan(state, owner, url, at).await {
+    match preview(state, None, owner, url, at, None).await {
         Ok(p) => {
-            lines.extend(p.notes.iter().cloned());
-            for planned in &p.new {
-                lines.push(format!(
-                    "new {} {}/{} from {} at {}: version {} (its rule: {})",
-                    planned.kind,
-                    p.owner,
-                    planned.name,
-                    planned.file,
-                    planned.tag.name,
-                    planned.tv,
-                    planned.rule.describe()
-                ));
-            }
-            match p.prepare_all(state).await {
-                Ok(read) => {
-                    for (label, prepared) in read {
-                        if prepared.deferred.is_empty() {
-                            lines.push(format!("  {label}: reads cleanly{}", sims_note(&prepared)));
-                        } else {
-                            lines.push(format!("  {label}: would wait (left unread, tried again): {}", prepared.deferred.join("; ")));
-                        }
-                    }
-                }
-                Err(e) => {
-                    clean = false;
-                    lines.push(format!("  would fail, so registering writes nothing: {e}"));
-                }
-            }
+            clean = !p.preview.entries.iter().any(|e| e.status == "fails");
+            lines.extend(preview_lines(&p.preview));
         }
         Err(AppError::BadRequest(m)) if m.contains("nothing to add") => lines.push("nothing new to register".into()),
         Err(e) => {
@@ -797,6 +1238,7 @@ pub async fn check(
             lines.push(format!("registering would fail: {e}"));
         }
     }
+    let Some(tag) = tag else { return Ok((lines, clean)) };
     // What the entries already on the repo would make of the tag.
     let refs = git::ls_tags(policy(state), &checked_url).await.map_err(AppError::bad)?;
     let remote_has_tag = refs.iter().any(|r| r.name == tag);
@@ -2044,6 +2486,79 @@ fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, s
     Exam::Version { tv, rank, error: None, note, pattern: rule.pattern.as_ref().map(|p| p.as_str().to_owned()) }
 }
 
+/// Files at a tag's commit, as [`read_tags`] reads them.
+enum TagFiles {
+    /// Each file asked for, in order.
+    Reads(Vec<Read>),
+    /// A fact about the tag that makes it no version of anything (a tree, a commit too large).
+    Not { kind: &'static str, why: String },
+    /// Couldn't be read now (see [`Exam::Unexamined`]).
+    Unexamined(String),
+}
+
+/// Reads `files` at each tag's commit from the repo's history mirror; a file the mirror can't give
+/// as plain content (a symbolic link, or a host that refuses blobs by id) is read from a checkout,
+/// with `read_in`'s containment rules, while `checkouts` lasts (each one used counts down; past it,
+/// the tag is unexamined). When the repo can't be read at all, every tag is unexamined.
+async fn read_tags(state: &AppState, mirrors: &git::Mirrors, url: &str, tags: &[RemoteRef], files: &[String], checkouts: &mut usize) -> Vec<TagFiles> {
+    let wants: Vec<(String, String)> = tags.iter().flat_map(|r| files.iter().map(|f| (r.commit.clone(), f.clone()))).collect();
+    let got = match git::read_files_in(policy(state), mirrors, url, &wants).await {
+        Ok(f) => f,
+        Err(e) => {
+            let why = format!("cannot read the repo's manifests right now: {e:#}");
+            return tags.iter().map(|_| TagFiles::Unexamined(why.clone())).collect();
+        }
+    };
+    let mut out = Vec::with_capacity(tags.len());
+    for (i, r) in tags.iter().enumerate() {
+        let chunk: Vec<git::FileAt> = got[i * files.len()..(i + 1) * files.len()].to_vec();
+        if chunk.iter().any(|f| matches!(f, git::FileAt::NotCommit)) {
+            out.push(TagFiles::Not { kind: "not-commit", why: format!("{} names a tree or a file, not a commit", r.name) });
+            continue;
+        }
+        if chunk.iter().any(|f| matches!(f, git::FileAt::Unavailable)) {
+            out.push(TagFiles::Unexamined(format!("{}: its commit isn't in the repo's history yet", r.name)));
+            continue;
+        }
+        let co = if chunk.iter().any(|f| matches!(f, git::FileAt::NeedsCheckout)) {
+            if *checkouts == 0 {
+                out.push(TagFiles::Unexamined(CHECKOUTS_USED.to_owned()));
+                continue;
+            }
+            *checkouts -= 1;
+            match git::checkout(policy(state), url, &r.commit, Some(&r.name)).await {
+                Ok(co) => Some(co),
+                // A fact about the commit, as when a version is frozen: whose release it is can't
+                // be read, so it is no version (examined again if the tag moves).
+                Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
+                    out.push(TagFiles::Not { kind: "large", why: format!("the tagged commit is too large to read: {e:#}") });
+                    continue;
+                }
+                Err(e) => {
+                    out.push(TagFiles::Unexamined(format!("{}: cannot fetch it ({e:#})", r.name)));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let reads: Vec<Read> = chunk
+            .into_iter()
+            .zip(files)
+            .map(|(f, file)| match (f, &co) {
+                (git::FileAt::NeedsCheckout, Some(co)) => match git::read_in(co, file) {
+                    Ok(Some(text)) => Read::Text(text),
+                    Ok(None) => Read::Absent,
+                    Err(e) => Read::Unreadable(format!("{e:#}")),
+                },
+                (other, _) => Read::of(file, other),
+            })
+            .collect();
+        out.push(TagFiles::Reads(reads));
+    }
+    out
+}
+
 /// Examines tags for an entry, reading its manifest (and its siblings', for claims) at each commit
 /// from the repo's history mirror; a file the mirror can't give as plain content (a symbolic link,
 /// or a host that refuses blobs by id) is read from a checkout, with `read_in`'s containment rules,
@@ -2059,60 +2574,21 @@ async fn examine(state: &AppState, entry: &Entry, repo: &RepoRow, tags: &[Remote
         sib_newest.push(Some(unreadable_rule(state, e.id).await?));
     }
     let files: Vec<String> = std::iter::once(repo.manifest_file.clone()).chain(sibs.iter().map(|(_, f)| f.clone())).collect();
-    let wants: Vec<(String, String)> = tags.iter().flat_map(|r| files.iter().map(|f| (r.commit.clone(), f.clone()))).collect();
-    let got = match git::read_files_at(policy(state), &repo.url, &wants).await {
-        Ok(f) => f,
-        Err(e) => {
-            let why = format!("cannot read the repo's manifests right now: {e:#}");
-            return Ok(tags.iter().map(|_| Exam::Unexamined(why.clone())).collect());
-        }
-    };
+    let got = read_tags(state, &git::Mirrors::Shared, &repo.url, tags, &files, checkouts).await;
     let newest = Some(unreadable_rule(state, entry.id).await?);
     let mut out = Vec::with_capacity(tags.len());
-    for (i, r) in tags.iter().enumerate() {
-        let chunk: Vec<git::FileAt> = got[i * files.len()..(i + 1) * files.len()].to_vec();
-        if chunk.iter().any(|f| matches!(f, git::FileAt::NotCommit)) {
-            out.push(Exam::Not { kind: "not-commit", why: format!("{} names a tree or a file, not a commit", r.name) });
-            continue;
-        }
-        if chunk.iter().any(|f| matches!(f, git::FileAt::Unavailable)) {
-            out.push(Exam::Unexamined(format!("{}: its commit isn't in the repo's history yet", r.name)));
-            continue;
-        }
-        let co = if chunk.iter().any(|f| matches!(f, git::FileAt::NeedsCheckout)) {
-            if *checkouts == 0 {
-                out.push(Exam::Unexamined(CHECKOUTS_USED.to_owned()));
+    for (r, got) in tags.iter().zip(got) {
+        let reads = match got {
+            TagFiles::Reads(reads) => reads,
+            TagFiles::Not { kind, why } => {
+                out.push(Exam::Not { kind, why });
                 continue;
             }
-            *checkouts -= 1;
-            match git::checkout(policy(state), &repo.url, &r.commit, Some(&r.name)).await {
-                Ok(co) => Some(co),
-                // A fact about the commit, as when a version is frozen: whose release it is can't
-                // be read, so it is no version (examined again if the tag moves).
-                Err(e) if e.downcast_ref::<git::TooLarge>().is_some() => {
-                    out.push(Exam::Not { kind: "large", why: format!("the tagged commit is too large to read: {e:#}") });
-                    continue;
-                }
-                Err(e) => {
-                    out.push(Exam::Unexamined(format!("{}: cannot fetch it ({e:#})", r.name)));
-                    continue;
-                }
+            TagFiles::Unexamined(why) => {
+                out.push(Exam::Unexamined(why));
+                continue;
             }
-        } else {
-            None
         };
-        let reads: Vec<Read> = chunk
-            .into_iter()
-            .zip(&files)
-            .map(|(f, file)| match (f, &co) {
-                (git::FileAt::NeedsCheckout, Some(co)) => match git::read_in(co, file) {
-                    Ok(Some(text)) => Read::Text(text),
-                    Ok(None) => Read::Absent,
-                    Err(e) => Read::Unreadable(format!("{e:#}")),
-                },
-                (other, _) => Read::of(file, other),
-            })
-            .collect();
         let theirs: Vec<Sib> = sibs
             .iter()
             .zip(&sib_newest)
