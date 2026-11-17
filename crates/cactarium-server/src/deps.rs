@@ -7,8 +7,8 @@
 //! version is refused unless the two agree: every hard CCL requirement of every published thorn is
 //! met by the package itself, or by the `needs` thorns of a dependency that applies to that thorn
 //! (for an `any-of`, by every alternative). A header counts only where some thorn the Cactarium
-//! knows of provides it, and not when it comes with a capability the thorn declares `OPTIONAL`
-//! (`closure::counts`): one nothing provides is a hook, and compiles empty.
+//! knows of provides it, and none that does is optional to the thorn (`ccl::counts`, through
+//! `closure::counts`): one nothing provides is a hook, and compiles empty.
 //! Smells are what a reviewer should look at but that don't block:
 //! needs the CCL doesn't explain, includes that reach another thorn's sources by path, and so on.
 //!
@@ -684,8 +684,7 @@ mod tests {
             for (name, facts) in own {
                 for need in unmet(facts, own.iter().map(|(n, f)| (n.as_str(), f))) {
                     // Only headers: the other needs were checked when these versions were frozen.
-                    let Need::Include(header) = &need else { continue };
-                    if !ccl::counts(&need, registry.iter().copied()) || crate::closure::comes_optionally(facts, header, &registry) {
+                    if !matches!(need, Need::Include(_)) || !ccl::counts(facts, &need, registry.iter().copied()) {
                         continue;
                     }
                     let met = claims.iter().filter(|c| c.kind == "dependency" && (c.needed_by.is_empty() || c.needed_by.contains(name))).any(|c| {

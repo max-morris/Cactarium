@@ -7,8 +7,9 @@
 //! What a built thorn needs comes from the facts the Cactarium stored for the package version
 //! that froze the commit its repo is pinned at. A header (`Need::Include`) counts only where some
 //! published thorn provides it (`ccl::counts`): one nothing provides compiles empty, which is how
-//! hooks work, so it never refuses anything. Nor does one that comes with a capability the thorn
-//! declares `OPTIONAL` ([`comes_optionally`]).
+//! hooks work, so it never refuses anything. Nor does one whose provider is optional to the thorn
+//! (`OPTIONAL`/`OPTIONAL_IFACTIVE`), nor one whose guard macro the thorn's sources test (the
+//! scanner leaves those out of `needs_includes`).
 //!
 //! Some built thorns' facts can't be known: a download's (a tarball component), a repo no package
 //! is registered for, a commit no version froze, a thorn the frozen version doesn't publish. The
@@ -74,11 +75,12 @@ pub async fn providers(state: &AppState, need: &Need) -> AppResult<Vec<(String, 
     Ok(out)
 }
 
-/// Whether an unmet `need` of the thorn with `needing` facts counts against a set: by the crate's
+/// Whether an unmet `need` of the thorn with `needing` facts counts against a set, by the crate's
 /// rule ([`ccl::counts`]), given the facts of the thorns the caller knows of (`local`) and every
-/// published thorn, a header counts only where some thorn provides it; and here, not when it comes
-/// with a capability the thorn declares `OPTIONAL` ([`comes_optionally`]). Every other need
-/// counts. `cache` keeps the published providers of each header for one check.
+/// published thorn: a header counts only where some thorn provides it, and none that does is
+/// optional to the thorn (it `PROVIDES` or `IMPLEMENTS` something the thorn declares `OPTIONAL` or
+/// `OPTIONAL_IFACTIVE`). Every other need counts. `cache` keeps the published providers of each
+/// header for one check.
 pub async fn counts(
     state: &AppState,
     needing: &ThornFacts,
@@ -100,22 +102,7 @@ pub async fn counts(
         .await?;
         cache.insert(key.clone(), rows.into_iter().map(|f| serde_json::from_value(f).unwrap_or_default()).collect());
     }
-    let published = &cache[&key];
-    let known: Vec<&ThornFacts> = local.iter().copied().chain(published).collect();
-    Ok(ccl::counts(need, known.iter().copied()) && !comes_optionally(needing, header, &known))
-}
-
-/// Whether `header` comes with a capability the thorn with `needing` facts declares `OPTIONAL`:
-/// some thorn among `known` that provides the header `PROVIDES` it. The thorn then builds without
-/// it, its unconditional `#include` reading the empty header Cactus makes (CactusNumerical/Slab
-/// includes `loopcontrol.h` with `OPTIONAL LoopControl`, PUGH `vectors.h` with `OPTIONAL
-/// Vectors`), so the header doesn't count. Facts don't record `OPTIONAL_IFACTIVE`, so a header
-/// optional that way (GRHydro's `carpet.hh`) still counts.
-pub fn comes_optionally(needing: &ThornFacts, header: &str, known: &[&ThornFacts]) -> bool {
-    known.iter().any(|f| {
-        f.provides_includes.iter().any(|h| h.eq_ignore_ascii_case(header))
-            && f.provides.iter().any(|c| needing.optional.iter().any(|o| o.eq_ignore_ascii_case(c)))
-    })
+    Ok(ccl::counts(needing, need, local.iter().copied().chain(&cache[&key])))
 }
 
 /// A thorn a thornlist builds, with what the Cactarium knows of it.
@@ -356,19 +343,50 @@ mod tests {
         assert!(unmet(&[unknown("A/Alone", vec![tpx()])]).is_empty());
     }
 
-    /// A header that comes with a capability the thorn declares OPTIONAL is optional: Slab
-    /// includes loopcontrol.h unconditionally, and builds without LoopControl.
+    /// Headers a thorn builds without are never needs that count, by the crate's rules: one whose
+    /// provider it declares OPTIONAL (Slab's loopcontrol.h, PUGH's vectors.h, McLachlan's
+    /// loopcontrol.h) or OPTIONAL_IFACTIVE (GRHydro's and NoExcision's carpet.hh), and one whose
+    /// guard macro its sources test (Formaline's http_Content.h, used only under
+    /// `#ifdef __HTTP_CONTENT_H__`), which the scanner leaves out of its needs.
     #[test]
-    fn a_header_of_an_optional_capability_does_not_count() {
-        let slab = facts(
-            "IMPLEMENTS: Slab\nUSES INCLUDE HEADER: loopcontrol.h\n",
-            Some("PROVIDES Slab\n{\n}\nOPTIONAL LoopControl MPI\n{\n}\n"),
-        );
+    fn headers_a_thorn_builds_without_do_not_count() {
+        let header = |h: &str| Need::Include(h.into());
+        let needing = |interface: &str, configuration: &str, needs: &[&str]| ThornFacts {
+            needs_includes: needs.iter().map(|s| s.to_string()).collect(),
+            ..facts(interface, Some(configuration))
+        };
         let loopcontrol = facts("IMPLEMENTS: LoopControl\nINCLUDES HEADER: loopcontrol.h IN loopcontrol.h\n", Some("PROVIDES LoopControl\n{\n}\n"));
-        assert!(comes_optionally(&slab, "LoopControl.h", &[&loopcontrol]), "headers compare case-insensitively");
+        let vectors = facts("IMPLEMENTS: Vectors\nINCLUDE HEADER: vectors.h IN vectors.h\n", Some("PROVIDES Vectors\n{\n}\n"));
+        let carpet = facts("IMPLEMENTS: Driver\nINCLUDE HEADER: carpet.hh IN carpet.hh\n", Some("PROVIDES Carpet\n{\n}\n"));
+        let providers = [&loopcontrol, &vectors, &carpet];
+        let slab = needing("IMPLEMENTS: Slab\nUSES INCLUDE HEADER: loopcontrol.h\n", "PROVIDES Slab\n{\n}\nOPTIONAL LoopControl MPI\n{\n}\n", &["loopcontrol.h"]);
+        let pugh = needing("IMPLEMENTS: Driver\nUSES INCLUDE: vectors.h\n", "OPTIONAL MPI\n{\n}\nOPTIONAL Vectors\n{\n}\n", &["vectors.h"]);
+        let ml = needing("IMPLEMENTS: ML_ADMConstraints\nUSES INCLUDE: loopcontrol.h\n", "REQUIRES GenericFD\nOPTIONAL LoopControl\n{\n}\n", &["loopcontrol.h"]);
+        let grhydro = needing("IMPLEMENTS: GRHydro\nUSES INCLUDE: carpet.hh\n", "OPTIONAL_IFACTIVE Carpet\n{\n}\n", &["carpet.hh"]);
+        let noexcision = needing("IMPLEMENTS: NoExcision\nUSES INCLUDE: carpet.hh\n", "OPTIONAL_IFACTIVE Carpet\n{\n}\n", &["carpet.hh"]);
+        for (what, f, h) in [("Slab", &slab, "loopcontrol.h"), ("PUGH", &pugh, "vectors.h"), ("McLachlan", &ml, "loopcontrol.h"), ("GRHydro", &grhydro, "carpet.hh"), ("NoExcision", &noexcision, "carpet.hh")] {
+            assert_eq!(ccl::needs_of(f).last(), Some(&header(h)), "{what} still includes {h}");
+            assert!(!ccl::counts(f, &header(h), providers), "{what} builds without {h}");
+        }
+        // TwoPuncturesX's header is no optional provider's: it counts.
         let tp = facts("IMPLEMENTS: TwoPunctures\nINCLUDE HEADER: TP_Guts.h in TP_Guts.h\n", None);
-        assert!(!comes_optionally(&tpx(), "TP_Guts.h", &[&tp, &loopcontrol]));
-        assert!(!comes_optionally(&slab, "TP_Guts.h", &[&tp, &loopcontrol]), "only the header the capability's provider provides");
+        assert!(ccl::counts(&tpx(), &header("TP_Guts.h"), [&tp, &loopcontrol]));
+        // Formaline: the sources test the header's guard, so the scanner reads no need at all.
+        let dir = std::env::temp_dir().join(format!("closure-formaline-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/announce.cc"),
+            "#include \"http_Content.h\"\nvoid f() {\n#ifdef __HTTP_CONTENT_H__\n  HTTP_Port();\n#endif\n}\n",
+        )
+        .unwrap();
+        let mut formaline = facts("IMPLEMENTS: Formaline\nUSES INCLUDE HEADER: http_Content.h\n", Some("OPTIONAL MPI\n{\n}\n"));
+        formaline.scan_sources(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(formaline.needs_includes.is_empty(), "{:?}", formaline.needs_includes);
+        // And so a thornlist of them without the providers builds.
+        let built = [known("CactusNumerical/Slab", slab), known("CactusPUGH/PUGH", pugh), known("CactusUtils/Formaline", formaline)];
+        let flagged: Vec<_> = unmet(&built).into_iter().filter(|(i, n)| ccl::counts(built[*i].facts.as_ref().unwrap(), n, providers)).collect();
+        assert!(flagged.is_empty(), "{flagged:?}");
     }
 
     /// Only lines of their own naming Arrangement/Thorn are built thorns.
@@ -421,13 +439,7 @@ mod tests {
                 .collect();
             let flagged: Vec<String> = unmet(&built)
                 .into_iter()
-                .filter(|(i, n)| match n {
-                    Need::Include(h) => {
-                        ccl::counts(n, registry.iter().copied())
-                            && !comes_optionally(built[*i].facts.as_ref().unwrap(), h, &registry)
-                    }
-                    _ => true,
-                })
+                .filter(|(i, n)| ccl::counts(built[*i].facts.as_ref().unwrap(), n, registry.iter().copied()))
                 .map(|(i, n)| format!("{} {n}", built[i].checkout))
                 .collect();
             let unknown = built.iter().filter(|b| b.facts.is_none()).count();
