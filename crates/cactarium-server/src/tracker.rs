@@ -4020,13 +4020,14 @@ async fn store_prepared(
         .execute(&mut *db)
         .await?;
     for (arr, name, dir, facts) in &p.thorns {
-        sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts, scanned_by) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(vid)
             .bind(arr)
             .bind(name)
             .bind(dir)
             .bind(&facts.implements)
             .bind(serde_json::to_value(facts).map_err(anyhow::Error::from)?)
+            .bind(FACTS_SCANNER)
             .execute(&mut *db)
             .await?;
     }
@@ -4154,6 +4155,13 @@ pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+/// The scanner that reads thorn facts (`ccl::scan_tree`: the CCL and the sources), recorded with
+/// every thorn stored (`thorns.scanned_by`). Change it whenever the shared crate's bump changes what
+/// the scanner reads, so `rescan-facts` reads every version's thorns again: ae11cce reads
+/// `OPTIONAL_IFACTIVE` into `optional` and leaves guard-tested headers out of `needs-includes`,
+/// which b3772d3 (the first to read headers) didn't.
+pub const FACTS_SCANNER: &str = "cactup-ecosystem-common ae11cce";
+
 /// What one version's rescan found ([`rescan_facts`]).
 pub struct Rescanned {
     /// `owner/name@version`.
@@ -4167,11 +4175,12 @@ pub struct Rescanned {
 
 /// Admin-only: reads the facts of every package version's thorns again from its repo at its frozen
 /// commit, as a new version's are read now (the CCL, and the sources for the headers each thorn
-/// includes outside any conditional), and stores them in place of the old ones. Facts stored by an
-/// older scanner lack what it didn't read (`provides-includes`, `needs-includes`), so they read as
-/// providing and needing no header until this runs. Only `entry` (a package) if given; valid
-/// versions only (an invalid one is read afresh when it is re-read); without `all`, only versions
-/// with a thorn whose facts lack those keys, so running it again does only what is left. Nothing
+/// includes outside any conditional), and stores them in place of the old ones, marked as read by
+/// [`FACTS_SCANNER`]. Facts an older scanner read lack what it didn't read (before b3772d3, every
+/// header: they read as providing and needing none; before ae11cce, `OPTIONAL_IFACTIVE`). Only
+/// `entry` (a package) if given; valid versions only (an invalid one is read afresh when it is
+/// re-read); without `all`, only versions with a thorn another scanner (or none recorded) read, so
+/// running it again does only what is left. Nothing
 /// else about a version changes: its commit, thorns, claims and review stay. Each version is
 /// written in one transaction with its audit record (`version.rescan-facts`), so a run that stops
 /// keeps what it did. `each` hears every version as it is done (`Ok`) or left as it was (`Err`,
@@ -4198,11 +4207,12 @@ pub async fn rescan_facts(
          WHERE e.kind = 'package' AND v.commit IS NOT NULL AND v.state <> 'invalid' AND v.invalid_reason IS NULL
            AND ($1::BIGINT IS NULL OR e.id = $1)
            AND EXISTS (SELECT 1 FROM thorns t WHERE t.version_id = v.id
-                       AND ($2 OR NOT (t.facts ? 'provides-includes' AND t.facts ? 'needs-includes')))
+                       AND ($2 OR t.scanned_by IS DISTINCT FROM $3))
          ORDER BY e.owner, e.name, v.track, v.sort_key",
     )
     .bind(entry.map(|e| e.id))
     .bind(all)
+    .bind(FACTS_SCANNER)
     .fetch_all(&state.db)
     .await?;
     for (vid, label, commit, tag, url, slug) in versions {
@@ -4236,16 +4246,16 @@ pub async fn rescan_facts(
                 continue;
             };
             let new_json = serde_json::to_value(&new).map_err(anyhow::Error::from)?;
-            if new_json == *old {
-                continue;
-            }
-            sqlx::query("UPDATE thorns SET facts = $2, implements = $3 WHERE id = $1")
+            sqlx::query("UPDATE thorns SET facts = $2, implements = $3, scanned_by = $4 WHERE id = $1")
                 .bind(id)
                 .bind(&new_json)
                 .bind(&new.implements)
+                .bind(FACTS_SCANNER)
                 .execute(&mut *tx)
                 .await?;
-            done.changed += 1;
+            if new_json != *old {
+                done.changed += 1;
+            }
         }
         crate::audit::audit_with(
             &mut tx,

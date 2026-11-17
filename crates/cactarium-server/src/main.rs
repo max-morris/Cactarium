@@ -102,12 +102,13 @@ enum Command {
     /// Read the thorn facts of package versions again at their frozen commits, as an admin, and
     /// store them in place of the old ones: facts stored before the scanner read included headers
     /// (`INCLUDE ... IN`, and the sources' unconditional `#include`s) say a thorn provides and
-    /// needs none. Only versions whose facts lack those, unless `--all`; only OWNER/NAME if given.
+    /// needs none. Only versions with a thorn an older scanner read, unless `--all`; only
+    /// OWNER/NAME if given.
     /// Prints one line per version; running it again does only what is left.
     RescanFacts {
         username: String,
         slug: Option<String>,
-        /// Every valid version, not only those whose facts lack the newer keys.
+        /// Every valid version, not only those with facts an older scanner read.
         #[arg(long)]
         all: bool,
     },

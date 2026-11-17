@@ -124,10 +124,10 @@ organization with `just cli org create et <your-username> --display-name "Einste
   and a release's against the thorns their thornlist builds (each thorn's facts are those of the
   package version that froze its pinned commit). Besides the CCL requirements, a thorn needs every
   `USES INCLUDE` header its sources include outside any `#if`/`#ifdef`, where a published thorn
-  provides it (`INCLUDE ... IN`) and it doesn't come with a capability the thorn declares
-  `OPTIONAL`. A built thorn the Cactarium has no facts for (a download, a commit no version froze)
-  is not checked and is taken to meet whatever a known thorn of its name meets, or anything when
-  none is known. `rescan-facts` reads the stored facts of package versions again at their frozen
+  provides it (`INCLUDE ... IN`) and the thorn doesn't declare such a provider `OPTIONAL` or
+  `OPTIONAL_IFACTIVE`, and the sources don't test the header's own guard macro. A built thorn
+  the Cactarium has no facts for (a download, a commit no version froze) is not checked and is
+  taken to meet whatever a known thorn of its name meets, or anything when none is known. `rescan-facts` reads the stored facts of package versions again at their frozen
   commits: facts stored before the scanner read headers say a thorn needs and provides none.
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
   uses 25): after deploying, the first polls examine the existing tags of big repos over a few
@@ -159,8 +159,9 @@ organization with `just cli org create et <your-username> --display-name "Einste
   - the stored tag pattern is now only a display hint for repo entries; after a rollback to the
     retry-not-freeze release it would be taken as the real rule again.
 - `move-repo` moves every entry on the repo together.
-- Upgrading to the include-closure release (no migrations): every stored thorn's facts predate the
-  header fields, so until they are rescanned no header is needed or provided anywhere. After `just
+- Upgrading to the include-closure release (migration 0019 adds `thorns.scanned_by`, which scanner
+  read a thorn's facts; older binaries ignore it): every stored thorn's facts predate the header
+  fields, so until they are rescanned no header is needed or provided anywhere. After `just
   update`, run `just cli rescan-facts <admin>` once (it fetches each package version's commit; one
   line per version; run it again to retry what failed, it skips what is done). From then on new
   package versions, sims and stack releases are refused when a thorn includes a header only a thorn
