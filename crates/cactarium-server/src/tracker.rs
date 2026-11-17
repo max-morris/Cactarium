@@ -4154,6 +4154,114 @@ pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+/// What one version's rescan found ([`rescan_facts`]).
+pub struct Rescanned {
+    /// `owner/name@version`.
+    pub label: String,
+    /// The thorns rescanned, and how many of them have new facts.
+    pub thorns: usize,
+    pub changed: usize,
+    /// Thorns the commit no longer has where the version recorded them (left as they were).
+    pub missing: Vec<String>,
+}
+
+/// Admin-only: reads the facts of every package version's thorns again from its repo at its frozen
+/// commit, as a new version's are read now (the CCL, and the sources for the headers each thorn
+/// includes outside any conditional), and stores them in place of the old ones. Facts stored by an
+/// older scanner lack what it didn't read (`provides-includes`, `needs-includes`), so they read as
+/// providing and needing no header until this runs. Only `entry` (a package) if given; valid
+/// versions only (an invalid one is read afresh when it is re-read); without `all`, only versions
+/// with a thorn whose facts lack those keys, so running it again does only what is left. Nothing
+/// else about a version changes: its commit, thorns, claims and review stay. Each version is
+/// written in one transaction with its audit record (`version.rescan-facts`), so a run that stops
+/// keeps what it did. `each` hears every version as it is done (`Ok`) or left as it was (`Err`,
+/// with why: its commit couldn't be fetched, say).
+pub async fn rescan_facts(
+    state: &AppState,
+    admin: &User,
+    entry: Option<&Entry>,
+    all: bool,
+    mut each: impl FnMut(Result<Rescanned, String>),
+) -> AppResult<()> {
+    if !admin.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    if let Some(e) = entry
+        && e.kind != "package"
+    {
+        return Err(AppError::bad(format!("{} is a {}: only packages have thorn facts", e.slug(), e.kind)));
+    }
+    let versions: Vec<(i64, String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT v.id, e.owner || '/' || e.name || '@' || CASE WHEN v.track = '' THEN v.version ELSE v.track || ':' || v.version END,
+                v.commit, v.tag, r.url, e.owner || '/' || e.name
+         FROM versions v JOIN entries e ON e.id = v.entry_id JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.kind = 'package' AND v.commit IS NOT NULL AND v.state <> 'invalid' AND v.invalid_reason IS NULL
+           AND ($1::BIGINT IS NULL OR e.id = $1)
+           AND EXISTS (SELECT 1 FROM thorns t WHERE t.version_id = v.id
+                       AND ($2 OR NOT (t.facts ? 'provides-includes' AND t.facts ? 'needs-includes')))
+         ORDER BY e.owner, e.name, v.track, v.sort_key",
+    )
+    .bind(entry.map(|e| e.id))
+    .bind(all)
+    .fetch_all(&state.db)
+    .await?;
+    for (vid, label, commit, tag, url, slug) in versions {
+        let co = match git::checkout(policy(state), &url, &commit, tag.as_deref()).await {
+            Ok(co) => co,
+            Err(e) => {
+                each(Err(format!("{label}: cannot fetch {}: {e:#}", short(&commit))));
+                continue;
+            }
+        };
+        let thorns: Vec<(i64, String, String, String, serde_json::Value)> =
+            sqlx::query_as("SELECT id, arrangement, name, dir, facts FROM thorns WHERE version_id = $1 ORDER BY id")
+                .bind(vid)
+                .fetch_all(&state.db)
+                .await?;
+        let dirs: Vec<std::path::PathBuf> = thorns.iter().map(|(_, _, _, dir, _)| co.path.join(dir)).collect();
+        // Each thorn's directory, scanned as the root of a tree: the thorn itself is the one found
+        // there, read from the CCL and from its sources.
+        let scanned: Vec<Option<ccl::ThornFacts>> = tokio::task::spawn_blocking(move || {
+            dirs.iter()
+                .map(|d| ccl::scan_tree(d).into_iter().find(|t| t.dir.as_os_str().is_empty()).map(|t| t.facts))
+                .collect()
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+        let mut done = Rescanned { label: label.clone(), thorns: thorns.len(), changed: 0, missing: Vec::new() };
+        let mut tx = state.db.begin().await?;
+        for ((id, arrangement, name, dir, old), new) in thorns.iter().zip(scanned) {
+            let Some(new) = new else {
+                done.missing.push(format!("{arrangement}/{name} ({dir})"));
+                continue;
+            };
+            let new_json = serde_json::to_value(&new).map_err(anyhow::Error::from)?;
+            if new_json == *old {
+                continue;
+            }
+            sqlx::query("UPDATE thorns SET facts = $2, implements = $3 WHERE id = $1")
+                .bind(id)
+                .bind(&new_json)
+                .bind(&new.implements)
+                .execute(&mut *tx)
+                .await?;
+            done.changed += 1;
+        }
+        crate::audit::audit_with(
+            &mut tx,
+            Some(admin.id),
+            "version.rescan-facts",
+            Some(&slug),
+            json!({ "version": label, "commit": commit, "thorns": done.thorns, "changed": done.changed, "missing": done.missing }),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        each(Ok(done));
+    }
+    Ok(())
+}
+
 /// Records the repos a stack release or a sim pins; `sim` names the sim of a multi-sim version
 /// ("" otherwise), whose sims may pin the same repo at different commits.
 pub async fn store_pins(

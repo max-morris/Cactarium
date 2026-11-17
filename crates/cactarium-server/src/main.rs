@@ -99,6 +99,18 @@ enum Command {
         #[arg(long, requires = "version")]
         moved: bool,
     },
+    /// Read the thorn facts of package versions again at their frozen commits, as an admin, and
+    /// store them in place of the old ones: facts stored before the scanner read included headers
+    /// (`INCLUDE ... IN`, and the sources' unconditional `#include`s) say a thorn provides and
+    /// needs none. Only versions whose facts lack those, unless `--all`; only OWNER/NAME if given.
+    /// Prints one line per version; running it again does only what is left.
+    RescanFacts {
+        username: String,
+        slug: Option<String>,
+        /// Every valid version, not only those whose facts lack the newer keys.
+        #[arg(long)]
+        all: bool,
+    },
     /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
     /// as the given admin.
     Curate { username: String, file: std::path::PathBuf },
@@ -287,6 +299,44 @@ async fn main() -> anyhow::Result<()> {
             }
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{said}");
+            Ok(())
+        }
+        Command::RescanFacts { username, slug, all } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            let entry = match slug {
+                Some(s) => {
+                    let (owner, name) = s.split_once('/').context("give owner/name")?;
+                    Some(
+                        model::find_entry(&state, owner, name)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                            .context("no such entry")?,
+                    )
+                }
+                None => None,
+            };
+            let (mut done, mut changed, mut failed) = (0, 0, 0);
+            tracker::rescan_facts(&state, &user, entry.as_ref(), all, |r| match r {
+                Ok(r) => {
+                    done += 1;
+                    changed += r.changed;
+                    let missing = if r.missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; not found at the commit, left as they were: {}", r.missing.join(", "))
+                    };
+                    println!("{}: {} thorns, {} with new facts{missing}", r.label, r.thorns, r.changed);
+                }
+                Err(why) => {
+                    failed += 1;
+                    println!("{why}");
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{done} versions rescanned, {changed} thorns with new facts, {failed} left as they were");
+            anyhow::ensure!(failed == 0, "{failed} versions could not be rescanned; run it again to retry them");
             Ok(())
         }
         Command::PublishSim { username, file, name, version } => {
