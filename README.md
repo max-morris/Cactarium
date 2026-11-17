@@ -52,7 +52,7 @@ writes take a bearer token from the site's Settings page (or `just cli token <us
 | `GET /stacks/{owner}/{name}/releases/{version\|head\|master}` | `FrozenStack` |
 | `GET /sims/{owner}/{name}/{X.Y.Z}/download[?sim=<sim>]` | the `.sim` bytes, with `x-sha256` |
 | `POST /lookup` | `LookedUp`: which package and version each pinned commit is, each download's review |
-| `GET /providers?implements=…` (or `capability=`, `function=`, `thorn=`) | `Providers` |
+| `GET /providers?implements=…` (or `capability=`, `function=`, `thorn=`, `include=`) | `Providers` |
 | `POST /sims/{owner}/{name}` (bearer, `.sim` body) | `Published` |
 | `POST /stacks/{owner}/{name}/releases` (bearer, `ReleaseRequest`) | `Published` |
 | `POST /packages/{owner}/{name}/refresh` (bearer) | `Refreshed` |
@@ -93,7 +93,7 @@ migrates and restarts.
 Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>] [--only <name>]...`, `check <url> [--tag <tag>
-[--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`), `move-repo`, `reapply`, `token`. Create the `et`
+[--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`, or `<version> --moved`), `rescan-facts <admin> [<owner/name>] [--all]`, `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
 - `register` finds each manifest file's newest release among the repo's tags (the newest tag its
@@ -111,7 +111,24 @@ organization with `just cli org create et <your-username> --display-name "Einste
   admin step. `reread` reads an invalid version of a non-curated repo entry again (valid if it
   reads cleanly now, or from another tag naming that version; removed if the tag isn't a version
   of the entry at all); with `--tag`, it examines a tag recorded as not a version again under the
-  current rules.
+  current rules. With `--moved`, `reread` reads a version of a sim or stack whose tag moved (marked
+  `tag-moved`, the frozen commit still served) at the tag's current commit: if the tag there is still
+  that version and passes every check a new tag passes, the version takes the new commit and
+  everything stored from the old one is replaced (a stack's frozen thornlist and pins, every stored
+  `.sim` of a sim entry, the thorn and pin indexes; the next release's diff), the mark goes, the
+  tag's alerts are acknowledged, and it is reviewed as a pushed tag is (`version.reread-moved` in the
+  audit log); otherwise nothing changes and the reasons are printed. Admin, Entries has the same as
+  *Re-read moved tag*. Package versions are refused: sims and stacks pin their commits.
+- A package version, a sim (upload or tag) and a stack release (tag or upload) are checked against
+  what their thorns need: a package's against its own thorns and its dependencies' `needs`, a sim's
+  and a release's against the thorns their thornlist builds (each thorn's facts are those of the
+  package version that froze its pinned commit). Besides the CCL requirements, a thorn needs every
+  `USES INCLUDE` header its sources include outside any `#if`/`#ifdef`, where a published thorn
+  provides it (`INCLUDE ... IN`) and it doesn't come with a capability the thorn declares
+  `OPTIONAL`. A built thorn the Cactarium has no facts for (a download, a commit no version froze)
+  is not checked and is taken to meet whatever a known thorn of its name meets, or anything when
+  none is known. `rescan-facts` reads the stored facts of package versions again at their frozen
+  commits: facts stored before the scanner read headers say a thorn needs and provides none.
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
   uses 25): after deploying, the first polls examine the existing tags of big repos over a few
   checks; a version is frozen once no unexamined or waiting tag could also be it. Each tag's
@@ -142,6 +159,14 @@ organization with `just cli org create et <your-username> --display-name "Einste
   - the stored tag pattern is now only a display hint for repo entries; after a rollback to the
     retry-not-freeze release it would be taken as the real rule again.
 - `move-repo` moves every entry on the repo together.
+- Upgrading to the include-closure release (no migrations): every stored thorn's facts predate the
+  header fields, so until they are rescanned no header is needed or provided anywhere. After `just
+  update`, run `just cli rescan-facts <admin>` once (it fetches each package version's commit; one
+  line per version; run it again to retry what failed, it skips what is done). From then on new
+  package versions, sims and stack releases are refused when a thorn includes a header only a thorn
+  they don't build provides. Versions already frozen stay as they are. Tags read after the deploy
+  (or `reapply`) of curated packages whose manifests leave such a header to a dependency without
+  naming its thorn in `needs` are refused with the line that fixes it; so are tip reads of them.
 - Upgrading to the dependency-plan release (migrations 0017 and 0018): the first `migrate` (which
   `just update` runs) recomputes every stored repo key (`source_pins.url_norm`) with the crate's
   `url::normalize_repo_url`, once, in Rust (queued in the new `data_migrations` table; `serve` runs
