@@ -480,6 +480,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve => {
             migrate().await?;
+            // A pin stored by the previous server between `migrate` and this start has its old
+            // key: recomputing is idempotent and writes only keys that differ.
+            let mut conn = db.acquire().await?;
+            match tracker::rekey_source_pins(&mut conn).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("{n} repo keys recomputed at startup"),
+                Err(e) => tracing::warn!("recomputing repo keys failed: {e}"),
+            }
+            drop(conn);
             serve(cfg, db).await
         }
     }

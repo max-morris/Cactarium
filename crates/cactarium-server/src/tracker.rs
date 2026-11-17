@@ -346,18 +346,26 @@ fn kind_of(file: &str) -> &'static str {
 }
 
 
-/// Every entry whose repo is `url`, compared normalized (`https://github.com/x/y.git` and
-/// `https://github.com/x/y` are one repo): the entries on one repo are each other's siblings.
+/// Every entry whose repo is `url`, compared by the shared key, and on GitHub, GitLab and
+/// Bitbucket also case-insensitively (`url::same_repo_lenient`: `https://github.com/X/y.git` and
+/// `https://github.com/x/Y` are one repo there): the entries on one repo are each other's
+/// siblings, and a second registration of a repo can't slip past them through another spelling.
 pub async fn entries_on(state: &AppState, url: &str) -> AppResult<Vec<(Entry, String)>> {
     let rows: Vec<(i64, String, String)> =
         sqlx::query_as("SELECT entry_id, url, manifest_file FROM entry_repos ORDER BY entry_id").fetch_all(&state.db).await?;
     let mut out = Vec::new();
     for (id, u, file) in rows {
-        if cactup_ecosystem_common::url::same_repo(&u, url) {
+        if one_repo(&u, url) {
             out.push((model::entry_by_id(state, id).await?, file));
         }
     }
     Ok(out)
+}
+
+/// Whether two registered URLs are one repo, for registering and moving repos: the shared key,
+/// or on a forge that ignores path case, the same path in another case.
+pub fn one_repo(a: &str, b: &str) -> bool {
+    cactup_ecosystem_common::url::same_repo_lenient(a, b)
 }
 
 /// The other entries on the same repo as `entry_id`.
@@ -950,7 +958,8 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
 /// What to tell a person registering a repo that has every entry its manifests give, if it has:
 /// every row of the preview is an entry already there. The API answers such a preview as it is.
 pub fn nothing_to_add(p: &Preview) -> Option<String> {
-    if p.entries.iter().any(|e| e.status != "existing") {
+    // A preview with no entries at all (one planned for no file) is no registered repo.
+    if p.entries.is_empty() || p.entries.iter().any(|e| e.status != "existing") {
         return None;
     }
     let list: Vec<String> = p.entries.iter().map(|e| format!("{} ({})", e.slug, e.file)).collect();
@@ -1071,6 +1080,9 @@ pub async fn register(
                 }
                 chosen
             }
+        }
+        Choice::Shown { files, .. } if files.is_empty() => {
+            return Err(AppError::bad("choose at least one entry to register"));
         }
         Choice::Shown { files, rows, fingerprint } => {
             left = rows.iter().filter_map(|r| r.split('|').next()).filter(|f| !files.iter().any(|x| x == f)).map(str::to_owned).collect();
@@ -1874,7 +1886,7 @@ pub async fn move_repo(state: &AppState, admin: &User, entry: &Entry, new_url: &
             .bind(e.id)
             .fetch_one(&mut *tx)
             .await?;
-        if !cactup_ecosystem_common::url::same_repo(&from, &repo.url) {
+        if !one_repo(&from, &repo.url) {
             return Err(AppError::Conflict(format!("{} moved while this ran; reload and try again", e.slug())));
         }
         sqlx::query("UPDATE entry_repos SET url = $2, poll_error = NULL WHERE entry_id = $1")
@@ -4090,6 +4102,18 @@ async fn poll_once(state: &AppState) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repo registered once can't be registered again through another spelling, case included
+    /// on the forges that ignore it.
+    #[test]
+    fn one_repo_by_any_spelling() {
+        let registered = "https://github.com/EinsteinToolkit/Cottonmouth";
+        for other in ["https://github.com/einsteintoolkit/cottonmouth.git", "git@github.com:EinsteinToolkit/Cottonmouth", "https://www.github.com/EINSTEINTOOLKIT/cottonmouth/"] {
+            assert!(one_repo(registered, other), "{other}");
+        }
+        assert!(!one_repo("https://git.example.org/X/Y", "https://git.example.org/x/y"));
+        assert!(!one_repo(registered, "https://github.com/EinsteinToolkit/Cottonmouth2"));
+    }
 
     fn rule(pattern: Option<&str>) -> TagRule {
         TagRule { pattern: pattern.map(|p| p.parse().unwrap()), since: None }

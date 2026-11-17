@@ -1262,6 +1262,18 @@ pub(crate) mod tests {
         assert!(chosen_files(&p, "et", &["old".into()]).is_err(), "already registered");
     }
 
+    /// Only a preview with entries, all already registered, has nothing to add: an empty one (a
+    /// forged choice of no files) is no registered repo.
+    #[test]
+    fn nothing_to_add_needs_entries() {
+        let mut p = tracker::Preview { url: "u".into(), owner: "et".into(), entries: vec![], fingerprint: "f".into() };
+        assert!(tracker::nothing_to_add(&p).is_none());
+        p.entries.push(row("et/old", "cactarium.toml", "existing", None));
+        assert!(tracker::nothing_to_add(&p).unwrap().contains("nothing to add"));
+        p.entries.push(row("et/new", "cactarium-sim.toml", "new", Some("reviewed")));
+        assert!(tracker::nothing_to_add(&p).is_none());
+    }
+
     /// The fingerprint round-trips, and names the request it answered.
     #[test]
     fn expect_round_trips() {
