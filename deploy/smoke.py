@@ -2337,7 +2337,7 @@ def dep_stack(target):
     d = f'format = 1\n\n[stack]\nname = "depstack"\nextends = ["et/et-stack@2026.5.0"]\n\n[[dependency]]\ntarget = "{target}"\n'
     return maxv.post("/new/stack", {"definition": d, "thornlist": "", "version": "0.1.0"})
 s, text, _ = dep_stack("max/nosuchpkg")
-check("a stack release whose dependency has no package version is refused", s == 200 and "no version of that package" in text, text[text.find("alert"):][:300])
+check("a stack release whose dependency has no package version is refused", s == 200 and "no public version of that package" in text, text[text.find("alert"):][:300])
 s, text, _ = dep_stack("et/et-stack")
 check("and one whose dependency is a stack", s == 200 and "that is a stack" in text, text[text.find("alert"):][:300])
 s, text, _ = dep_stack("max/pinpkg@^1")
@@ -2375,7 +2375,7 @@ mbare = publish_tree(M, "m17")
 s, r, _ = api("POST", "/repos", {"url": REPOS + "/m17.git"}, MAXAUTH)
 e = (r.get("entries") or [{}])[0]
 check("a package depending on one awaiting review registers, and its first version waits",
-      s == 200 and e.get("status") == "new" and e.get("new-versions") == 0 and any("isn't public yet" in w for w in e.get("warnings", [])), r)
+      s == 200 and e.get("status") == "new" and e.get("new-versions") == 0 and any("no public version of that package" in w for w in e.get("warnings", [])), r)
 check("its version isn't frozen", not has_version(maxv, "max/m17", "1.0.0"))
 check("approve bob's package", decide("bob/apireg", "approve") == 303)
 ok, out = cli_sync("max/m17")
@@ -2388,7 +2388,7 @@ commit_tag(M, "m17 1.1", "v1.1.0")
 push_all(M, mbare)
 ok, out = cli_sync("max/m17")
 check("a dependency whose version in range awaits review makes the version wait",
-      not ok and "bob/apireg@1.2.0 awaits review" in out and not has_version(maxv, "max/m17", "1.1.0"), out[-300:])
+      not ok and "newest version of bob/apireg in its range awaits review" in out and not has_version(maxv, "max/m17", "1.1.0"), out[-300:])
 # Every read honors the header: the entry, and the lookup, which names the newest version that froze a commit.
 s, r, hdrs = api("GET", "/entries/bob/apireg")
 check("an entry's versions leave out what awaits review", s == 200 and "1.2.0" not in r.get("versions", []) and "x-cactarium-unreviewed" not in hdrs, r)
@@ -2406,6 +2406,27 @@ check("providers serve the newest version awaiting review to an admin who asks",
 check("approve the release", decide("bob/apireg@1.2.0", "approve") == 303)
 ok, out = cli_sync("max/m17")
 check("once reviewed, the waiting version is read", ok and has_version(anon, "max/m17", "1.1.0"), out[-300:])
+
+# A tip read now counts only what its requester could be served: a dependency on a package awaiting
+# its first review is no version to an anonymous reader, and the answer doesn't name it.
+_, _, _, _ = tiny_package("hidtgt", "bob", "HidArr")
+s, r, _ = api("POST", "/repos", {"url": REPOS + "/hidtgt.git"}, BOB)
+check("bob registers a package awaiting review", s == 200 and (r.get("entries") or [{}])[0].get("review") == "pending", r)
+T = new_tree("tipuser")
+thorn_at(T, "TuArr")
+write(T, "cactarium.toml", package_toml("tipuser", "TuArr"))
+commit_tag(T, "tipuser 1.0", "v1.0.0")
+tbare = publish_tree(T, "tipuser")
+s, r, _ = api("POST", "/repos", {"url": REPOS + "/tipuser.git"}, MAXAUTH)
+write(T, "cactarium.toml", package_toml("tipuser", "TuArr", '\n[[dependency]]\ntarget = "bob/hidtgt"\nneeds = ["HidArrThorn"]\n'))
+commit_tag(T, "depends on a package awaiting review")
+push_all(T, tbare)
+s, r, _ = api("GET", "/packages/max/tipuser/versions/head")
+msg = r.get("error", {}).get("message", "")
+check("an anonymous tip read doesn't count a package awaiting review, nor name its versions",
+      s == 400 and "no public version of that package" in msg and "1.0.0" not in msg and "HidArrThorn, which" not in msg, r)
+s, r, _ = api("GET", "/packages/max/tipuser/versions/head", headers={**REV, **MAXAUTH})
+check("an admin who asks reads the tip against it", s == 200 and r.get("version") == "head", r)
 
 print()
 if FAILED:

@@ -279,7 +279,7 @@ pub async fn resolve(
         }
         let label = tip_label(tip);
         let trusted = unreviewed_allowed(&state, &e, label, Unreviewed::Tip).await?;
-        let t = package_snapshot(&state, &e, ip, None).await?;
+        let t = package_snapshot(&state, &e, ip, None, &reviewer).await?;
         let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
         let contact = model::entry_contact(&state, &e, url.as_deref(), None).await?;
         let body = Resolved {
@@ -469,7 +469,7 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str, 
         .into_response());
     }
     let trusted = unreviewed_allowed(state, e, &commit, Unreviewed::Commit).await?;
-    let t = package_snapshot(state, e, ip, Some(&commit)).await?;
+    let t = package_snapshot(state, e, ip, Some(&commit), reviewer).await?;
     let contact = model::entry_contact(state, e, url.as_deref(), None).await?;
     let body = Resolved {
         slug: format!("{}#{commit}", e.slug()),
@@ -538,7 +538,7 @@ pub async fn package_tip(
     let label = commit.clone().unwrap_or(at);
     let kind = if commit.is_some() { Unreviewed::Commit } else { Unreviewed::Tip };
     let trusted = unreviewed_allowed(&state, &e, &label, kind).await?;
-    let t = package_snapshot(&state, &e, ip, commit.as_deref()).await?;
+    let t = package_snapshot(&state, &e, ip, commit.as_deref(), &reviewer).await?;
     let body = PackageVersion {
         version: tip_version_info(&e, &label, &t),
         url,
@@ -639,11 +639,14 @@ fn tip_headers(trusted: bool) -> [(header::HeaderName, header::HeaderValue); 2] 
 }
 
 /// The package read at `commit`, else at its default branch's current commit; cached by commit.
+/// Its dependencies are read against what `reviewer` could be served, and nothing else
+/// (`deps::Reading::Tip`), so an answer never names a hidden entry or a version it can't see.
 async fn package_snapshot(
     state: &AppState,
     e: &Entry,
     ip: ClientIp,
     commit: Option<&str>,
+    reviewer: &Reviewer,
 ) -> ApiResult<std::sync::Arc<tracker::PackageTip>> {
     // Reading a package outside its versions fetches the remote repo; keep anonymous callers from
     // turning that into a flood.
@@ -658,7 +661,9 @@ async fn package_snapshot(
     let fingerprint = {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
-        for part in [e.owner.as_str(), repo.as_ref().map_or("", |r| r.url.as_str()), repo.as_ref().and_then(|r| r.overlay_manifest.as_deref()).unwrap_or("")] {
+        // What the requester may see decides which dependency targets count.
+        let sees = format!("{}{}", u8::from(reviewer.releases), u8::from(reviewer.entries));
+        for part in [e.owner.as_str(), repo.as_ref().map_or("", |r| r.url.as_str()), repo.as_ref().and_then(|r| r.overlay_manifest.as_deref()).unwrap_or(""), sees.as_str()] {
             h.update(part.as_bytes());
             h.update([0]);
         }
@@ -667,7 +672,8 @@ async fn package_snapshot(
     let t = state
         .package_tips
         .get_or_try_init((e.id, commit.clone(), fingerprint), || async {
-            tracker::package_tip(state, e, &commit).await.map(std::sync::Arc::new)
+            let reading = crate::deps::Reading::Tip { releases: reviewer.releases, entries: reviewer.entries };
+            tracker::package_tip(state, e, &commit, reading).await.map(std::sync::Arc::new)
         })
         .await?;
     Ok(t)

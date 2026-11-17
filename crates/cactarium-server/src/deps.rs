@@ -38,15 +38,46 @@ struct TargetVersion {
     visibility: String,
 }
 
-async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetVersion>> {
+/// How a commit's dependencies are read: as a version to freeze, or as a tip read now for someone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reading {
+    /// A version to freeze (a tag, a registration's preview, a snapshot release): every target
+    /// the Cactarium has counts, and one awaiting review, or not public, makes it wait ([`judge`]).
+    /// What it reports goes to the entry's managers and the admins.
+    #[default]
+    Freeze,
+    /// A branch tip or commit read now for a requester, which freezes nothing: only what that
+    /// requester could be served counts (public entries and approved versions; versions awaiting
+    /// review of public entries when `releases`, entries awaiting their first review when
+    /// `entries`, as the include-unreviewed rules allow), and nothing waits. Anything else is no
+    /// version at all, so an answer never names it.
+    Tip { releases: bool, entries: bool },
+}
+
+/// Which target entries (by visibility) and versions (by review) count: all of them when freezing
+/// (a wait decides), what the requester could be served for a tip.
+fn counted(reading: Reading) -> (Vec<&'static str>, Vec<&'static str>) {
+    match reading {
+        Reading::Freeze => (vec!["public", "pending", "hidden"], vec!["approved", "pending"]),
+        Reading::Tip { releases, entries } => (
+            if entries { vec!["public", "pending"] } else { vec!["public"] },
+            if releases { vec!["approved", "pending"] } else { vec!["approved"] },
+        ),
+    }
+}
+
+async fn target_version(state: &AppState, alt: &Alt, reading: Reading) -> AppResult<Option<TargetVersion>> {
+    let (entries, releases) = counted(reading);
     let rows: Vec<(i64, String, String, Option<String>, Option<serde_json::Value>, String, String)> = sqlx::query_as(
         "SELECT v.id, v.track, v.version, v.commit, v.manifest, v.review, e.visibility FROM versions v JOIN entries e ON e.id = v.entry_id
          WHERE e.owner = $1 AND e.name = $2 AND e.kind = 'package' AND v.state <> 'invalid' AND v.invalid_reason IS NULL
-           AND v.review IN ('approved', 'pending')
+           AND v.review = ANY($3) AND e.visibility = ANY($4)
          ORDER BY v.sort_key DESC",
     )
     .bind(&alt.owner)
     .bind(&alt.name)
+    .bind(&releases)
+    .bind(&entries)
     .fetch_all(&state.db)
     .await?;
     let req: Option<TrackedReq> = match (&alt.sha, &alt.range) {
@@ -89,15 +120,21 @@ async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetV
 /// Clients aren't served either, so the dependent waits (left unread, tried again) until it is
 /// reviewed rather than freeze against something nobody can install; once it is approved the
 /// dependent is read against it, and once it is rejected, against the next version in range.
+/// The words name no version nor say why a package isn't public: they reach the dependent's
+/// registrant and its version page, who may not see the target.
 fn judge(target: &str, tv: &TargetVersion) -> Option<String> {
     if tv.visibility != "public" {
-        return Some(format!(
-            "the dependency on {target}: {target} isn't public yet (it awaits review, or is hidden); this waits until it is"
-        ));
+        return Some(no_public_version(target, ""));
     }
     (tv.review == "pending").then(|| {
-        format!("the dependency on {target}: {target}@{} awaits review; this waits until it is reviewed", tv.label)
+        format!("the dependency on {target}: the newest version of {target} in its range awaits review; this waits until it is reviewed")
     })
+}
+
+/// What a dependent waits for when the Cactarium has no public version of its target in range: one
+/// not registered yet, not public yet, or with none in range yet, said alike.
+fn no_public_version(target: &str, at: &str) -> String {
+    format!("the dependency on {target}{at}: the Cactarium has no public version of that package in that range yet; this waits until it has")
 }
 
 /// Whether the target of `alt` has tags in its range not read yet (see
@@ -153,9 +190,8 @@ struct Resolution<'a> {
     waiting: Vec<String>,
 }
 
-/// With `wait_for_review`, a target awaiting review makes the dependent wait ([`judge`]); without
-/// (a branch tip read now, which freezes nothing), it is read against that target as it is.
-async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: Of<'_>, wait_for_review: bool) -> AppResult<Resolution<'a>> {
+/// `reading` says which targets count and whether what awaits review makes it wait ([`Reading`]).
+async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: Of<'_>, reading: Reading) -> AppResult<Resolution<'a>> {
     let mut r = Resolution { deps: Vec::new(), problems: Vec::new(), waiting: Vec::new() };
     let what = match of {
         Of::Package { .. } => "package",
@@ -169,9 +205,10 @@ async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: 
                 (None, Some(h)) => format!("#{h}"),
                 (None, None) => String::new(),
             };
-            match target_version(state, &alt).await? {
+            match target_version(state, &alt, reading).await? {
                 None => {
-                    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM entries WHERE owner = $1 AND name = $2")
+                    // Only a public entry's kind is told: another's existence isn't anyone's to learn.
+                    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM entries WHERE owner = $1 AND name = $2 AND visibility = 'public'")
                         .bind(&alt.owner)
                         .bind(&alt.name)
                         .fetch_optional(&state.db)
@@ -181,14 +218,11 @@ async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: 
                             "the dependency on {}: that is a {k}; a {what} depends on packages, whose thorns it names in needs (say works-with for a {k})",
                             alt.target()
                         )),
-                        _ => r.waiting.push(format!(
-                            "the dependency on {}{at}: the Cactarium has no version of that package in that range yet; publish it first",
-                            alt.target()
-                        )),
+                        _ => r.waiting.push(no_public_version(&alt.target(), &at)),
                     }
                 }
                 Some(tv) => {
-                    if wait_for_review && let Some(why) = judge(&alt.target(), &tv) {
+                    if reading == Reading::Freeze && let Some(why) = judge(&alt.target(), &tv) {
                         r.waiting.push(why);
                         continue;
                     }
@@ -287,26 +321,26 @@ fn refuse(mut problems: Vec<String>, mut waiting: Vec<String>) -> AppResult<()> 
 /// with a version on the Cactarium in range (or at the commit) that has the `needs` thorns, if any
 /// are named. A target awaiting review, or not public, makes the release wait ([`judge`]).
 pub async fn check_stack(state: &AppState, claims: &[ClaimRec]) -> AppResult<()> {
-    let r = resolve_dependencies(state, claims, Of::Stack, true).await?;
+    let r = resolve_dependencies(state, claims, Of::Stack, Reading::Freeze).await?;
     refuse(r.problems, r.waiting)
 }
 
 /// Checks a package version's dependencies against its thorns' CCL. `own` is what will be
 /// published; `repo` is the checkout (for the includes reviewers should see). Returns the smells,
-/// or refuses with every problem and, where it can tell, the line that fixes it. With
-/// `wait_for_review` (a version to freeze), a dependency on what awaits review waits for it.
+/// or refuses with every problem and, where it can tell, the line that fixes it. `reading` says
+/// which targets count, and whether one awaiting review makes it wait ([`Reading`]).
 pub async fn check(
     state: &AppState,
     m: &Manifest,
     own: &[Thorn],
     claims: &[ClaimRec],
     repo: &Path,
-    wait_for_review: bool,
+    reading: Reading,
 ) -> AppResult<Vec<String>> {
     let Some(pkg) = &m.package else { return Ok(Vec::new()) };
     let mut smells: Vec<String> = Vec::new();
     let Resolution { deps, mut problems, waiting } =
-        resolve_dependencies(state, claims, Of::Package { repo }, wait_for_review).await?;
+        resolve_dependencies(state, claims, Of::Package { repo }, reading).await?;
 
     // The CCL can only be checked against what the dependencies resolve to: with one still missing,
     // the facts found so far decide, else the version waits.
@@ -555,10 +589,11 @@ mod tests {
         };
         assert_eq!(judge("et/carpet", &tv("approved", "public")), None);
         let pending = judge("et/carpet", &tv("pending", "public")).unwrap();
-        assert!(pending.contains("et/carpet@2026.5.1 awaits review") && pending.contains("waits"), "{pending}");
+        assert!(pending.contains("in its range awaits review") && !pending.contains("2026.5.1"), "{pending}");
         for vis in ["pending", "hidden"] {
             let why = judge("et/carpet", &tv("approved", vis)).unwrap();
-            assert!(why.contains("isn't public yet"), "{why}");
+            assert_eq!(why, no_public_version("et/carpet", ""), "a hidden or pending target is said like a missing one");
+            assert!(!why.contains("hidden") && !why.contains("review"), "{why}");
         }
     }
 
@@ -572,5 +607,16 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(refuse(vec![], vec!["w".into()]), Err(AppError::Upstream(m)) if m == "w"));
+    }
+
+    /// A tip read counts only what its requester could be served; freezing counts every target
+    /// and lets a wait decide. Rejected versions and hidden entries never count for a tip.
+    #[test]
+    fn tips_count_only_what_the_requester_sees() {
+        assert_eq!(Reading::default(), Reading::Freeze);
+        assert_eq!(counted(Reading::Freeze), (vec!["public", "pending", "hidden"], vec!["approved", "pending"]));
+        assert_eq!(counted(Reading::Tip { releases: false, entries: false }), (vec!["public"], vec!["approved"]));
+        assert_eq!(counted(Reading::Tip { releases: true, entries: false }), (vec!["public"], vec!["approved", "pending"]));
+        assert_eq!(counted(Reading::Tip { releases: true, entries: true }), (vec!["public", "pending"], vec!["approved", "pending"]));
     }
 }
