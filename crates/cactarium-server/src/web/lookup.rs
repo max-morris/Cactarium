@@ -25,6 +25,37 @@ use crate::web::api::{Reviewer, entry_servable, frozen_at, servable, unreviewed_
 /// their mirrors lack (each is fetched at most once a minute anyway); past that, the answer is
 /// `null` (can't tell just now) rather than a guess.
 const MIRROR_UPDATES_PER_LOOKUP: usize = 8;
+/// How many mirror updates all lookups together may ask for in a minute, whoever asks: cycling
+/// through unfrozen commits can't keep the lookups' slot busy, nor send a stream of fetches to a
+/// forge.
+const MIRROR_UPDATES_PER_MINUTE: u32 = 30;
+/// How many distinct packages one lookup reads the history mirrors of (`git cat-file`); past
+/// that, `commit-known` for a commit no version froze is `null`.
+const MIRROR_READS_PER_LOOKUP: usize = 50;
+
+/// The lookups' shared per-minute budget of mirror updates.
+static UPDATE_BUDGET: std::sync::Mutex<Option<(std::time::Instant, u32)>> = std::sync::Mutex::new(None);
+
+/// Takes one mirror update from the budget, if any is left this minute.
+fn take_update() -> bool {
+    take_from(&UPDATE_BUDGET, std::time::Instant::now(), MIRROR_UPDATES_PER_MINUTE)
+}
+
+/// Takes one from a per-minute `budget` of `per_minute` at `now`: a minute starts with its first
+/// take.
+fn take_from(budget: &std::sync::Mutex<Option<(std::time::Instant, u32)>>, now: std::time::Instant, per_minute: u32) -> bool {
+    let mut b = budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (start, used) = match *b {
+        Some((start, used)) if now.duration_since(start) < std::time::Duration::from_secs(60) => (start, used),
+        _ => (now, 0),
+    };
+    if used >= per_minute {
+        *b = Some((start, used));
+        return false;
+    }
+    *b = Some((start, used + 1));
+    true
+}
 
 /// `POST /lookup`: for each pin, the package whose repo it is and the version that froze its
 /// commit; for each download, its review. Both lists in request order.
@@ -54,6 +85,7 @@ pub async fn lookup(
     let mut known: HashMap<usize, Known> = HashMap::new();
     let policy = GitPolicy { allow_local: state.cfg.allow_local_repos };
     let mut updates = MIRROR_UPDATES_PER_LOOKUP;
+    let mut reads = MIRROR_READS_PER_LOOKUP;
     for (i, commits) in &asked {
         let (e, url) = &packages[*i];
         let versions: Vec<Version> =
@@ -63,12 +95,12 @@ pub async fn lookup(
         let mut unfrozen: Vec<String> = commits.iter().filter(|c| frozen_at(&versions, c).is_none()).cloned().collect();
         unfrozen.sort();
         unfrozen.dedup();
-        let history = if unfrozen.is_empty() {
+        let history = if unfrozen.is_empty() || reads == 0 {
             HashMap::new()
         } else {
-            let refresh = updates > 0;
-            let answer = git::mirror_has_commits(policy, url, &unfrozen, refresh).await;
-            if refresh && answer.as_ref().is_some_and(|a| a.updated) {
+            reads -= 1;
+            let answer = git::mirror_has_commits(policy, url, &unfrozen, || updates > 0 && take_update()).await;
+            if answer.as_ref().is_some_and(|a| a.updated) {
                 updates -= 1;
             }
             answer.map(|a| unfrozen.iter().cloned().zip(a.has).collect()).unwrap_or_default()
@@ -267,6 +299,16 @@ fn newest_per_track(versions: &[Version]) -> Vec<&Version> {
 mod tests {
     use super::*;
     use crate::web::api::tests::version;
+
+    /// The lookups' update budget: so many a minute, whoever asks, and a new minute starts afresh.
+    #[test]
+    fn updates_are_budgeted_per_minute() {
+        let budget = std::sync::Mutex::new(None);
+        let t0 = std::time::Instant::now();
+        assert!((0..3).all(|_| take_from(&budget, t0, 3)));
+        assert!(!take_from(&budget, t0 + std::time::Duration::from_secs(59), 3));
+        assert!(take_from(&budget, t0 + std::time::Duration::from_secs(61), 3));
+    }
 
     #[test]
     fn newest_of_each_track() {

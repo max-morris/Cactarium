@@ -534,6 +534,10 @@ const STALE_CLONE: Duration = Duration::from_secs(3600);
 /// At most this many mirrors are cloned or fetched at once, whatever the requests ask for.
 static MIRROR_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 
+/// Lookups (`POST /lookup`, anonymous) update kept mirrors one at a time, on a slot of their own:
+/// however many lookups arrive, they never take one of the slots syncing uses.
+static LOOKUP_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Registration previews' temporary mirrors are cloned one at a time, on their own slot: a preview
 /// never takes one of the slots syncing uses.
 static PREVIEW_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
@@ -741,10 +745,10 @@ pub struct MirrorAnswer {
 }
 
 /// Whether the repo's kept history mirror has each of `commits` (full ids), as commits. `None`
-/// when no mirror is kept for the repo yet: this never clones one. With `refresh`, a mirror that
-/// lacks some is brought up to date first, at most once per [`MIRROR_REFRESH`], as
-/// [`resolve_commit_prefix`] does.
-pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String], refresh: bool) -> Option<MirrorAnswer> {
+/// when no mirror is kept for the repo yet: this never clones one. A mirror that lacks some is
+/// brought up to date first when `refresh` allows it (asked only then), at most once per
+/// [`MIRROR_REFRESH`], on the lookups' own slot ([`LOOKUP_UPDATES`]).
+pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String], refresh: impl FnOnce() -> bool) -> Option<MirrorAnswer> {
     let (root, key, dir) = mirror_of(url).await.ok()?;
     if !mirror_complete(&dir).await {
         return None;
@@ -754,10 +758,10 @@ pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String]
     if first.iter().all(|&b| b) {
         return Some(MirrorAnswer { has: first.into_iter().map(Some).collect(), updated: false });
     }
-    if !refresh {
+    if !refresh() {
         return Some(MirrorAnswer { has: first.into_iter().map(|b| b.then_some(true)).collect(), updated: false });
     }
-    let error = update_mirror(policy, key, root, dir.clone(), false).await;
+    let error = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &LOOKUP_UPDATES).await;
     let after = is_commit(object_types(policy, &dir, commits).await);
     let has = after.into_iter().map(|b| if b { Some(true) } else if error.is_none() { Some(false) } else { None }).collect();
     Some(MirrorAnswer { has, updated: true })
@@ -800,7 +804,11 @@ pub async fn read_files_in(policy: GitPolicy, mirrors: &Mirrors, url: &str, want
     commits.dedup();
     let mut types = object_types(policy, &dir, &commits).await;
     if types.iter().any(Option::is_none) {
-        let error = update_mirror_in(policy, mirrors, key.clone(), root, dir.clone(), false, Some(commits.clone())).await;
+        let slots = match mirrors {
+            Mirrors::Shared => &MIRROR_UPDATES,
+            Mirrors::Temp(_) => &PREVIEW_UPDATES,
+        };
+        let error = update_mirror_in(policy, mirrors, key.clone(), root, dir.clone(), false, Some(commits.clone()), slots).await;
         if let Some(e) = error {
             bail!("{e}");
         }
@@ -975,13 +983,14 @@ async fn update_mirror(
     dir: PathBuf,
     broken: bool,
 ) -> Option<String> {
-    update_mirror_in(policy, &Mirrors::Shared, url, root, dir, broken, None).await
+    update_mirror_in(policy, &Mirrors::Shared, url, root, dir, broken, None, &MIRROR_UPDATES).await
 }
 
 /// [`update_mirror`]; with `needed`, the update skips the window when those commits (which the repo
 /// just listed, so they exist) aren't in the mirror yet, once the lock is held: a tag pushed a
 /// moment after the last update is read at once, and concurrent callers fetch once.
-/// Among `mirrors`: a temporary mirror is updated on [`PREVIEW_UPDATES`], and the update holds its
+/// The update waits for one of `slots` ([`MIRROR_UPDATES`] for syncing, [`PREVIEW_UPDATES`] for a
+/// temporary mirror, [`LOOKUP_UPDATES`] for lookups). The update of a temporary mirror holds its
 /// root, so it is deleted only after the update ends. Once no request holds it anymore (the
 /// client went away), the update is given up: a queued one never takes the slot, and a running
 /// clone is stopped (its git killed).
@@ -994,14 +1003,11 @@ async fn update_mirror_in(
     dir: PathBuf,
     broken: bool,
     needed: Option<Vec<String>>,
+    slots: &'static tokio::sync::Semaphore,
 ) -> Option<String> {
     let lock = mirror_lock(&dir);
     let held = mirrors.clone();
     let task = tokio::spawn(async move {
-        let slots = match &held {
-            Mirrors::Shared => &MIRROR_UPDATES,
-            Mirrors::Temp(_) => &PREVIEW_UPDATES,
-        };
         let mut state = lock.lock_owned().await;
         let lacking = match &needed {
             Some(commits) => lacks_commits(policy, &dir, commits).await,
@@ -1462,17 +1468,27 @@ mod tests {
         let first = sh(&up, &["rev-parse", "HEAD"]);
         let url = format!("file://{}", up.display());
         let policy = GitPolicy { allow_local: true };
-        assert!(mirror_has_commits(policy, &url, std::slice::from_ref(&first), true).await.is_none(), "no mirror kept yet");
+        assert!(mirror_has_commits(policy, &url, std::slice::from_ref(&first), || true).await.is_none(), "no mirror kept yet");
         resolve_commit_prefix(policy, &url, &first[..7]).await.unwrap();
         let none = "0".repeat(40);
-        let a = mirror_has_commits(policy, &url, &[first.clone(), none.clone()], false).await.unwrap();
+        let a = mirror_has_commits(policy, &url, &[first.clone(), none.clone()], || false).await.unwrap();
         assert_eq!((a.has, a.updated), (vec![Some(true), None], false), "without an update, a miss can't tell");
         let later = commit_on(&up, "later", "later");
         tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
-        let a = mirror_has_commits(policy, &url, &[later.clone(), none], true).await.unwrap();
+        let asked = std::cell::Cell::new(false);
+        let a = mirror_has_commits(policy, &url, &[later.clone(), none], || {
+            asked.set(true);
+            true
+        })
+        .await
+        .unwrap();
+        assert!(asked.get(), "asked, since the mirror lacked them");
         assert_eq!((a.has, a.updated), (vec![Some(true), Some(false)], true));
         let tree = sh(&up, &["rev-parse", "HEAD^{tree}"]);
-        assert_eq!(mirror_has_commits(policy, &url, &[tree], true).await.unwrap().has, vec![Some(false)]);
+        assert_eq!(mirror_has_commits(policy, &url, &[tree], || true).await.unwrap().has, vec![Some(false)]);
+        // A mirror that has every commit asked never asks for an update.
+        let a = mirror_has_commits(policy, &url, &[first], || panic!("no update needed")).await.unwrap();
+        assert_eq!((a.has, a.updated), (vec![Some(true)], false));
     }
 
     /// Files at commits from a blobless mirror: blobs fetched by id, a symbolic link left to a
