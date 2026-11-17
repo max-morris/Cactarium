@@ -2277,6 +2277,13 @@ for q in ["", "?thorn=Arith&implements=Driver", "?capability=a%26b"]:
 css = urllib.request.urlopen(BASE + "/static/app.css").read()
 css_sha = hashlib.sha256(css).hexdigest()
 css_url = "http://127.0.0.1:8000/static/app.css"  # as the server reaches itself
+dl_section = f"\n!TARGET = $ROOT/dl\n!TYPE = http\n!URL = {css_url}\n!CHECKSUM_SHA256 = {css_sha}\n!CHECKOUT = app.css\n"
+q3 = "'" * 3
+dlsim = pin_sim("dlsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)])
+dlsim = dlsim.replace(q3 + "\n\n[parfile]", dl_section + q3 + "\n\n[parfile]", 1) + f'\n[[repo]]\nname = "app.css"\nurl = "{css_url}"\nsha256 = "{css_sha}"\n'
+s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
+check("a sim pinning a download nobody submitted is refused, naming the command",
+      s == 400 and f"cactup download submit {css_url}" in body and "hasn't been reviewed" in body, f"{s} {body[:400]}")
 bob.get("/settings")
 _, btext, _ = bob.post("/settings/tokens", {"name": "smoke-bob", "days": "30"})
 BOB = {"Authorization": "Bearer " + re.search(r"(cactarium_[A-Za-z0-9_-]+)", btext).group(1)}
@@ -2292,10 +2299,6 @@ check("submitting it again is a 409 that carries its review",
       s == 409 and r.get("id") == did and r.get("review") == "pending" and r["error"]["code"] == "conflict", r)
 s, r, _ = api("POST", "/lookup", {"pins": [], "downloads": [{"url": css_url, "sha256": css_sha}]})
 check("the lookup says it is pending", s == 200 and r["downloads"][0]["review"] == "pending" and r["pins"] == [], r)
-dl_section = f"\n!TARGET = $ROOT/dl\n!TYPE = http\n!URL = {css_url}\n!CHECKSUM_SHA256 = {css_sha}\n!CHECKOUT = app.css\n"
-q3 = "'" * 3
-dlsim = pin_sim("dlsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)])
-dlsim = dlsim.replace(q3 + "\n\n[parfile]", dl_section + q3 + "\n\n[parfile]", 1) + f'\n[[repo]]\nname = "app.css"\nurl = "{css_url}"\nsha256 = "{css_sha}"\n'
 s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
 check("a sim pinning a download that isn't approved is refused, naming the command",
       s == 400 and f"cactup download submit {css_url}" in body and "awaits review" in body, f"{s} {body[:400]}")

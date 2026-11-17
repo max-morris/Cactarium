@@ -301,7 +301,7 @@ async fn download_problem(state: &AppState, name: &str, url: &str, sha: &str, ou
             &sha[..12]
         )),
         Some(_) => out.passing.push(format!(
-            "{name}: the download {url} (sha256 {}) awaits review on the Cactarium; publish once it is approved",
+            "{name}: the download {url} (sha256 {}) awaits review on the Cactarium (`{submit}` shows its review); publish once it is approved",
             &sha[..12]
         )),
         None => out.passing.push(format!(
