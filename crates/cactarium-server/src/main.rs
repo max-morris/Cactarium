@@ -6,6 +6,7 @@
 mod audit;
 mod auth;
 mod claims;
+mod closure;
 mod config;
 mod curate;
 mod deps;

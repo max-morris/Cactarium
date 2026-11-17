@@ -1,7 +1,8 @@
 //! Publishing `.sim` files.
 //!
-//! A published sim must be fully specified (every repo pinned, nothing dirty or untracked), and
-//! its `[[repo]]` table must name exactly the repos its thornlist checks out. The registry stamps
+//! A published sim must be fully specified (every repo pinned, nothing dirty or untracked), its
+//! `[[repo]]` table must name exactly the repos its thornlist checks out, and the thorns it builds
+//! must build together ([`check_closure`]). The registry stamps
 //! `[sim] cactarium = "owner/name@N"` into the stored copy; the thornlist and parfile stay verbatim.
 
 use std::collections::BTreeSet;
@@ -195,6 +196,17 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
     if all.is_empty() { Ok(()) } else { Err(AppError::bad(format!("not fully specified: {}", all.join("; ")))) }
 }
 
+/// The thorns a sim builds must build together: every hard CCL requirement of each (a header it
+/// includes too, where a published thorn provides it) met by a thorn the sim builds, its facts
+/// those of the package version that froze its pinned commit (`closure::problems`, which is
+/// conservative about thorns whose facts the Cactarium can't know). Refuses with every need left
+/// unmet and the published thorn that would meet it. Run once the pins pass (`check_pins`,
+/// `pin_problems`): before that, the pins say what is wrong.
+pub async fn check_closure(state: &AppState, sim: &SimFile) -> AppResult<()> {
+    let p = crate::closure::problems(state, "the sim", &sim.thornlist.text, &sim.repos).await?;
+    if p.is_empty() { Ok(()) } else { Err(AppError::bad(format!("the thornlist doesn't build: {}", p.join("; ")))) }
+}
+
 /// What is wrong with a sim's pins, split by whether it can change without a new commit of the
 /// sim's repo.
 #[derive(Default)]
@@ -336,6 +348,7 @@ pub async fn publish(
 ) -> AppResult<(Entry, String, &'static str)> {
     let Checked { sim, index } = checked;
     check_pins(state, &sim).await?;
+    check_closure(state, &sim).await?;
     let owner = owner
         .map(str::trim)
         .filter(|o| !o.is_empty())

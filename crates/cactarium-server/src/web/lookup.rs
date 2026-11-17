@@ -11,7 +11,7 @@ use axum::response::{AppendHeaders, IntoResponse, Response};
 use cactup_ecosystem_common::api::{
     DownloadInfo, LookedUp, LookupRequest, PinInfo, Provider, Providers, ProvidersQuery,
 };
-use cactup_ecosystem_common::ccl::{self, Need, ThornFacts};
+use cactup_ecosystem_common::ccl::{self, ThornFacts};
 
 use crate::claims::ClaimRec;
 use crate::error::{ApiResult, AppError};
@@ -225,12 +225,7 @@ pub async fn providers(
 ) -> ApiResult<Response> {
     let need = q.need().map_err(AppError::bad)?;
     // The thorns that might meet it, found by index; `ccl::meets` has the last word.
-    let (cond, key) = match &need {
-        Need::Implementation(_) => ("lower(t.implements) = lower($1) AND $2 = ''", ""),
-        Need::Thorn(_) => ("lower(t.name) = lower($1) AND $2 = ''", ""),
-        Need::Capability(_) => ("EXISTS (SELECT 1 FROM jsonb_array_elements_text(t.facts -> $2) x WHERE lower(x) = lower($1))", "provides"),
-        Need::Function(_) => ("EXISTS (SELECT 1 FROM jsonb_array_elements_text(t.facts -> $2) x WHERE lower(x) = lower($1))", "provides-functions"),
-    };
+    let (cond, key) = crate::closure::need_index(&need);
     let candidates: Vec<(i64, i64)> = sqlx::query_as(&format!(
         "SELECT DISTINCT v.entry_id, v.id FROM thorns t JOIN versions v ON v.id = t.version_id JOIN entries e ON e.id = v.entry_id
          WHERE e.kind = 'package' AND e.visibility IN ('public', 'pending') AND NOT v.yanked AND v.state <> 'invalid'

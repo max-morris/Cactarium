@@ -3697,6 +3697,7 @@ async fn prepare(
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{}.th", entry.name));
         let frozen = stacks::freeze(slug, &filename, resolution, Some(text.clone()))?;
+        stacks::check_closure(state, &frozen).await?;
         let toml = toml::to_string(&frozen).map_err(anyhow::Error::from)?;
         p.frozen = Some((frozen, toml, own));
     }
@@ -3809,6 +3810,11 @@ async fn prepare_one_sim(
         ));
     }
     let pins = crate::sims::pin_problems(state, &checked.sim, &opts.registering).await?;
+    // Once every pin is a package's commit (before that, the pins say what is wrong), what the
+    // sim builds must build together: a fact about the commit, so the version is invalid.
+    if pins.facts.is_empty() && pins.passing.is_empty() {
+        crate::sims::check_closure(state, &checked.sim).await?;
+    }
     Ok((checked, pins))
 }
 
