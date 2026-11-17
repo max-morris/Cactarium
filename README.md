@@ -70,9 +70,12 @@ say `x-cactarium-unreviewed: true`.
 - A sim stored from now on labels each pin `cactarium = "owner/pkg@X.Y.Z"` when a published version
   froze its commit (never `owner/pkg#sha`); stack releases get the labels when served. Stored sims
   are served byte for byte.
-- A sim that pins a download (a tarball component by sha256) is published only once that URL and
-  content are approved: `cactup download submit <url>` submits it, the server fetches it once to
-  check the sha256 (keeping no copy), and an admin decides it under Admin, Downloads.
+- A sim that pins a download (a tarball component by sha256, or an `[[input]]` with url and
+  sha256) is published only once that URL and content are approved: `cactup download submit <url>`
+  submits it, a background job fetches it once to check the sha256 (keeping no copy; rows left
+  fetching by a restart are fetched again at startup), and an admin decides it under Admin,
+  Downloads once verified. A rejected download can be reopened or approved there; a tag that froze
+  invalid over it is read again with `reread`.
 - A package version (or stack release) whose dependency resolves to a version awaiting review, or
   to a package that isn't public, waits (left unread, retried) until it is reviewed; stack
   releases' dependencies are checked like packages', but for the CCL.
@@ -145,7 +148,10 @@ organization with `just cli org create et <your-username> --display-name "Einste
   versions are never re-read); a new stack tag whose `[[dependency]]` names no usable package
   version is now invalid (or waits); registering a repo whose new entry's first version would wait
   registers it instead of refusing; a sim pinning an approved download is accepted where every
-  tarball pin was refused.
+  tarball pin was refused, and a new sim (upload or tag) whose `[[input]]` downloads a url+sha256
+  needs that download approved too (stored sims, such as
+  max-morris/bhns-gw230529-dense@1.0.0, keep their versions). `serve` also recomputes repo keys at
+  every start, for pins the old server stored between `migrate` and the restart.
 - A database that ran an early build of the multi-sim branch (with `0012_multi_sim.sql`, or
   `0013_multi_sim.sql` before it was renumbered to 0014) refuses to start: "migration 12 (or 13) was
   previously applied but has been modified". Production on master or the retry-not-freeze release

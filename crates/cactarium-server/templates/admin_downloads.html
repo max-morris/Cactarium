@@ -4,22 +4,24 @@
 {% block content %}
 {% include "_admin_nav.html" %}
 <section class="stack">
-  <p class="muted">Files a sim pins by sha256 (a tarball component, an input's download), submitted with <code>cactup download submit &lt;url&gt;</code>. The Cactarium fetched each once and checked its sha256; it keeps no copy. A sim pinning a download that isn't approved isn't published. Trusted users' and admins' submissions are approved at once.</p>
+  <p class="muted">Files a sim pins by sha256 (a tarball component, an input's download), submitted with <code>cactup download submit &lt;url&gt;</code>. The Cactarium fetches each once in the background and checks its sha256; it keeps no copy. Only a verified download can be decided. A sim pinning a download that isn't approved isn't published: an upload is refused, a tag waits, and a tag pinning a rejected download becomes an invalid version. Trusted users' and admins' submissions are approved once verified.</p>
+  <p class="muted small">A rejected download can be reopened (back to pending) or approved. Sim tags that became invalid over it stay invalid until read again: <code>just cli reread &lt;admin&gt; &lt;owner/name&gt; &lt;version&gt;</code> (or Admin, Entries, <em>Re-read invalid version</em>).</p>
   {% for d in downloads %}
   <div class="card stack-sm">
-    <span class="small"><strong class="{% if d.review == "pending" %}warn-text{% else if d.review == "approved" %}good-text{% endif %}">{{ d.review }}</strong> · #{{ d.id }} · {{ d.size }} · by <span class="mono">{{ d.submitter }}</span> · {{ d.when }}{% if !d.reviewer.is_empty() %} · decided by <span class="mono">{{ d.reviewer }}</span>{% endif %}</span>
+    <span class="small"><strong class="{% if d.review == "pending" %}warn-text{% else if d.review == "approved" %}good-text{% endif %}">{{ d.review }}</strong> · {% if d.fetch == "fetching" %}being fetched{% else if d.fetch == "failed" %}<strong class="warn-text">fetch failed</strong>{% else %}verified, {{ d.size }}{% endif %} · #{{ d.id }} · by <span class="mono">{{ d.submitter }}</span> · {{ d.when }}{% if !d.reviewer.is_empty() %} · decided by <span class="mono">{{ d.reviewer }}</span>{% endif %}</span>
     <a class="mono strong break" href="{{ d.url }}" rel="nofollow noopener">{{ d.url }}</a>
     <span class="mono small break">sha256 {{ d.sha256 }}</span>
+    {% if !d.fetch_error.is_empty() %}<p class="alert warn small">{{ d.fetch_error }} (submitting it again tries again)</p>{% endif %}
     {% if !d.note.is_empty() %}<p class="small">{{ d.note }}</p>{% endif %}
     {% if !d.review_note.is_empty() %}<p class="small muted">Review note: {{ d.review_note }}</p>{% endif %}
-    {% if d.review == "pending" %}
+    {% if d.fetch == "ok" && d.review != "approved" %}
     <form method="post" action="/admin/downloads/{{ d.id }}" class="stack-sm">
       <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
       <label for="note-{{ d.id }}">Note</label>
       <input id="note-{{ d.id }}" name="note" type="text">
       <div class="row-wrap">
         <button class="button small" name="decision" value="approve" type="submit">Approve</button>
-        <button class="button small danger" name="decision" value="reject" type="submit">Reject</button>
+        {% if d.review == "pending" %}<button class="button small danger" name="decision" value="reject" type="submit">Reject</button>{% else %}<button class="button small ghost" name="decision" value="reopen" type="submit">Reopen</button>{% endif %}
       </div>
     </form>
     {% endif %}

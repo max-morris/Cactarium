@@ -742,7 +742,11 @@ pub struct DownloadRow {
     pub id: i64,
     pub url: String,
     pub sha256: String,
+    /// Empty until the fetch read it.
     pub size: String,
+    /// `fetching`, `ok` (verified) or `failed`.
+    pub fetch: String,
+    pub fetch_error: String,
     pub note: String,
     /// `pending`, `approved` or `rejected`.
     pub review: String,

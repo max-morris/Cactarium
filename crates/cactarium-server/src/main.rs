@@ -704,6 +704,13 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("cannot listen on {bind}"))?;
     tracing::info!("listening on {bind}, serving {}", state.cfg.base_url);
+    // Downloads a stopped server left being fetched are fetched again, now that this server
+    // accepts connections (a download may be served by the site itself, in development).
+    match web::downloads::requeue(&state).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("{n} submitted downloads queued to be fetched again"),
+        Err(e) => tracing::warn!("queueing submitted downloads again failed: {e}"),
+    }
     axum::serve(listener, web::router(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;

@@ -115,6 +115,17 @@ def page(v, path, expect=200, contains=None):
     return text
 
 
+def compose(*args):
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    return subprocess.run(["docker", "compose", "--project-directory", here, "-f", here + "/compose.yaml", "-f", here + "/compose.dev.yaml", *args],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def psql(sql):
+    return compose("exec", "-T", "db", "psql", "-U", "cactarium", "-d", "cactarium", "-tAc", sql)
+
+
 anon = Visitor()
 for p in ["/", "/search", "/search?kind=package", "/search?kind=stack", "/search?kind=sim", "/search?kind=thorn",
           "/search?q=carpetx", "/search?q=driver", "/docs", "/thorns/CarpetX/Loop", "/thorns/Loop",
@@ -302,7 +313,13 @@ if tok:
     v2 = sim.replace("format = 1", "format = 2", 1) + archive_input
     auth = {"Authorization": f"Bearer {tok.group(1)}"}
     s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=v2.encode(), headers=auth)
-    check("a sim with an unpacking input publishes", s == 200, f"{s} {body[:300]}")
+    check("a sim whose input's download isn't reviewed is refused, naming the command",
+          s == 400 and "cactup download submit https://example.org/id.tar.gz" in body, f"{s} {body[:300]}")
+    # (Reviewed as an admin would, without fetching example.org.)
+    psql("INSERT INTO downloads (url, sha256, fetch_state, size, fetched_at, review, decided_at) "
+         f"VALUES ('https://example.org/id.tar.gz', '{digest}', 'ok', {len(buf.getvalue())}, now(), 'approved', now())")
+    s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo", raw=v2.encode(), headers=auth)
+    check("a sim with an unpacking input publishes once its download is approved", s == 200, f"{s} {body[:300]}")
     n = json.loads(body)["slug"].rsplit("@", 1)[1] if s == 200 else "0"
     text = page(anon, f"/max/qc0-demo/{n}?tab=inputs", contains="Downloads and unpacks")
     check("the sim page shows what an import fetches and edits", "id/run.info" in text and digest in text and "/path/to/gam2.polytrope" in text)
@@ -1968,11 +1985,6 @@ ok, out = cli_sync("max/pinstack")
 check("and is read once the tag is there", ok and has_version(anon, "max/pinstack", "1.1.0"), out[-300:])
 # A tag that has waited a very long time (its backoff long capped) doesn't break the sync: other
 # waiting tags are still tried and read.
-def psql(sql):
-    here = os.path.dirname(os.path.abspath(__file__))
-    return subprocess.run(["docker", "compose", "--project-directory", here, "-f", here + "/compose.yaml", "-f", here + "/compose.dev.yaml",
-                           "exec", "-T", "db", "psql", "-U", "cactarium", "-d", "cactarium", "-tAc", sql],
-                          check=True, capture_output=True, text=True).stdout.strip()
 open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("never"))
 retag(pst, pstbare, "v1.2.0")
 open(os.path.join(pst, "cactarium-stack.toml"), "w").write(pst_toml("d-3"))
@@ -2287,16 +2299,39 @@ check("a sim pinning a download nobody submitted is refused, naming the command"
 bob.get("/settings")
 _, btext, _ = bob.post("/settings/tokens", {"name": "smoke-bob", "days": "30"})
 BOB = {"Authorization": "Bearer " + re.search(r"(cactarium_[A-Za-z0-9_-]+)", btext).group(1)}
+def download_state(did):
+    """fetch|review|fetch_error of a submitted download."""
+    return psql(f"SELECT fetch_state || '|' || review || '|' || COALESCE(fetch_error, '') FROM downloads WHERE id = {int(did or 0)}")
+def until_fetched(did):
+    st = ""
+    for _ in range(120):
+        st = download_state(did)
+        if not st.startswith("fetching|"):
+            break
+        time.sleep(0.5)
+    return st
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": "0" * 64}, BOB)
-check("a download whose content has another sha256 is refused", s == 400 and css_sha in r["error"]["message"], r)
+bad_id = r.get("id")
+check("a submission is answered at once, pending", s == 200 and r.get("review") == "pending" and bad_id, r)
+st = until_fetched(bad_id)
+check("its fetch in the background finds another sha256, and fails saying so", st.startswith("failed|pending|") and css_sha in st, st)
+text = page(maxv, "/admin/downloads", contains="fetch failed")
+check("the admin page shows the failed fetch and why, with no decision to make",
+      css_sha in text and f'action="/admin/downloads/{bad_id}"' not in text)
+s, _, _ = maxv.post(f"/admin/downloads/{bad_id}", {"decision": "approve"})
+check("a download not verified can't be decided", s == 409, s)
+s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": "0" * 64}, BOB)
+check("submitting a failed one again tries it again", s == 200 and r.get("id") == bad_id and r.get("review") == "pending", r)
+check("and it fails again", until_fetched(bad_id).startswith("failed|"))
 s, r, _ = api("POST", "/downloads", {"url": "file:///etc/hostname", "sha256": css_sha}, BOB)
-check("a download outside the fetch policy is refused", s == 400 and "https://" in r["error"]["message"], r)
+check("a URL no fetch could read is refused at once", s == 400 and "https://" in r["error"]["message"], r)
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha, "note": "the site's stylesheet"}, BOB)
 did = r.get("id")
-check("bob submits a download: fetched, checked, pending", s == 200 and r.get("review") == "pending" and did, r)
+check("bob submits a download: pending", s == 200 and r.get("review") == "pending" and did, r)
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha}, BOB)
 check("submitting it again is a 409 that carries its review",
       s == 409 and r.get("id") == did and r.get("review") == "pending" and r["error"]["code"] == "conflict", r)
+check("its fetch verifies it, still pending review", until_fetched(did) == "ok|pending|", download_state(did))
 s, r, _ = api("POST", "/lookup", {"pins": [], "downloads": [{"url": css_url, "sha256": css_sha}]})
 check("the lookup says it is pending", s == 200 and r["downloads"][0]["review"] == "pending" and r["pins"] == [], r)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
@@ -2410,14 +2445,15 @@ check("once reviewed, the waiting version is read", ok and has_version(anon, "ma
 # A tip read now counts only what its requester could be served: a dependency on a package awaiting
 # its first review is no version to an anonymous reader, and the answer doesn't name it.
 _, _, _, _ = tiny_package("hidtgt", "bob", "HidArr")
-s, r, _ = api("POST", "/repos", {"url": REPOS + "/hidtgt.git"}, BOB)
-check("bob registers a package awaiting review", s == 200 and (r.get("entries") or [{}])[0].get("review") == "pending", r)
+ok, out = cli("register", "bob", REPOS + "/hidtgt.git")
+check("bob registers a package awaiting review", ok and "pending" in out, out[-300:])
 T = new_tree("tipuser")
 thorn_at(T, "TuArr")
 write(T, "cactarium.toml", package_toml("tipuser", "TuArr"))
 commit_tag(T, "tipuser 1.0", "v1.0.0")
 tbare = publish_tree(T, "tipuser")
-s, r, _ = api("POST", "/repos", {"url": REPOS + "/tipuser.git"}, MAXAUTH)
+ok, out = cli("register", "max", REPOS + "/tipuser.git")
+check("max registers a package", ok, out[-300:])
 write(T, "cactarium.toml", package_toml("tipuser", "TuArr", '\n[[dependency]]\ntarget = "bob/hidtgt"\nneeds = ["HidArrThorn"]\n'))
 commit_tag(T, "depends on a package awaiting review")
 push_all(T, tbare)
@@ -2427,6 +2463,66 @@ check("an anonymous tip read doesn't count a package awaiting review, nor name i
       s == 400 and "no public version of that package" in msg and "1.0.0" not in msg and "HidArrThorn, which" not in msg, r)
 s, r, _ = api("GET", "/packages/max/tipuser/versions/head", headers={**REV, **MAXAUTH})
 check("an admin who asks reads the tip against it", s == 200 and r.get("version") == "head", r)
+
+# A sim repo's tags: an input whose download nobody submitted waits; one pinning a rejected download
+# freezes invalid, and once an admin reopens and approves it, reread reads the tag again.
+svg = urllib.request.urlopen(BASE + "/static/cactus.svg").read()
+svg_sha, svg_url = hashlib.sha256(svg).hexdigest(), "http://127.0.0.1:8000/static/cactus.svg"
+js = urllib.request.urlopen(BASE + "/static/app.js").read()
+js_sha, js_url = hashlib.sha256(js).hexdigest(), "http://127.0.0.1:8000/static/app.js"
+def input_sim(url, sha):
+    plain = pin_sim("dlrepo", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)])
+    return plain if url is None else plain + f'\n[[input]]\nknob = "data"\ndescription = "data"\nurl = "{url}"\nsha256 = "{sha}"\n'
+D = new_tree("dlrepo")
+write(D, "cactarium-sim.toml", 'format = 1\n\n[sim]\nname = "dlrepo"\nowners = ["max"]\nfile = "run.sim"\n')
+write(D, "run.sim", input_sim(None, None))
+commit_tag(D, "dlrepo 1.0", "v1.0.0")
+dbare = publish_tree(D, "dlrepo")
+ok, out = cli("register", "max", REPOS + "/dlrepo.git")
+check("register a sim repo", ok and has_version(anon, "max/dlrepo", "1.0.0"), out[-300:])
+s, r, _ = api("POST", "/downloads", {"url": svg_url, "sha256": svg_sha}, BOB)
+sid = r.get("id")
+check("bob submits another download, verified", s == 200 and until_fetched(sid) == "ok|pending|", download_state(sid))
+s, _, _ = maxv.post(f"/admin/downloads/{sid}", {"decision": "reject", "note": "not data"})
+check("an admin rejects it", s == 303 and download_state(sid).startswith("ok|rejected"), download_state(sid))
+write(D, "run.sim", input_sim(svg_url, svg_sha))
+commit_tag(D, "an input whose download was rejected", "v1.1.0")
+push_all(D, dbare)
+ok, out = cli_sync("max/dlrepo")
+check("a tag whose input's download was rejected freezes invalid",
+      psql("SELECT state FROM versions v JOIN entries e ON e.id = v.entry_id WHERE e.name = 'dlrepo' AND v.version = '1.1.0'") == "invalid", out[-300:])
+write(D, "run.sim", input_sim(js_url, js_sha))
+commit_tag(D, "an input whose download nobody submitted", "v1.2.0")
+push_all(D, dbare)
+ok, out = cli_sync("max/dlrepo")
+check("a tag whose input's download nobody submitted waits, naming the command",
+      not ok and f"cactup download submit {js_url}" in out and not has_version(maxv, "max/dlrepo", "1.2.0"), out[-300:])
+s, _, _ = maxv.post(f"/admin/downloads/{sid}", {"decision": "reopen"})
+check("an admin reopens the rejected download", s == 303 and download_state(sid).startswith("ok|pending"), download_state(sid))
+check("the reopen is in the audit log", psql(f"SELECT count(*) FROM audit_log WHERE action = 'download.reopen' AND details->>'id' = '{sid}'") == "1")
+s, _, _ = maxv.post(f"/admin/downloads/{sid}", {"decision": "approve"})
+check("and approves it", s == 303 and download_state(sid).startswith("ok|approved"), download_state(sid))
+ok, out = cli("reread", "max", "max/dlrepo", "1.1.0")
+check("reread reads the invalid tag again: valid now", ok and "reads cleanly now" in out and has_version(anon, "max/dlrepo", "1.1.0")
+      and psql("SELECT state FROM versions v JOIN entries e ON e.id = v.entry_id WHERE e.name = 'dlrepo' AND v.version = '1.1.0'") == "ok", out[-300:])
+
+# A restart: a repo key a previous server left stale is recomputed, and a download left being
+# fetched is fetched again.
+psql("UPDATE source_pins SET url_norm = 'stale' WHERE ctid = (SELECT ctid FROM source_pins WHERE url LIKE 'file://%' LIMIT 1)")
+jid = psql(f"INSERT INTO downloads (url, sha256, submitter) VALUES ('{js_url}', '{js_sha}', (SELECT id FROM users WHERE username = 'bob')) RETURNING id").split()[0]
+compose("restart", "app")
+for _ in range(120):
+    try:
+        if urllib.request.urlopen(BASE + "/").status == 200:
+            break
+    except Exception:
+        pass
+    time.sleep(0.5)
+check("a stale repo key is recomputed at startup", psql("SELECT count(*) FROM source_pins WHERE url_norm = 'stale'") == "0")
+check("a download left being fetched is fetched again at startup", until_fetched(jid) == "ok|pending|", download_state(jid))
+s, _, _ = maxv.post(f"/admin/downloads/{jid}", {"decision": "approve"})
+ok, out = cli_sync("max/dlrepo")
+check("once its download is approved, the waiting tag is read", ok and has_version(anon, "max/dlrepo", "1.2.0"), out[-300:])
 
 print()
 if FAILED:
