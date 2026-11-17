@@ -65,6 +65,9 @@ Every read honors `x-cactarium-include-unreviewed: true` (CactUp's
 releases awaiting review of public entries when the site serves unreviewed code, and such answers
 say `x-cactarium-unreviewed: true`.
 
+- `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
+  other commit the server doesn't read the manifest there: `flesh` is the package's newest
+  version's value, a hint, and `fork-of` is empty.
 - Repo URLs are matched with the crate's `url::normalize_repo_url` (stored as
   `source_pins.url_norm`), and on GitHub, GitLab and Bitbucket also by `url::same_repo_lenient`.
 - A sim stored from now on labels each pin `cactarium = "owner/pkg@X.Y.Z"` when a published version

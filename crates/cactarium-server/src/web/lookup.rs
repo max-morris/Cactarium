@@ -146,6 +146,8 @@ pub async fn lookup(
             commit: p.commit.clone(),
             package: Some(e.slug()),
             version: v.map(Version::label),
+            // Exact only for a commit a version froze: for any other, the newest version's value,
+            // a hint (the commit's own manifest isn't read; `fork-of` stays empty there).
             flesh: flesh(v.or(k.newest.as_ref())),
             fork_of,
             commit_known: if v.is_some() { Some(true) } else { k.history.get(&p.commit).copied().flatten() },

@@ -761,7 +761,8 @@ pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String]
     if !refresh() {
         return Some(MirrorAnswer { has: first.into_iter().map(|b| b.then_some(true)).collect(), updated: false });
     }
-    let error = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &LOOKUP_UPDATES).await;
+    // Never queued: a lookup that finds the slot busy says "can't tell" for what the mirror lacks.
+    let error = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &LOOKUP_UPDATES, Wait::Never).await;
     let after = is_commit(object_types(policy, &dir, commits).await);
     let has = after.into_iter().map(|b| if b { Some(true) } else if error.is_none() { Some(false) } else { None }).collect();
     Some(MirrorAnswer { has, updated: true })
@@ -808,7 +809,7 @@ pub async fn read_files_in(policy: GitPolicy, mirrors: &Mirrors, url: &str, want
             Mirrors::Shared => &MIRROR_UPDATES,
             Mirrors::Temp(_) => &PREVIEW_UPDATES,
         };
-        let error = update_mirror_in(policy, mirrors, key.clone(), root, dir.clone(), false, Some(commits.clone()), slots).await;
+        let error = update_mirror_in(policy, mirrors, key.clone(), root, dir.clone(), false, Some(commits.clone()), slots, Wait::Queue).await;
         if let Some(e) = error {
             bail!("{e}");
         }
@@ -983,7 +984,7 @@ async fn update_mirror(
     dir: PathBuf,
     broken: bool,
 ) -> Option<String> {
-    update_mirror_in(policy, &Mirrors::Shared, url, root, dir, broken, None, &MIRROR_UPDATES).await
+    update_mirror_in(policy, &Mirrors::Shared, url, root, dir, broken, None, &MIRROR_UPDATES, Wait::Queue).await
 }
 
 /// [`update_mirror`]; with `needed`, the update skips the window when those commits (which the repo
@@ -1004,16 +1005,56 @@ async fn update_mirror_in(
     broken: bool,
     needed: Option<Vec<String>>,
     slots: &'static tokio::sync::Semaphore,
+    wait: Wait,
 ) -> Option<String> {
     let lock = mirror_lock(&dir);
     let held = mirrors.clone();
     let task = tokio::spawn(async move {
-        let mut state = lock.lock_owned().await;
-        let lacking = match &needed {
-            Some(commits) => lacks_commits(policy, &dir, commits).await,
-            None => false,
+        // Up to date (or updated by another request within the window): answered without a slot.
+        let fresh = |state: &MirrorState, lacking: bool| !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH);
+        let lacking = || async {
+            match &needed {
+                Some(commits) => lacks_commits(policy, &dir, commits).await,
+                None => false,
+            }
         };
-        if !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH) {
+        {
+            let state = lock.lock().await;
+            if fresh(&state, lacking().await) {
+                return state.error.clone();
+            }
+        }
+        // Only this task holds a temporary mirror once its requests are gone.
+        let watched = match &held {
+            Mirrors::Shared => None,
+            Mirrors::Temp(t) => Some(std::sync::Arc::downgrade(t)),
+        };
+        let abandoned = || {
+            let watched = watched.clone();
+            async move {
+                let Some(w) = watched else { return std::future::pending().await };
+                while w.strong_count() > 1 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        };
+        // A slot first, and only then the repo's lock: nobody holds a repo's lock while waiting
+        // for a slot, so syncs and lookups of a repo never wait behind a queue of other repos.
+        let _permit = match wait {
+            Wait::Queue => tokio::select! {
+                p = slots.acquire() => match p {
+                    Ok(p) => p,
+                    Err(e) => return Some(format!("updating the mirror failed: {e}")),
+                },
+                () = abandoned() => return Some("the preview this mirror was for went away".to_owned()),
+            },
+            Wait::Never => match slots.try_acquire() {
+                Ok(p) => p,
+                Err(_) => return Some(SLOT_BUSY.to_owned()),
+            },
+        };
+        let mut state = lock.clone().lock_owned().await;
+        if fresh(&state, lacking().await) {
             return state.error.clone();
         }
         let limit = match &held {
@@ -1021,7 +1062,6 @@ async fn update_mirror_in(
             Mirrors::Temp(_) => Some(MAX_PREVIEW_MIRROR_BYTES),
         };
         let work = async {
-            let _permit = slots.acquire().await?;
             let t = check(policy, &url).await?;
             let home = tempfile::tempdir()?;
             if broken {
@@ -1033,20 +1073,9 @@ async fn update_mirror_in(
                 clone_mirror(policy, home.path(), &t, &root, &dir, limit).await
             }
         };
-        // Only this task holds a temporary mirror once its requests are gone.
-        let watched = match &held {
-            Mirrors::Shared => None,
-            Mirrors::Temp(t) => Some(std::sync::Arc::downgrade(t)),
-        };
-        let abandoned = async move {
-            let Some(w) = watched else { return std::future::pending().await };
-            while w.strong_count() > 1 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        };
         let result = tokio::select! {
             r = work => r,
-            () = abandoned => Err(anyhow!("the preview this mirror was for went away")),
+            () = abandoned() => Err(anyhow!("the preview this mirror was for went away")),
         };
         state.finished = Some(std::time::Instant::now());
         state.error = result.err().map(|e| {
@@ -1060,6 +1089,17 @@ async fn update_mirror_in(
     });
     task.await.unwrap_or_else(|e| Some(format!("updating the mirror failed: {e}")))
 }
+
+/// Whether an update waits for a slot ([`Wait::Queue`]) or gives up when none is free
+/// ([`Wait::Never`], for lookups: the answer is then "can't tell just now").
+#[derive(Clone, Copy, PartialEq)]
+enum Wait {
+    Queue,
+    Never,
+}
+
+/// What an update that gave up for want of a slot answers.
+const SLOT_BUSY: &str = "no slot is free to update the repo's history just now";
 
 /// Fetches every branch and tag, by URL with explicit refspecs: a bare clone has no fetch refspec,
 /// and the stored remote isn't consulted, so the mirror's config can't redirect the fetch.
@@ -1451,6 +1491,45 @@ mod tests {
         for bad in [format!("http://{addr}/file"), "https://127.0.0.1/x".to_owned(), "https://u:p@example.org/x".to_owned(), "file:///etc/hostname".to_owned()] {
             assert!(fetch_and_hash(strict, &bad, 1 << 20, limit).await.is_err(), "{bad}");
         }
+    }
+
+    /// Nobody holds a repo's lock while waiting for a slot: a queued update leaves the repo's
+    /// lock free, and a lookup that finds its slot busy answers "can't tell" at once.
+    #[tokio::test]
+    async fn slots_are_taken_before_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        sh(&up, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(up.join("f"), "x").unwrap();
+        sh(&up, &["add", "f"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let first = sh(&up, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", up.display());
+        let policy = GitPolicy { allow_local: true };
+        resolve_commit_prefix(policy, &url, &first[..7]).await.unwrap();
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        // The lookups' only slot is busy: a lookup lacking a commit can't tell, and doesn't wait.
+        let busy = LOOKUP_UPDATES.acquire().await.unwrap();
+        let none = "0".repeat(40);
+        let a = tokio::time::timeout(Duration::from_secs(5), mirror_has_commits(policy, &url, std::slice::from_ref(&none), || true))
+            .await
+            .expect("answered at once")
+            .unwrap();
+        assert_eq!(a.has, vec![None]);
+        drop(busy);
+        // Every syncing slot busy: an update waits for one without the repo's lock.
+        let all = MIRROR_UPDATES.acquire_many(3).await.unwrap();
+        let queued = {
+            let url = url.clone();
+            tokio::spawn(async move { resolve_commit_prefix(policy, &url, "0000000").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(mirror_lock(&dir).try_lock().is_ok(), "the repo's lock is free while the update waits for a slot");
+        drop(all);
+        assert!(matches!(queued.await.unwrap().unwrap(), PrefixMatch::None));
     }
 
     /// What a kept mirror says of commits: nothing before one exists (it never clones one), then
