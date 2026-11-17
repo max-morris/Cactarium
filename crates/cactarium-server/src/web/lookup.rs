@@ -78,6 +78,8 @@ pub async fn lookup(
     }
 
     let mut pins = Vec::with_capacity(req.pins.len());
+    // Each version's fork-of targets, read once however many pins name it.
+    let mut forks: HashMap<i64, Vec<String>> = HashMap::new();
     for (p, i) in req.pins.iter().zip(&found) {
         let Some(i) = i else {
             pins.push(PinInfo {
@@ -96,12 +98,13 @@ pub async fn lookup(
         let k = &known[i];
         let v = frozen_at(&k.versions, &p.commit);
         let fork_of = match v {
-            Some(v) => ClaimRec::of_version(&state.db, v.id)
-                .await?
-                .iter()
-                .filter(|c| c.kind == "fork-of")
-                .map(claim_target)
-                .collect(),
+            Some(v) if forks.contains_key(&v.id) => forks[&v.id].clone(),
+            Some(v) => {
+                let targets: Vec<String> =
+                    ClaimRec::of_version(&state.db, v.id).await?.iter().filter(|c| c.kind == "fork-of").map(claim_target).collect();
+                forks.insert(v.id, targets.clone());
+                targets
+            }
             None => vec![],
         };
         let review = v.filter(|v| !v.approved()).map(|_| "pending".to_owned());

@@ -872,7 +872,7 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
     let plan = plan(state, owner, url, at, files).await?;
     let registering: Vec<String> =
         if plan.new.iter().any(|p| p.kind == "package") { vec![plan.url.clone()] } else { vec![] };
-    let opts = PrepOpts { defer_pins: true, registering };
+    let opts = PrepOpts { defer_pins: true, registering, tip: false };
     let skips = user.is_some_and(publish::skips_review) || publish::owner_trusted(state, &plan.owner).await?;
     let mut entries = Vec::new();
     for (e, file) in &plan.existing {
@@ -3465,7 +3465,7 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppRe
         .map_err(AppError::bad)?;
     let r = RemoteRef { name: "HEAD".into(), commit: commit.to_owned() };
     let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
-    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts::default())
+    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts { tip: true, ..PrepOpts::default() })
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
     let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);
@@ -3514,6 +3514,9 @@ struct PrepOpts {
     /// The URLs of packages being registered along with this entry: a pin to one is a package not
     /// public yet, not a repo nobody registered.
     registering: Vec<String>,
+    /// A branch tip or a commit read now, not a version to freeze: its dependencies are read
+    /// against what awaits review too, rather than waiting for it.
+    tip: bool,
 }
 
 /// Reads one commit of an entry the way a version is read, checking everything a version must
@@ -3660,7 +3663,7 @@ async fn prepare(
             }
         }
         // The CCL and the dependencies must agree; what reviewers should see comes back as smells.
-        p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path).await?;
+        p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path, !opts.tip).await?;
     }
     if let Some(stack) = &m.stack {
         // A stack's dependencies name packages, as a package's do: each must be there, reviewed.

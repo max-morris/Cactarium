@@ -621,4 +621,18 @@ commit = "{SHA}"
         parsed.repos[0].sha256 = Some("ab".repeat(32));
         assert!(stamped(&entry, "", "2.0.0", &parsed).is_err(), "a download carries no label");
     }
+    /// A sim may pin a download (a tarball component) by its sha256 beside its git repos: the
+    /// file's checks pass, and whether the download is approved is up to `pin_problems`.
+    #[test]
+    fn a_download_pin_passes_the_file_checks() {
+        let h = "ab".repeat(32);
+        let section = format!(
+            "CarpetX/Loop\n\n!TARGET = $ROOT/dl\n!TYPE = https\n!URL = https://x.org/files/lib.tar.gz\n!CHECKSUM_SHA256 = {h}\n!CHECKOUT = lib.tar.gz\n"
+        );
+        let text = sim(false, "x = 1").replacen("CarpetX/Loop\n", &section, 1)
+            + &format!("[[repo]]\nname = \"lib.tar.gz\"\nurl = \"https://x.org/files/lib.tar.gz\"\nsha256 = \"{h}\"\n");
+        let c = check(text.as_bytes()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.index.repos, ["CarpetX", "lib.tar.gz"]);
+        assert_eq!(c.sim.repos[1].pin(), Some(cactup_ecosystem_common::crl::Pin::Sha256(h)));
+    }
 }

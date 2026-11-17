@@ -1401,6 +1401,80 @@ mod tests {
         }
     }
 
+    /// A download is fetched once and hashed as it streams: redirects are followed (each checked
+    /// again), a server error and an oversized body are refused, and so is anything but https
+    /// outside development.
+    #[tokio::test]
+    async fn downloads_are_fetched_and_hashed() {
+        use sha2::Digest;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = b"tarball bytes".repeat(100);
+        let served = body.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let head = |status: &str, extra: &str, len: usize| format!("HTTP/1.1 {status}\r\n{extra}content-length: {len}\r\nconnection: close\r\n\r\n");
+                    let reply: Vec<u8> = match path.as_str() {
+                        "/file" => [head("200 OK", "", served.len()).into_bytes(), served].concat(),
+                        "/moved" => head("302 Found", "location: /file\r\n", 0).into_bytes(),
+                        _ => head("404 Not Found", "", 0).into_bytes(),
+                    };
+                    let _ = s.write_all(&reply).await;
+                });
+            }
+        });
+        let dev = GitPolicy { allow_local: true };
+        let limit = Duration::from_secs(30);
+        let got = fetch_and_hash(dev, &format!("http://{addr}/file"), 1 << 20, limit).await.unwrap();
+        assert_eq!((got.sha256, got.size), (hex::encode(sha2::Sha256::digest(&body)), body.len() as u64));
+        let moved = fetch_and_hash(dev, &format!("http://{addr}/moved"), 1 << 20, limit).await.unwrap();
+        assert_eq!(moved.size, body.len() as u64);
+        let e = fetch_and_hash(dev, &format!("http://{addr}/gone"), 1 << 20, limit).await.unwrap_err();
+        assert!(format!("{e:#}").contains("404"), "{e:#}");
+        let e = fetch_and_hash(dev, &format!("http://{addr}/file"), 100, limit).await.unwrap_err();
+        assert!(format!("{e:#}").contains("more than the 100"), "{e:#}");
+        let strict = GitPolicy { allow_local: false };
+        for bad in [format!("http://{addr}/file"), "https://127.0.0.1/x".to_owned(), "https://u:p@example.org/x".to_owned(), "file:///etc/hostname".to_owned()] {
+            assert!(fetch_and_hash(strict, &bad, 1 << 20, limit).await.is_err(), "{bad}");
+        }
+    }
+
+    /// What a kept mirror says of commits: nothing before one exists (it never clones one), then
+    /// the commits it has; one pushed since is found once an update may run; a tree is no commit.
+    #[tokio::test]
+    async fn mirrors_answer_whether_they_have_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        sh(&up, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(up.join("f"), "x").unwrap();
+        sh(&up, &["add", "f"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let first = sh(&up, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", up.display());
+        let policy = GitPolicy { allow_local: true };
+        assert!(mirror_has_commits(policy, &url, std::slice::from_ref(&first), true).await.is_none(), "no mirror kept yet");
+        resolve_commit_prefix(policy, &url, &first[..7]).await.unwrap();
+        let none = "0".repeat(40);
+        let a = mirror_has_commits(policy, &url, &[first.clone(), none.clone()], false).await.unwrap();
+        assert_eq!((a.has, a.updated), (vec![Some(true), None], false), "without an update, a miss can't tell");
+        let later = commit_on(&up, "later", "later");
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        let a = mirror_has_commits(policy, &url, &[later.clone(), none], true).await.unwrap();
+        assert_eq!((a.has, a.updated), (vec![Some(true), Some(false)], true));
+        let tree = sh(&up, &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(mirror_has_commits(policy, &url, &[tree], true).await.unwrap().has, vec![Some(false)]);
+    }
+
     /// Files at commits from a blobless mirror: blobs fetched by id, a symbolic link left to a
     /// checkout, a file over the limit refused, a tree that a tag might name told apart.
     #[tokio::test]

@@ -153,7 +153,9 @@ struct Resolution<'a> {
     waiting: Vec<String>,
 }
 
-async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: Of<'_>) -> AppResult<Resolution<'a>> {
+/// With `wait_for_review`, a target awaiting review makes the dependent wait ([`judge`]); without
+/// (a branch tip read now, which freezes nothing), it is read against that target as it is.
+async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: Of<'_>, wait_for_review: bool) -> AppResult<Resolution<'a>> {
     let mut r = Resolution { deps: Vec::new(), problems: Vec::new(), waiting: Vec::new() };
     let what = match of {
         Of::Package { .. } => "package",
@@ -186,7 +188,7 @@ async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: 
                     }
                 }
                 Some(tv) => {
-                    if let Some(why) = judge(&alt.target(), &tv) {
+                    if wait_for_review && let Some(why) = judge(&alt.target(), &tv) {
                         r.waiting.push(why);
                         continue;
                     }
@@ -285,17 +287,26 @@ fn refuse(mut problems: Vec<String>, mut waiting: Vec<String>) -> AppResult<()> 
 /// with a version on the Cactarium in range (or at the commit) that has the `needs` thorns, if any
 /// are named. A target awaiting review, or not public, makes the release wait ([`judge`]).
 pub async fn check_stack(state: &AppState, claims: &[ClaimRec]) -> AppResult<()> {
-    let r = resolve_dependencies(state, claims, Of::Stack).await?;
+    let r = resolve_dependencies(state, claims, Of::Stack, true).await?;
     refuse(r.problems, r.waiting)
 }
 
 /// Checks a package version's dependencies against its thorns' CCL. `own` is what will be
 /// published; `repo` is the checkout (for the includes reviewers should see). Returns the smells,
-/// or refuses with every problem and, where it can tell, the line that fixes it.
-pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[ClaimRec], repo: &Path) -> AppResult<Vec<String>> {
+/// or refuses with every problem and, where it can tell, the line that fixes it. With
+/// `wait_for_review` (a version to freeze), a dependency on what awaits review waits for it.
+pub async fn check(
+    state: &AppState,
+    m: &Manifest,
+    own: &[Thorn],
+    claims: &[ClaimRec],
+    repo: &Path,
+    wait_for_review: bool,
+) -> AppResult<Vec<String>> {
     let Some(pkg) = &m.package else { return Ok(Vec::new()) };
     let mut smells: Vec<String> = Vec::new();
-    let Resolution { deps, mut problems, waiting } = resolve_dependencies(state, claims, Of::Package { repo }).await?;
+    let Resolution { deps, mut problems, waiting } =
+        resolve_dependencies(state, claims, Of::Package { repo }, wait_for_review).await?;
 
     // The CCL can only be checked against what the dependencies resolve to: with one still missing,
     // the facts found so far decide, else the version waits.
