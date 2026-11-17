@@ -7,10 +7,13 @@
 //! package itself, or by the `needs` thorns of a dependency that applies to that thorn (for an
 //! `any-of`, by every alternative). Smells are what a reviewer should look at but that don't block:
 //! needs the CCL doesn't explain, includes that reach another thorn's sources by path, and so on.
+//!
+//! What a requirement is and what meets it is the crate's (`ccl::needs_of`, `meets`, `unmet`),
+//! shared with CactUp's composition and trim, so the two can't disagree about what a thorn needs.
 
 use std::path::Path;
 
-use cactup_ecosystem_common::ccl::ThornFacts;
+use cactup_ecosystem_common::ccl::{Need, ThornFacts, meets, unmet};
 use cactup_ecosystem_common::manifest::Manifest;
 use cactup_ecosystem_common::version::{TrackedReq, TrackedVersion};
 
@@ -20,47 +23,6 @@ use crate::state::AppState;
 
 /// A published thorn as `prepare` scanned it: (arrangement, name, directory in the repo, facts).
 pub type Thorn = (String, String, String, ThornFacts);
-
-/// A hard CCL requirement.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Need {
-    Impl(String),
-    Cap(String),
-    Thorn(String),
-    Func(String),
-}
-
-impl Need {
-    fn says(&self) -> String {
-        match self {
-            Need::Impl(i) => format!("inherits or befriends {i}"),
-            Need::Cap(c) => format!("requires the capability {c}"),
-            Need::Thorn(t) => format!("requires the thorn {t}"),
-            Need::Func(f) => format!("requires the function {f}"),
-        }
-    }
-}
-
-fn needs_of(f: &ThornFacts) -> Vec<Need> {
-    let mut v: Vec<Need> = Vec::new();
-    v.extend(f.inherits.iter().chain(&f.friends).map(|i| Need::Impl(i.clone())));
-    v.extend(f.requires.iter().map(|c| Need::Cap(c.clone())));
-    v.extend(f.requires_thorns.iter().map(|t| Need::Thorn(t.clone())));
-    v.extend(f.requires_functions.iter().map(|x| Need::Func(x.clone())));
-    v.dedup();
-    v
-}
-
-/// Whether thorn `name` (with `facts`) meets the requirement. CCL names are case-insensitive.
-fn meets(name: &str, facts: &ThornFacts, need: &Need) -> bool {
-    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-    match need {
-        Need::Impl(i) => facts.implements.as_deref().is_some_and(|x| eq(x, i)),
-        Need::Cap(c) => facts.provides.iter().any(|p| eq(p, c)),
-        Need::Thorn(t) => eq(name, t),
-        Need::Func(x) => facts.provides_functions.iter().any(|p| eq(p, x)),
-    }
-}
 
 /// The version of a dependency's target that the check reads: the newest one on the Cactarium
 /// within its range (or at its commit), reviewed or awaiting review.
@@ -133,6 +95,11 @@ async fn alt_unread(state: &AppState, alt: &Alt) -> AppResult<crate::tracker::Un
         (Some(req), Some(id)) => crate::tracker::unread_in_range(state, id, &req).await?,
         _ => Unread::No,
     })
+}
+
+/// The thorn among a dependency's `needs` that meets `need`, of the target version's `thorns`.
+fn supplier(needs: &[String], thorns: &[(String, ThornFacts)], need: &Need) -> Option<String> {
+    needs.iter().find(|n| thorns.iter().any(|(t, f)| t == *n && meets(t, f, need))).cloned()
 }
 
 /// Whether a library's checkout can't go at `path`: something is there already (a file, or a
@@ -264,19 +231,16 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
     let mut ccl_waiting: Vec<String> = Vec::new();
     let mut explained: Vec<(String, String)> = Vec::new(); // (target, needs thorn) some requirement used
     for (arr, name, _, facts) in own {
-        for need in needs_of(facts) {
-            if own.iter().any(|(_, n, _, f)| meets(n, f, &need)) {
-                continue;
-            }
+        // What CactUp reads a thorn's requirements as, and meets them by (the crate's `ccl`): the
+        // needs the package's own thorns leave unmet.
+        for need in unmet(facts, own.iter().map(|(_, n, _, f)| (n.as_str(), f))) {
             let applicable: Vec<&(&ClaimRec, Vec<(Alt, TargetVersion)>)> = deps
                 .iter()
                 .filter(|(c, opts)| (c.needed_by.is_empty() || c.needed_by.contains(name)) && !opts.is_empty())
                 .collect();
             let mut met = false;
             for (_, opts) in &applicable {
-                let supplies = |(alt, tv): &(Alt, TargetVersion)| {
-                    alt.needs.iter().find(|n| tv.thorns.iter().any(|(t, f)| t == *n && meets(t, f, &need))).cloned()
-                };
+                let supplies = |(alt, tv): &(Alt, TargetVersion)| supplier(&alt.needs, &tv.thorns, &need);
                 let found: Vec<Option<String>> = opts.iter().map(supplies).collect();
                 if found.iter().all(Option::is_some) {
                     met = true;
@@ -300,7 +264,7 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
             });
             let said = format!(
                 "{arr}/{name} {}, which neither this package nor a dependency's needs supplies{}",
-                need.says(),
+                need,
                 hint.unwrap_or_else(|| ": add a [[dependency]] on the package that provides it, with needs naming its thorn, or exclude-thorns this thorn if it can't build".to_owned())
             );
             let mut unread = None;
@@ -443,4 +407,49 @@ fn includes_leaving(repo: &Path, thorn_dir: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(interface: &str, configuration: Option<&str>) -> ThornFacts {
+        ThornFacts::scan(interface, configuration)
+    }
+
+    /// The package's own thorns meet what they can, by the crate's rule: names compare
+    /// case-insensitively, each need is read once, and words an older scanner stored that are no
+    /// CCL names make no need (nothing could meet them).
+    #[test]
+    fn own_thorns_meet_needs_by_the_shared_rule() {
+        let z4c = facts("IMPLEMENTS: Z4c\nINHERITS: ADMBase, admbase, CarpetX\nREQUIRES FUNCTION GetLevel", Some("REQUIRES Loop\n"));
+        let admbase = facts("IMPLEMENTS: ADMBASE", None);
+        let own = [("Z4c", &z4c), ("ADMBase", &admbase)];
+        let left: Vec<String> = unmet(&z4c, own).iter().map(ToString::to_string).collect();
+        assert_eq!(left, ["inherits or befriends CarpetX", "requires the capability Loop", "requires the function GetLevel"]);
+        let old: ThornFacts = serde_json::from_value(serde_json::json!({
+            "implements": "X", "inherits": ["b@d"], "friends": [], "requires-functions": ["Get X"], "uses-functions": [],
+            "provides-functions": [], "uses-includes": [], "requires": [], "requires-thorns": ["no/pe"], "optional": [], "provides": []
+        }))
+        .unwrap();
+        assert!(unmet(&old, []).is_empty(), "no CCL name, no need");
+    }
+
+    /// A dependency supplies a need through one of its `needs` thorns that meets it; a thorn
+    /// without an IMPLEMENTS line implements nothing, even what its name spells.
+    #[test]
+    fn a_dependency_supplies_through_its_needs() {
+        let carpetx = facts("IMPLEMENTS: driver\nPROVIDES FUNCTION GetLevel WITH X LANGUAGE C", None);
+        let loop_ = facts("IMPLEMENTS: Loop", Some("PROVIDES Loop\n{\n}\n"));
+        let bare = facts("INHERITS: grid", None);
+        let thorns = vec![("CarpetX".to_owned(), carpetx), ("Loop".to_owned(), loop_), ("Grid".to_owned(), bare)];
+        let needs = ["CarpetX".to_owned(), "Loop".to_owned()];
+        assert_eq!(supplier(&needs, &thorns, &Need::Implementation("Driver".into())).as_deref(), Some("CarpetX"));
+        assert_eq!(supplier(&needs, &thorns, &Need::Capability("loop".into())).as_deref(), Some("Loop"));
+        assert_eq!(supplier(&needs, &thorns, &Need::Function("GetLevel".into())).as_deref(), Some("CarpetX"));
+        assert_eq!(supplier(&needs[..1], &thorns, &Need::Capability("Loop".into())), None, "not among its needs");
+        let all = ["Grid".to_owned()];
+        assert_eq!(supplier(&all, &thorns, &Need::Implementation("Grid".into())), None);
+        assert_eq!(supplier(&all, &thorns, &Need::Thorn("grid".into())).as_deref(), Some("Grid"));
+    }
 }
