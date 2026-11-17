@@ -862,6 +862,8 @@ pub struct Previewed {
     pub preview: Preview,
     plan: Plan,
     prepared: Vec<Option<Prepared>>,
+    /// New entries whose first version would wait: (`owner/name@version`, why).
+    waits: Vec<(String, String)>,
 }
 
 /// The dry run of registering `url` under `owner` (as `user`, if known: whether new entries are
@@ -890,6 +892,7 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
         });
     }
     let mut prepared = Vec::with_capacity(plan.new.len());
+    let mut waits = Vec::new();
     for p in &plan.new {
         let slug = format!("{}/{}", plan.owner, p.name);
         let (status, note, ready) = match &p.problem {
@@ -899,6 +902,13 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
                 match prepare(state, &entry, &repo, &p.co, &p.tag, &p.tv, &opts).await {
                     Ok(r) if r.deferred.is_empty() => ("new", format!("reads cleanly{}{}", sims_note(&r), off_head_note(p)), Some(r)),
                     Ok(r) => ("new", format!("would wait (left unread, tried again): {}{}", r.deferred.join("; "), off_head_note(p)), Some(r)),
+                    // What may change without a new commit (a dependency awaiting review, a
+                    // package not registered yet): the entry registers, and its first version
+                    // waits for it, as its sync would.
+                    Err(AppError::Upstream(why)) => {
+                        waits.push((format!("{slug}@{}", p.tv), why.clone()));
+                        ("new", format!("would wait (left unread, tried again): {why}{}", off_head_note(p)), None)
+                    }
                     Err(e) => ("fails", e.to_string(), None),
                 }
             }
@@ -936,7 +946,7 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
         sha2::Digest::update(&mut h, format!("{}|{}\n", e.slug, e.file).as_bytes());
     }
     let fingerprint = hex::encode(&sha2::Digest::finalize(h)[..12]);
-    Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared })
+    Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared, waits })
 }
 
 /// The preview's mark on a release whose manifest file isn't on the default branch anymore.
@@ -1012,7 +1022,7 @@ pub async fn register(
     };
     // The new entries left out, for the notes.
     let mut left: Vec<String> = Vec::new();
-    let Previewed { preview, plan, prepared } = match choice {
+    let Previewed { preview, plan, prepared, waits } = match choice {
         Choice::All => preview(state, Some(user), Some(&owner), url, at(), None).await?,
         Choice::Names(names) => {
             let full = preview(state, Some(user), Some(&owner), url, at(), None).await?;
@@ -1073,6 +1083,7 @@ pub async fn register(
             notes.extend(r.deferred.iter().map(|d| format!("{label} waits: {d}")));
         }
     }
+    notes.extend(waits.iter().map(|(label, why)| format!("{label} waits: {why}")));
     let mut tx = state.db.begin().await?;
     let mut entries = Vec::new();
     let mut from = Vec::new();
@@ -3619,6 +3630,8 @@ async fn prepare(
         p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path).await?;
     }
     if let Some(stack) = &m.stack {
+        // A stack's dependencies name packages, as a package's do: each must be there, reviewed.
+        crate::deps::check_stack(state, &p.claims).await?;
         let own = match &stack.thornlist {
             Some(path) => Some(
                 git::read_in(co, path)

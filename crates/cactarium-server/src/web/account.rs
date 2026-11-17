@@ -331,6 +331,7 @@ pub async fn cut_release(
     // Resolve before anything is created, so a definition that fails leaves no trace.
     let own = thornlist.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("{t}\n"));
     let resolution = stacks::resolve(state, &owner, stack, own.as_deref(), None).await.map_err(stacks::for_a_person)?;
+    crate::deps::check_stack(state, &ClaimRec::of_manifest(&m)).await.map_err(stacks::for_a_person)?;
     let slug = format!("{owner}/{name}@{label}").parse().map_err(AppError::bad)?;
     let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
     let entry = match existing {
