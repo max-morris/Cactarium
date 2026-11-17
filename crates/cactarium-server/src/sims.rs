@@ -185,8 +185,9 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
 /// downstream user must be able to rebuild the sim from the Cactarium alone. The pin's identity is
 /// then `owner/pkg@version` (a commit a version froze) or `owner/pkg` at that commit (any other
 /// commit of the repo). A download (a tarball component pinned by sha256) has no package identity:
-/// it must be one the Cactarium's reviewers approved (`cactup download submit <url>`). Refuses
-/// with every pin that fails, and what to do about it. For an upload, where the uploader sees the answer and can try
+/// it must be one the Cactarium's reviewers approved (`cactup download submit <url>`), and so must
+/// every `[[input]]` downloaded by url and sha256. Refuses with every pin that fails, and what to
+/// do about it. For an upload, where the uploader sees the answer and can try
 /// again; a tag read from a repo uses [`check_pins_at_tag`].
 pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
     let p = pin_problems(state, sim, &[]).await?;
@@ -198,7 +199,8 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// sim's repo.
 #[derive(Default)]
 pub struct PinProblems {
-    /// Facts about the commit: a download the Cactarium's reviewers rejected.
+    /// Facts about the commit: a download (a tarball pin or an input's) the Cactarium's reviewers
+    /// rejected.
     pub facts: Vec<String>,
     /// Things the world can change: no package for the repo is registered yet, or it is but isn't
     /// public yet (awaiting review, a sibling entry not yet approved, or being registered along
@@ -224,6 +226,13 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     .await?;
     let policy = crate::git::GitPolicy { allow_local: state.cfg.allow_local_repos };
     let mut out = PinProblems::default();
+    // An input's download is pinned by its sha256 like a tarball component, and reviewed the same
+    // way (one read from the sim's own repo, `repo-file`, is pinned by the commit instead).
+    for i in &sim.inputs {
+        if let (Some(url), Some(sha)) = (&i.url, &i.sha256) {
+            download_problem(state, &format!("input {}", i.knob), url, sha, &mut out).await?;
+        }
+    }
     for pin in &sim.repos {
         let Some(commit) = pin.commit.as_deref() else {
             // A download (a tarball component pinned by sha256) belongs to no package: it must be
