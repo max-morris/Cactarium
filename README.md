@@ -36,6 +36,47 @@ localhost.
   - `migrations/`: the database schema
 - `deploy/`: Dockerfile, Compose files, the demo seed and the smoke test
 
+## The API
+
+CactUp talks to the server under `/api/v1`; the shapes are the crate's `api.rs`, and its
+`docs/api.md` is the reference (the site's `/docs/api` describes each route). Reads are anonymous;
+writes take a bearer token from the site's Settings page (or `just cli token <user>`).
+
+| Request | Response |
+|---|---|
+| `GET /resolve?req=owner/name[/sim]@[track:]range` | `Resolved` |
+| `GET /entries/{owner}/{name}` | `EntryInfo` |
+| `GET /packages/{owner}/{name}/versions` | `PackageVersions` |
+| `GET /packages/{owner}/{name}/versions/{commit\|head\|master}` | `PackageVersion` |
+| `GET /stacks/{owner}/{name}/releases` | `StackReleases` |
+| `GET /stacks/{owner}/{name}/releases/{version\|head\|master}` | `FrozenStack` |
+| `GET /sims/{owner}/{name}/{X.Y.Z}/download[?sim=<sim>]` | the `.sim` bytes, with `x-sha256` |
+| `POST /lookup` | `LookedUp`: which package and version each pinned commit is, each download's review |
+| `GET /providers?implements=…` (or `capability=`, `function=`, `thorn=`) | `Providers` |
+| `POST /sims/{owner}/{name}` (bearer, `.sim` body) | `Published` |
+| `POST /stacks/{owner}/{name}/releases` (bearer, `ReleaseRequest`) | `Published` |
+| `POST /packages/{owner}/{name}/refresh` (bearer) | `Refreshed` |
+| `POST /repos` (bearer, `RegisterRequest`) | `Registered`: the site's registration, preview (`dry-run`) and confirm (`expect`) |
+| `GET /whoami` (bearer) | `WhoAmI` |
+| `POST /downloads` (bearer, `DownloadSubmission`) | `DownloadReview`; 409 `DownloadConflict` when submitted before |
+
+Every read honors `x-cactarium-include-unreviewed: true` (CactUp's
+`--risky-allow-untrusted-artifacts`): an admin's token also gets what awaits review, anyone gets
+releases awaiting review of public entries when the site serves unreviewed code, and such answers
+say `x-cactarium-unreviewed: true`.
+
+- Repo URLs are matched with the crate's `url::normalize_repo_url` (stored as
+  `source_pins.url_norm`), and on GitHub, GitLab and Bitbucket also by `url::same_repo_lenient`.
+- A sim stored from now on labels each pin `cactarium = "owner/pkg@X.Y.Z"` when a published version
+  froze its commit (never `owner/pkg#sha`); stack releases get the labels when served. Stored sims
+  are served byte for byte.
+- A sim that pins a download (a tarball component by sha256) is published only once that URL and
+  content are approved: `cactup download submit <url>` submits it, the server fetches it once to
+  check the sha256 (keeping no copy), and an admin decides it under Admin, Downloads.
+- A package version (or stack release) whose dependency resolves to a version awaiting review, or
+  to a package that isn't public, waits (left unread, retried) until it is reviewed; stack
+  releases' dependencies are checked like packages', but for the CCL.
+
 ## Deploying
 
 The production setup mirrors the CactUp tutorial server: the host's Apache terminates TLS and
@@ -95,6 +136,16 @@ organization with `just cli org create et <your-username> --display-name "Einste
   - the stored tag pattern is now only a display hint for repo entries; after a rollback to the
     retry-not-freeze release it would be taken as the real rule again.
 - `move-repo` moves every entry on the repo together.
+- Upgrading to the dependency-plan release (migrations 0017 and 0018): the first `migrate` (which
+  `just update` runs) recomputes every stored repo key (`source_pins.url_norm`) with the crate's
+  `url::normalize_repo_url`, once, in Rust (queued in the new `data_migrations` table; `serve` runs
+  it too if `migrate` didn't). https:// keys stay as they were; scp-like, ssh://, ported and local
+  (`file://`) keys change. 0018 adds the `downloads` table. Behavior that changes for existing
+  data: a new tag whose dependency is a version awaiting review waits until it is reviewed (frozen
+  versions are never re-read); a new stack tag whose `[[dependency]]` names no usable package
+  version is now invalid (or waits); registering a repo whose new entry's first version would wait
+  registers it instead of refusing; a sim pinning an approved download is accepted where every
+  tarball pin was refused.
 - A database that ran an early build of the multi-sim branch (with `0012_multi_sim.sql`, or
   `0013_multi_sim.sql` before it was renumbered to 0014) refuses to start: "migration 12 (or 13) was
   previously applied but has been modified". Production on master or the retry-not-freeze release

@@ -2217,6 +2217,193 @@ check("'#' needs at least 7 hex digits", s == 400, f"{s} {body[:200]}")
 s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@1.0.0")
 check("@ prefers a version over everything else", s == 200 and json.loads(body)["slug"] == "max/carpetx@1.0.0", body[:200])
 
+
+# ---------------------------------------------------------------------------------------------
+# The dependency plan's routes: whoami, the pin lookup, providers, reviewed downloads, registering
+# through the API, pins labeled with their versions, dependencies on what awaits review, stack
+# releases' dependencies, the shared URL keys.
+MAXAUTH = {"Authorization": f"Bearer {tok.group(1)}"}
+def api(method, path, body=None, headers=None):
+    raw = json.dumps(body).encode() if body is not None else None
+    h = {"Content-Type": "application/json"} if raw is not None else {}
+    h.update(headers or {})
+    s, text, hdrs = anon.req(method, "/api/v1" + path, raw=raw, headers=h)
+    try:
+        return s, json.loads(text), hdrs
+    except ValueError:
+        return s, {"raw": text}, hdrs
+
+s, w, _ = api("GET", "/whoami", headers=MAXAUTH)
+check("whoami names the token's user, their organizations and whether they are an admin",
+      s == 200 and w.get("user") == "max" and "et" in (w.get("orgs") or []) and w.get("admin") is True, w)
+s, _, _ = api("GET", "/whoami")
+check("whoami needs a token", s == 401, s)
+
+# The repo keys are the crate's, recomputed once by the migration.
+check("the shared-url-keys data migration ran", psql("SELECT done_at IS NOT NULL FROM data_migrations WHERE name = 'shared-url-keys'") == "t")
+check("local repos' stored keys are the crate's (file://...)",
+      psql("SELECT count(*) FROM source_pins WHERE url LIKE 'file://%' AND url_norm NOT LIKE 'file://%'") == "0")
+
+# The pin lookup: in request order, by the shared key (a respelled URL is the same repo).
+carpetx_url = REPOS + "/carpetx.git"
+respelled = REPOS.replace("file://", "file://localhost", 1) + "/carpetx/"
+s, r, _ = api("POST", "/lookup", {"pins": [
+    {"url": carpetx_url, "commit": v110},
+    {"url": respelled, "commit": unrel},
+    {"url": carpetx_url, "commit": "0" * 40},
+    {"url": REPOS + "/nobody-here.git", "commit": v110}],
+    "downloads": [{"url": "https://example.org/never.tar.gz", "sha256": "0" * 64}]})
+pins = r.get("pins") or [{}] * 4
+check("the lookup answers every pin, in request order", s == 200 and [p.get("commit") for p in pins] == [v110, unrel, "0" * 40, v110], r)
+check("a commit a version froze is that version", pins[0].get("package") == "max/carpetx" and pins[0].get("version") == "1.1.0"
+      and pins[0].get("commit-known") is True and "review" not in pins[0], pins[0])
+check("a respelled URL is the same repo; a commit no version froze has no version but is known",
+      pins[1].get("package") == "max/carpetx" and pins[1].get("version") is None and pins[1].get("commit-known") is True, pins[1])
+check("a commit the repo doesn't have is not known", pins[2].get("package") == "max/carpetx" and pins[2].get("commit-known") is False, pins[2])
+check("a repo no package has: no package, nothing known", pins[3].get("package") is None and pins[3].get("commit-known") is None, pins[3])
+check("a download never submitted has no review", (r.get("downloads") or [{}])[0].get("review", "x") is None, r.get("downloads"))
+s, r, _ = api("POST", "/lookup", {"pins": [{"url": carpetx_url, "commit": v110[:12]}]})
+check("the lookup takes full commit ids only", s == 400 and r["error"]["code"] == "bad-request", r)
+
+# Providers: the thorns that meet one CCL requirement, in each package's newest version.
+s, r, _ = api("GET", "/providers?thorn=arith")
+check("providers finds a thorn by name, case-insensitively",
+      s == 200 and any(p["package"] == "max/carpetx" and p["thorn"] == "Arith" for p in r.get("providers", [])), r)
+for q in ["", "?thorn=Arith&implements=Driver", "?capability=a%26b"]:
+    s, _, _ = api("GET", "/providers" + q)
+    check(f"providers{q or ' with nothing'} is a 400", s == 400, s)
+
+# Reviewed downloads: fetched once, checked, reviewed by an admin; a sim pinning one waits for it.
+css = urllib.request.urlopen(BASE + "/static/app.css").read()
+css_sha = hashlib.sha256(css).hexdigest()
+css_url = "http://127.0.0.1:8000/static/app.css"  # as the server reaches itself
+bob.get("/settings")
+_, btext, _ = bob.post("/settings/tokens", {"name": "smoke-bob", "days": "30"})
+BOB = {"Authorization": "Bearer " + re.search(r"(cactarium_[A-Za-z0-9_-]+)", btext).group(1)}
+s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": "0" * 64}, BOB)
+check("a download whose content has another sha256 is refused", s == 400 and css_sha in r["error"]["message"], r)
+s, r, _ = api("POST", "/downloads", {"url": "file:///etc/hostname", "sha256": css_sha}, BOB)
+check("a download outside the fetch policy is refused", s == 400 and "https://" in r["error"]["message"], r)
+s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha, "note": "the site's stylesheet"}, BOB)
+did = r.get("id")
+check("bob submits a download: fetched, checked, pending", s == 200 and r.get("review") == "pending" and did, r)
+s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha}, BOB)
+check("submitting it again is a 409 that carries its review",
+      s == 409 and r.get("id") == did and r.get("review") == "pending" and r["error"]["code"] == "conflict", r)
+s, r, _ = api("POST", "/lookup", {"pins": [], "downloads": [{"url": css_url, "sha256": css_sha}]})
+check("the lookup says it is pending", s == 200 and r["downloads"][0]["review"] == "pending" and r["pins"] == [], r)
+dl_section = f"\n!TARGET = $ROOT/dl\n!TYPE = http\n!URL = {css_url}\n!CHECKSUM_SHA256 = {css_sha}\n!CHECKOUT = app.css\n"
+q3 = "'" * 3
+dlsim = pin_sim("dlsim", [("pinpkg", "PinArr", REPOS + "/pinpkg.git", ptagged)])
+dlsim = dlsim.replace(q3 + "\n\n[parfile]", dl_section + q3 + "\n\n[parfile]", 1) + f'\n[[repo]]\nname = "app.css"\nurl = "{css_url}"\nsha256 = "{css_sha}"\n'
+s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
+check("a sim pinning a download that isn't approved is refused, naming the command",
+      s == 400 and f"cactup download submit {css_url}" in body and "awaits review" in body, f"{s} {body[:400]}")
+page(bob, "/admin/downloads", expect=403)
+text = page(maxv, "/admin/downloads", contains=css_url)
+s, _, _ = maxv.post(f"/admin/downloads/{did}", {"decision": "approve", "note": "ours"})
+check("an admin approves the download", s == 303, s)
+s, _, _ = maxv.post(f"/admin/downloads/{did}", {"decision": "reject"})
+check("a decided download stays decided", s == 409, s)
+s, r, _ = api("POST", "/lookup", {"downloads": [{"url": css_url, "sha256": css_sha}]})
+check("the lookup says it is approved", r.get("downloads", [{}])[0].get("review") == "approved", r)
+s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
+check("then the sim is published", s == 200 and '"max/dlsim@1.0.0"' in body, f"{s} {body[:400]}")
+# Its pins are labeled with the versions that froze their commits; the download carries none.
+s, stored, _ = anon.get("/api/v1/sims/max/dlsim/1.0.0/download")
+check("a sim stored now labels each pin with its package version", 'cactarium = "max/pinpkg@1.0.0"' in stored
+      and stored.count("cactarium = ") == 2 and stored.startswith("format = 1"), stored[-600:])
+s, _, hdrs = anon.get("/api/v1/sims/max/dlsim/1.0.0/download")
+check("served with the stored file's own sha256", hdrs.get("x-sha256") == hashlib.sha256(stored.encode()).hexdigest(), hdrs.get("x-sha256"))
+
+# Stack releases' pins are labeled when served; the stored release doesn't change.
+lab_th = (f"!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n\n!TARGET = $ROOT/arrangements\n!TYPE = git\n!URL = {REPOS}/pinpkg.git\n"
+          f"!REPO_PATH = $2\n!REPO_COMMIT = {ptagged}\n!CHECKOUT =\nPinArr/PinArrThorn\n")
+maxv.get("/new/stack")
+s, text, _ = maxv.post("/new/stack", {"definition": 'format = 1\n\n[stack]\nname = "labeled"\nthornlist = "labeled.th"\n', "thornlist": lab_th, "version": "0.1.0"})
+check("publish a stack pinning a package version's commit", s == 303, text[text.find("alert"):][:300])
+s, body, _ = anon.get("/api/v1/stacks/max/labeled/releases/0.1.0")
+rp = json.loads(body)["repo"] if s == 200 else [{}]
+check("a stack release's pin is labeled when served", rp[0].get("cactarium") == "max/pinpkg@1.0.0", body[:400])
+check("and the stored release isn't rewritten",
+      psql("SELECT count(*) FROM stack_releases s JOIN versions v ON v.id = s.version_id JOIN entries e ON e.id = v.entry_id WHERE e.name = 'labeled' AND s.frozen LIKE '%max/pinpkg@%'") == "0")
+
+# A stack's [[dependency]] is checked like a package's: it names a package with a version in range.
+def dep_stack(target):
+    maxv.get("/new/stack")
+    d = f'format = 1\n\n[stack]\nname = "depstack"\nextends = ["et/et-stack@2026.5.0"]\n\n[[dependency]]\ntarget = "{target}"\n'
+    return maxv.post("/new/stack", {"definition": d, "thornlist": "", "version": "0.1.0"})
+s, text, _ = dep_stack("max/nosuchpkg")
+check("a stack release whose dependency has no package version is refused", s == 200 and "no version of that package" in text, text[text.find("alert"):][:300])
+s, text, _ = dep_stack("et/et-stack")
+check("and one whose dependency is a stack", s == 200 and "that is a stack" in text, text[text.find("alert"):][:300])
+s, text, _ = dep_stack("max/pinpkg@^1")
+check("one whose dependency has a version in range is released", s == 303, text[text.find("alert"):][:300])
+
+# Registering through the API: preview, a stale fingerprint, confirm, nothing to add.
+_, arbare, _, _ = tiny_package("apireg", "bob", "ApiArr")
+APIREG = REPOS + "/apireg.git"
+s, r, _ = api("POST", "/repos", {"url": APIREG, "dry-run": True}, BOB)
+e = (r.get("entries") or [{}])[0]
+check("a dry run previews the registration, with a fingerprint",
+      s == 200 and e.get("status") == "new" and e.get("slug") == "bob/apireg" and e.get("review") == "pending" and r.get("expect"), r)
+check("and registers nothing", page(anon, "/bob/apireg", expect=404) is not None)
+git("apireg", "tag", "v1.1.0", "master")  # a newer release since the preview
+s, r, _ = api("POST", "/repos", {"url": APIREG, "expect": r.get("expect", "")}, BOB)
+check("a fingerprint the repo moved past is a 409", s == 409 and r["error"]["code"] == "conflict", r)
+s, r, _ = api("POST", "/repos", {"url": APIREG, "expect": "garbage"}, BOB)
+check("an expect no dry run gave is a 400", s == 400, r)
+s, r, _ = api("POST", "/repos", {"url": APIREG, "dry-run": True}, BOB)
+s, r, _ = api("POST", "/repos", {"url": APIREG, "expect": r.get("expect", "")}, BOB)
+e = (r.get("entries") or [{}])[0]
+check("registering with a fresh fingerprint registers it, with its page and its first versions",
+      s == 200 and e.get("status") == "new" and e.get("slug") == "bob/apireg" and e.get("url", "").endswith("/bob/apireg")
+      and e.get("version") == "1.1.0" and e.get("new-versions") == 2, r)
+s, r, _ = api("POST", "/repos", {"url": APIREG}, BOB)
+check("a repo with nothing to add answers 200, every entry existing",
+      s == 200 and r.get("entries") and all(x["status"] == "existing" for x in r["entries"]) and not r.get("expect"), r)
+
+# A dependency on a package awaiting review waits; once approved, the version is read.
+M = new_tree("m17")
+thorn_at(M, "MsArr")
+write(M, "cactarium.toml", package_toml("m17", "MsArr", '\n[[dependency]]\ntarget = "bob/apireg"\nneeds = ["ApiArrThorn"]\n'))
+commit_tag(M, "m17 1.0", "v1.0.0")
+mbare = publish_tree(M, "m17")
+s, r, _ = api("POST", "/repos", {"url": REPOS + "/m17.git"}, MAXAUTH)
+e = (r.get("entries") or [{}])[0]
+check("a package depending on one awaiting review registers, and its first version waits",
+      s == 200 and e.get("status") == "new" and e.get("new-versions") == 0 and any("isn't public yet" in w for w in e.get("warnings", [])), r)
+check("its version isn't frozen", not has_version(maxv, "max/m17", "1.0.0"))
+check("approve bob's package", decide("bob/apireg", "approve") == 303)
+ok, out = cli_sync("max/m17")
+check("once it is approved, the waiting version is read", ok and has_version(anon, "max/m17", "1.0.0"), out[-300:])
+# A dependency whose version in range awaits review waits for that review.
+git("apireg", "tag", "v1.2.0", "master")
+cli_sync("bob/apireg")
+write(M, "cactarium.toml", package_toml("m17", "MsArr", '\n[[dependency]]\ntarget = "bob/apireg@^1.2"\nneeds = ["ApiArrThorn"]\n'))
+commit_tag(M, "m17 1.1", "v1.1.0")
+push_all(M, mbare)
+ok, out = cli_sync("max/m17")
+check("a dependency whose version in range awaits review makes the version wait",
+      not ok and "bob/apireg@1.2.0 awaits review" in out and not has_version(maxv, "max/m17", "1.1.0"), out[-300:])
+# Every read honors the header: the entry, and the lookup, which names the newest version that froze a commit.
+s, r, hdrs = api("GET", "/entries/bob/apireg")
+check("an entry's versions leave out what awaits review", s == 200 and "1.2.0" not in r.get("versions", []) and "x-cactarium-unreviewed" not in hdrs, r)
+s, r, hdrs = api("GET", "/entries/bob/apireg", headers={**REV, **MAXAUTH})
+check("an admin who asks sees it, marked", s == 200 and "1.2.0" in r.get("versions", []) and hdrs.get("x-cactarium-unreviewed") == "true", r)
+c12 = git("apireg", "rev-parse", "v1.2.0^{commit}")
+s, r, hdrs = api("POST", "/lookup", {"pins": [{"url": APIREG, "commit": c12}]})
+check("the lookup names an approved version for everyone", r["pins"][0].get("version") == "1.1.0" and "review" not in r["pins"][0], r)
+s, r, hdrs = api("POST", "/lookup", {"pins": [{"url": APIREG, "commit": c12}]}, {**REV, **MAXAUTH})
+check("and the version awaiting review for an admin who asks, marked",
+      r["pins"][0].get("version") == "1.2.0" and r["pins"][0].get("review") == "pending" and hdrs.get("x-cactarium-unreviewed") == "true", r)
+s, r, _ = api("GET", "/providers?thorn=ApiArrThorn", headers={**REV, **MAXAUTH})
+check("providers serve the newest version awaiting review to an admin who asks",
+      any(p["package"] == "bob/apireg" and p["version"] == "1.2.0" and p.get("review") == "pending" for p in r.get("providers", [])), r)
+check("approve the release", decide("bob/apireg@1.2.0", "approve") == 303)
+ok, out = cli_sync("max/m17")
+check("once reviewed, the waiting version is read", ok and has_version(anon, "max/m17", "1.1.0"), out[-300:])
+
 print()
 if FAILED:
     print(f"{len(FAILED)} failed")
