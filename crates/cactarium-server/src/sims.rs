@@ -208,8 +208,9 @@ pub struct PinProblems {
 
 /// What is wrong with `sim`'s pins, for an upload ([`check_pins`]) or a tag (`tracker::prepare`,
 /// where facts make the version invalid and passing problems leave the tag unread).
-/// `registering` holds normalized URLs of packages being registered right now, in the same
-/// registration: a pin to one is a package that isn't public yet.
+/// `registering` holds the URLs of packages being registered right now, in the same registration:
+/// a pin to one is a package that isn't public yet. A pin's URL matches a package's by the shared
+/// key ([`model::find_repo`]).
 pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String]) -> AppResult<PinProblems> {
     // Public packages first (oldest first), then any other package entry, which only tells a
     // registered-but-not-public repo from one nobody registered.
@@ -229,9 +230,8 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
             ));
             continue;
         };
-        let norm = crate::git::normalize_url(&pin.url);
-        let Some((owner, name, url, public)) = packages.iter().find(|(_, _, u, _)| crate::git::normalize_url(u) == norm) else {
-            if registering.contains(&norm) {
+        let Some((owner, name, url, public)) = model::find_repo(&pin.url, &packages, |(_, _, u, _)| u) else {
+            if model::find_repo(&pin.url, registering, |u| u).is_some() {
                 out.passing.push(format!("{} ({}) is the repo of a package registered along with this entry, not public yet", pin.name, pin.url));
                 continue;
             }

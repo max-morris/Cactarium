@@ -1217,17 +1217,6 @@ pub fn read_in(co: &Checkout, rel: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(std::fs::read_to_string(&real).with_context(|| format!("'{rel}' is not UTF-8 text"))?))
 }
 
-/// A URL in canonical form for matching (scheme-less, no `.git`, no trailing slash, lowercase host).
-pub fn normalize_url(url: &str) -> String {
-    let u = url.trim().trim_end_matches('/');
-    let u = u.strip_suffix(".git").unwrap_or(u);
-    let u = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
-    match u.split_once('/') {
-        Some((host, path)) => format!("{}/{}", host.to_ascii_lowercase(), path),
-        None => u.to_ascii_lowercase(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,18 +1432,6 @@ mod tests {
         for a in ["140.82.112.3", "2606:50c0:8000::153"] {
             assert!(!private(a.parse().unwrap()), "{a}");
         }
-    }
-
-    #[test]
-    fn url_normalization() {
-        assert_eq!(
-            normalize_url("https://GitHub.com/max-morris/CarpetX.git/"),
-            "github.com/max-morris/CarpetX"
-        );
-        assert_eq!(
-            normalize_url("https://github.com/max-morris/CarpetX"),
-            "github.com/max-morris/CarpetX"
-        );
     }
 
     #[tokio::test]

@@ -349,12 +349,11 @@ fn kind_of(file: &str) -> &'static str {
 /// Every entry whose repo is `url`, compared normalized (`https://github.com/x/y.git` and
 /// `https://github.com/x/y` are one repo): the entries on one repo are each other's siblings.
 pub async fn entries_on(state: &AppState, url: &str) -> AppResult<Vec<(Entry, String)>> {
-    let norm = git::normalize_url(url);
     let rows: Vec<(i64, String, String)> =
         sqlx::query_as("SELECT entry_id, url, manifest_file FROM entry_repos ORDER BY entry_id").fetch_all(&state.db).await?;
     let mut out = Vec::new();
     for (id, u, file) in rows {
-        if git::normalize_url(&u) == norm {
+        if cactup_ecosystem_common::url::same_repo(&u, url) {
             out.push((model::entry_by_id(state, id).await?, file));
         }
     }
@@ -872,7 +871,7 @@ pub struct Previewed {
 pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>, url: &str, at: At<'_>, files: Option<&[String]>) -> AppResult<Previewed> {
     let plan = plan(state, owner, url, at, files).await?;
     let registering: Vec<String> =
-        if plan.new.iter().any(|p| p.kind == "package") { vec![git::normalize_url(&plan.url)] } else { vec![] };
+        if plan.new.iter().any(|p| p.kind == "package") { vec![plan.url.clone()] } else { vec![] };
     let opts = PrepOpts { defer_pins: true, registering };
     let skips = user.is_some_and(publish::skips_review) || publish::owner_trusted(state, &plan.owner).await?;
     let mut entries = Vec::new();
@@ -1831,7 +1830,7 @@ pub async fn move_repo(state: &AppState, admin: &User, entry: &Entry, new_url: &
             .bind(e.id)
             .fetch_one(&mut *tx)
             .await?;
-        if git::normalize_url(&from) != git::normalize_url(&repo.url) {
+        if !cactup_ecosystem_common::url::same_repo(&from, &repo.url) {
             return Err(AppError::Conflict(format!("{} moved while this ran; reload and try again", e.slug())));
         }
         sqlx::query("UPDATE entry_repos SET url = $2, poll_error = NULL WHERE entry_id = $1")
@@ -3468,8 +3467,8 @@ struct PrepOpts {
     /// Return sim pins that can't be checked yet as `deferred` instead of failing with
     /// [`AppError::Upstream`] (a registration's dry read).
     defer_pins: bool,
-    /// Normalized URLs of packages being registered along with this entry: a pin to one is a
-    /// package not public yet, not a repo nobody registered.
+    /// The URLs of packages being registered along with this entry: a pin to one is a package not
+    /// public yet, not a repo nobody registered.
     registering: Vec<String>,
 }
 
@@ -3913,13 +3912,43 @@ pub async fn store_pins(
             .bind(sim)
             .bind(&p.name)
             .bind(&p.url)
-            .bind(git::normalize_url(&p.url))
+            .bind(model::repo_key(&p.url))
             .bind(&p.git_ref)
             .bind(p.commit.as_ref().or(p.sha256.as_ref()))
             .execute(&mut *db)
             .await?;
     }
     Ok(())
+}
+
+/// Recomputes every stored repo key (`source_pins.url_norm`) from its URL with [`model::repo_key`],
+/// for the `shared-url-keys` data migration: only rows whose key differs are written. Returns how
+/// many changed.
+pub async fn rekey_source_pins(db: &mut sqlx::PgConnection) -> AppResult<usize> {
+    let rows: Vec<(i64, String, String, String, String)> =
+        sqlx::query_as("SELECT version_id, sim, repo, url, url_norm FROM source_pins").fetch_all(&mut *db).await?;
+    let (mut vids, mut sims, mut repos, mut keys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (vid, sim, repo, url, old) in rows {
+        let key = model::repo_key(&url);
+        if key != old {
+            vids.push(vid);
+            sims.push(sim);
+            repos.push(repo);
+            keys.push(key);
+        }
+    }
+    sqlx::query(
+        "UPDATE source_pins p SET url_norm = k.key
+         FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[]) AS k(vid, sim, repo, key)
+         WHERE p.version_id = k.vid AND p.sim = k.sim AND p.repo = k.repo",
+    )
+    .bind(&vids)
+    .bind(&sims)
+    .bind(&repos)
+    .bind(&keys)
+    .execute(&mut *db)
+    .await?;
+    Ok(keys.len())
 }
 
 /// Admin-only: a curated version (a commit that exists upstream, named by the admin).

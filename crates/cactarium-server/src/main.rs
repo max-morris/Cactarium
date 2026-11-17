@@ -220,7 +220,8 @@ async fn main() -> anyhow::Result<()> {
     let migrate = || async {
         let mut m = sqlx::migrate!("./migrations");
         m.set_ignore_missing(true);
-        m.run(&db).await
+        m.run(&db).await?;
+        data_migrations(&db).await
     };
     match cli.command {
         Command::Migrate => {
@@ -482,6 +483,39 @@ async fn main() -> anyhow::Result<()> {
             serve(cfg, db).await
         }
     }
+}
+
+/// The data migrations a schema migration queued (`data_migrations`) that can't be written in SQL,
+/// run once each, right after the schema migrations: by `migrate` (which `just update` runs before
+/// the new server starts) or, failing that, by `serve`. Each runs in one transaction with its
+/// mark, so a step that fails is tried again next time and leaves nothing half done.
+async fn data_migrations(db: &sqlx::PgPool) -> anyhow::Result<()> {
+    let due: Vec<String> = sqlx::query_scalar("SELECT name FROM data_migrations WHERE done_at IS NULL ORDER BY name")
+        .fetch_all(db)
+        .await?;
+    for name in due {
+        let mut tx = db.begin().await?;
+        // Locked: a `migrate` and a `serve` starting together run each step once.
+        let still: Option<String> =
+            sqlx::query_scalar("SELECT name FROM data_migrations WHERE name = $1 AND done_at IS NULL FOR UPDATE")
+                .bind(&name)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if still.is_none() {
+            continue;
+        }
+        match name.as_str() {
+            "shared-url-keys" => {
+                let n = tracker::rekey_source_pins(&mut tx).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                tracing::info!("data migration {name}: {n} repo keys recomputed");
+            }
+            // Queued by a newer release: left for it.
+            _ => continue,
+        }
+        sqlx::query("UPDATE data_migrations SET done_at = now() WHERE name = $1").bind(&name).execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 async fn admin(db: &sqlx::PgPool, action: AdminAction) -> anyhow::Result<()> {

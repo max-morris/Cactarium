@@ -12,7 +12,6 @@ use serde::Deserialize;
 use crate::auth::{User, Visitor};
 use crate::claims::ClaimRec;
 use crate::error::{AppError, AppResult};
-use crate::git::normalize_url;
 use crate::markdown;
 use crate::model::{self, ENTRY_COLS, Entry, Version, fmt_date};
 use crate::stacks;
@@ -302,7 +301,7 @@ pub async fn sources(
          (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1 AND v.review = 'approved')
          ORDER BY updated_at DESC"
     ))
-    .bind(normalize_url(&q.url))
+    .bind(model::repo_key(&q.url))
     .fetch_all(&state.db)
     .await?;
     Ok(page(&SearchPage {
@@ -546,9 +545,8 @@ async fn pin_rows(
     .await?;
     let mut out = Vec::new();
     for p in pins {
-        let norm = normalize_url(&p.url);
         let mut registered = None;
-        if let Some((id, o, n, _)) = repos.iter().find(|r| normalize_url(&r.3) == norm)
+        if let Some((id, o, n, _)) = model::find_repo(&p.url, &repos, |r| &r.3)
             && let Some(c) = &p.commit
         {
             let label: Option<(String, String)> =
@@ -711,7 +709,7 @@ async fn package_page(
         "SELECT {ENTRY_COLS} FROM entries WHERE visibility = 'public' AND kind <> 'package' AND id IN
          (SELECT v.entry_id FROM source_pins p JOIN versions v ON v.id = p.version_id WHERE p.url_norm = $1 AND v.review = 'approved') ORDER BY updated_at DESC LIMIT 50"
     ))
-    .bind(normalize_url(&e.repo_url))
+    .bind(model::repo_key(&e.repo_url))
     .fetch_all(&state.db)
     .await?;
     let repo = repo_manage(state, entry, e.can_manage).await?;

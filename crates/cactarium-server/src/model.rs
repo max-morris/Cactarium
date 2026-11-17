@@ -223,6 +223,26 @@ pub fn latest_on<'a>(versions: &'a [Version], track: &str) -> Option<&'a Version
     on.iter().find(|v| v.usable()).or(on.first()).copied()
 }
 
+/// The key two repo URLs are compared by, the one CactUp compares with too (the crate's
+/// `url::normalize_repo_url`): what `source_pins.url_norm` stores.
+pub fn repo_key(url: &str) -> String {
+    cactup_ecosystem_common::url::normalize_repo_url(url)
+}
+
+/// The candidate whose repo `url` names: the first whose URL has `url`'s key, else, on a forge
+/// that ignores path case (GitHub, GitLab, Bitbucket), the first equal to it but for case
+/// (`url::same_repo_lenient`), unless those name more than one repo (then none: a guess between
+/// two registered repos would be wrong half the time).
+pub fn find_repo<'a, T>(url: &str, candidates: &'a [T], url_of: impl Fn(&T) -> &str) -> Option<&'a T> {
+    use cactup_ecosystem_common::url::{same_repo, same_repo_lenient};
+    if let Some(c) = candidates.iter().find(|c| same_repo(url, url_of(c))) {
+        return Some(c);
+    }
+    let lenient: Vec<&T> = candidates.iter().filter(|c| same_repo_lenient(url, url_of(c))).collect();
+    let first = *lenient.first()?;
+    lenient.iter().all(|c| same_repo(url_of(c), url_of(first))).then_some(first)
+}
+
 /// A git URL as a page a person can open: `https://host/x/y.git` → `https://host/x/y`.
 pub fn repo_page(url: &str) -> String {
     let u = url.trim_end_matches('/');
@@ -353,6 +373,26 @@ mod tests {
         assert!(!v.valid() && !v.usable());
         let ok = Version { state: "tag-moved".into(), invalid_reason: None, ..v };
         assert!(ok.valid() && ok.usable());
+    }
+
+    /// Pins find their package by the shared key, then by the lenient match on caseless forges,
+    /// never by guessing between two repos.
+    #[test]
+    fn repos_are_found_by_the_shared_key() {
+        let urls = ["https://github.com/EinsteinToolkit/Cottonmouth.git", "https://git.example.org/X/Y"];
+        let find = |u: &str| find_repo(u, &urls, |s| s).copied();
+        assert_eq!(find("git@github.com:EinsteinToolkit/Cottonmouth"), Some(urls[0]));
+        assert_eq!(find("https://github.com/einsteintoolkit/cottonmouth/"), Some(urls[0]), "lenient on GitHub");
+        assert_eq!(find("https://git.example.org/x/y"), None, "path case counts elsewhere");
+        assert_eq!(find("https://git.example.org/X/Y.git"), Some(urls[1]));
+        // Two registered repos equal but for case: an exact match wins, a lenient one is ambiguous.
+        let two = ["https://github.com/a/Repo", "https://github.com/A/repo"];
+        assert_eq!(find_repo("https://github.com/A/repo", &two, |s| s), Some(&two[1]));
+        assert_eq!(find_repo("https://github.com/a/repo", &two, |s| s), None);
+        // Keys: ordinary https URLs keep theirs, scp-like and local ones change.
+        assert_eq!(repo_key("https://GitHub.com/max-morris/CarpetX.git/"), "github.com/max-morris/CarpetX");
+        assert_eq!(repo_key("git@github.com:max-morris/CarpetX.git"), "github.com/max-morris/CarpetX");
+        assert_eq!(repo_key("file:///srv/repos/x.git"), "file:///srv/repos/x");
     }
 
     #[test]
