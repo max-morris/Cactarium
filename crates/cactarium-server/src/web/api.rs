@@ -145,6 +145,7 @@ fn version_info(v: &Version) -> VersionInfo {
         state: v.state.clone(),
         curated: v.is_virtual,
         published: v.created_at.unix_timestamp(),
+        review: (!v.approved()).then(|| "pending".to_owned()),
     }
 }
 
@@ -187,7 +188,8 @@ pub async fn package_versions(
         versions.push(version_body(&state, v, &url).await?);
     }
     let marked = unreviewed_header(&e, servable.iter().find(|v| !v.approved()));
-    Ok((axum::response::AppendHeaders(marked), Json(PackageVersions { slug: e.slug(), versions })).into_response())
+    let contact = model::entry_contact(&state, &e, (!url.is_empty()).then_some(url.as_str()), None).await?;
+    Ok((axum::response::AppendHeaders(marked), Json(PackageVersions { slug: e.slug(), contact, versions })).into_response())
 }
 
 /// One published package version, with its thorns and claims.
@@ -667,6 +669,7 @@ fn tip_version_info(e: &Entry, label: &str, t: &tracker::PackageTip) -> VersionI
         state: "ok".to_owned(),
         curated: e.curated,
         published: time::OffsetDateTime::now_utc().unix_timestamp(),
+        review: None,
     }
 }
 
