@@ -65,6 +65,13 @@ Every read honors `x-cactarium-include-unreviewed: true` (CactUp's
 releases awaiting review of public entries when the site serves unreviewed code, and such answers
 say `x-cactarium-unreviewed: true`.
 
+- Rate limits answer 429 (`rate-limited`) with `Retry-After`: the whole seconds (at least 1) until
+  that client's window resets, or for a per-user limit until a place frees. A refused request isn't
+  counted, so a client that waits that long gets through.
+- `/packages/{o}/{n}/versions/{commit}` (and `/resolve` with `#<commit>`) named by a full commit id
+  is answered from the cache without counting against the per-minute limit on reads made now when
+  that reading is cached already; `head`, `master`, abbreviated commits and readings not cached
+  yet count.
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.

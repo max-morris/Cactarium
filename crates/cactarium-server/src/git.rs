@@ -1493,10 +1493,14 @@ mod tests {
         }
     }
 
+    /// The tests that use the lookups' only slot run one at a time.
+    static LOOKUP_SLOT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Nobody holds a repo's lock while waiting for a slot: a queued update leaves the repo's
     /// lock free, and a lookup that finds its slot busy answers "can't tell" at once.
     #[tokio::test]
     async fn slots_are_taken_before_locks() {
+        let _one = LOOKUP_SLOT_TESTS.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let up = tmp.path().join("up");
         std::fs::create_dir(&up).unwrap();
@@ -1536,6 +1540,7 @@ mod tests {
     /// the commits it has; one pushed since is found once an update may run; a tree is no commit.
     #[tokio::test]
     async fn mirrors_answer_whether_they_have_commits() {
+        let _one = LOOKUP_SLOT_TESTS.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let up = tmp.path().join("up");
         std::fs::create_dir(&up).unwrap();

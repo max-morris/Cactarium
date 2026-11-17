@@ -2554,6 +2554,15 @@ s, _, _ = maxv.post(f"/admin/downloads/{jid}", {"decision": "approve"})
 ok, out = cli_sync("max/dlrepo")
 check("once its download is approved, the waiting tag is read", ok and has_version(anon, "max/dlrepo", "1.2.0"), out[-300:])
 
+# Readings at a full commit already cached don't count against the per-minute limit on reads made
+# now (the restart above emptied the limiter); tips still do, and a 429 says when to retry.
+codes = [anon.get(f"/api/v1/packages/max/carpetx/versions/{unrel}")[0] for _ in range(16)]
+check("a cached reading at a full commit is answered past the per-minute limit", codes == [200] * 16, codes)
+answers = [anon.get("/api/v1/packages/max/carpetx/versions/head") for _ in range(14)]
+codes = [a[0] for a in answers]
+retry = answers[-1][2].get("Retry-After") or answers[-1][2].get("retry-after")
+check("tips still count, and a 429 says when to try again", codes[0] == 200 and codes[-1] == 429 and retry and 1 <= int(retry) <= 60, f"{codes} {retry}")
+
 print()
 if FAILED:
     print(f"{len(FAILED)} failed")
