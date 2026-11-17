@@ -8,9 +8,9 @@ use axum::http::header;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
-    API_GENERATION, EntryInfo, PackageVersion, PackageVersions, Published, Refreshed,
-    ReleaseRequest, Resolved, CONTACT_HEADER, SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER,
-    UNTRUSTED_HEADER, VersionInfo,
+    API_GENERATION, CONTACT_HEADER, EntryInfo, INCLUDE_UNREVIEWED_HEADER, PackageVersion, PackageVersions,
+    Published, Refreshed, ReleaseRequest, Resolved, SHA256_HEADER, StackReleases, ThornInfo,
+    UNPINNED_HEADER, UNREVIEWED_HEADER, UNTRUSTED_HEADER, VersionInfo,
 };
 use cactup_ecosystem_common::ccl::ThornFacts;
 use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
@@ -61,21 +61,17 @@ impl FromRequestParts<AppState> for TokenUser {
     }
 }
 
-/// The request header asking for what awaits review too (CactUp sends it for
-/// `--risky-allow-untrusted-artifacts`): see [`Reviewer`] for who gets what.
-pub const INCLUDE_UNREVIEWED_HEADER: &str = "x-cactarium-include-unreviewed";
-/// On an answer that serves something awaiting review (only ever to a request that asked).
-pub const UNREVIEWED_HEADER: &str = "x-cactarium-unreviewed";
-
-/// What awaits review this request may see. It must say `x-cactarium-include-unreviewed: true`.
+/// What awaits review this request may see. It must say `x-cactarium-include-unreviewed: true`
+/// ([`INCLUDE_UNREVIEWED_HEADER`], which CactUp sends for `--risky-allow-untrusted-artifacts`).
 /// Then an admin's token reaches releases awaiting review and entries awaiting their first review;
 /// anyone else reaches releases awaiting review of public entries when the site serves unreviewed
 /// code (the `untrusted-tips` setting is `allow`). Otherwise it is an ordinary request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reviewer {
     /// Releases awaiting review of public entries.
-    releases: bool,
+    pub releases: bool,
     /// Entries awaiting their first review (admins only).
-    entries: bool,
+    pub entries: bool,
 }
 
 impl FromRequestParts<AppState> for Reviewer {
@@ -97,13 +93,25 @@ impl FromRequestParts<AppState> for Reviewer {
 
 /// A version this request may be served: a reviewed one, or for a reviewer one awaiting review.
 /// Rejected versions never.
-fn servable(v: &Version, reviewer: &Reviewer) -> bool {
+pub fn servable(v: &Version, reviewer: &Reviewer) -> bool {
     v.valid() && (v.approved() || (reviewer.releases && v.review == "pending"))
 }
 
-/// The answer's header saying what it serves awaits review, when it does.
+/// An entry this request may see: a public one, or for an admin reviewer one awaiting its first
+/// review too.
+#[allow(dead_code)] // the lookup and providers use it
+pub fn entry_servable(e: &Entry, reviewer: &Reviewer) -> bool {
+    e.visibility == "public" || (reviewer.entries && e.visibility == "pending")
+}
+
+/// The answer's header saying what it serves awaits review, when it does: the entry awaits its
+/// first review, or one of the versions served awaits its own.
 fn unreviewed_header(e: &Entry, v: Option<&Version>) -> Option<(header::HeaderName, header::HeaderValue)> {
-    let unreviewed = e.visibility != "public" || v.is_some_and(|v| !v.approved());
+    unreviewed_mark(e.visibility != "public" || v.is_some_and(|v| !v.approved()))
+}
+
+/// The header saying an answer serves something awaiting review, when `unreviewed`.
+pub fn unreviewed_mark(unreviewed: bool) -> Option<(header::HeaderName, header::HeaderValue)> {
     unreviewed.then(|| (header::HeaderName::from_static(UNREVIEWED_HEADER), header::HeaderValue::from_static("true")))
 }
 
@@ -149,18 +157,22 @@ fn version_info(v: &Version) -> VersionInfo {
     }
 }
 
+/// An entry and the versions this request may be served (with what awaits review, for a request
+/// that asked and may: see [`Reviewer`]).
 pub async fn entry(
     State(state): State<AppState>,
+    reviewer: Reviewer,
     Path((owner, name)): Path<(String, String)>,
-) -> ApiResult<Json<EntryInfo>> {
-    let e = public_entry(&state, &owner, &name, None).await?;
-    let versions = model::versions(&state, e.id).await?;
+) -> ApiResult<Response> {
+    let e = entry_for(&state, &owner, &name, None, &reviewer).await?;
+    let versions = servable_versions(&state, &e, &reviewer).await?;
     let repo = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
     let sims = match versions.iter().filter(|v| v.state != "invalid").max_by(|a, b| a.sort_key.cmp(&b.sort_key)) {
         Some(v) if e.kind == "sim" && model::multi_sim(&state, e.id).await? => model::sim_names(&state, v.id).await?,
         _ => vec![],
     };
-    Ok(Json(EntryInfo {
+    let marked = unreviewed_header(&e, versions.iter().find(|v| !v.approved()));
+    Ok((axum::response::AppendHeaders(marked), Json(EntryInfo {
         slug: e.slug(),
         kind: e.kind.clone(),
         summary: e.summary.clone(),
@@ -173,6 +185,7 @@ pub async fn entry(
         tracks: model::tracks_of(&versions, None),
         versions: versions.iter().map(|v| v.label()).collect(),
     }))
+        .into_response())
 }
 
 pub async fn package_versions(
@@ -220,14 +233,23 @@ async fn version_body(state: &AppState, v: &Version, url: &str) -> ApiResult<Pac
     })
 }
 
-/// The published, valid version of `e` frozen at exactly `commit`, if any: naming that commit is
-/// naming that version.
-async fn version_at_commit(state: &AppState, e: &Entry, commit: &str) -> ApiResult<Option<Version>> {
-    Ok(model::versions(state, e.id)
-        .await?
-        .into_iter()
-        .filter(|v| v.commit.as_deref() == Some(commit) && v.valid())
-        .max_by(|a, b| a.sort_key.cmp(&b.sort_key)))
+/// The version of `e` this request may be served that froze exactly `commit`, if any: naming that
+/// commit is naming that version. When several did, [`frozen_at`] chooses.
+async fn version_at_commit(state: &AppState, e: &Entry, commit: &str, reviewer: &Reviewer) -> ApiResult<Option<Version>> {
+    let versions = servable_versions(state, e, reviewer).await?;
+    Ok(frozen_at(&versions, commit).cloned())
+}
+
+/// Among `versions`, the one that names `commit` when several froze it: the newest on the default
+/// track; with none there, the newest on any track, ties going to the track name first in byte
+/// order (the rule `PinInfo::version` documents). Yanked versions count.
+pub fn frozen_at<'a>(versions: &'a [Version], commit: &str) -> Option<&'a Version> {
+    let at = versions.iter().filter(|v| v.commit.as_deref() == Some(commit));
+    let key = |v: &Version| model::tracked(v).map(|t| t.version);
+    at.clone()
+        .filter(|v| v.track.is_empty())
+        .max_by(|a, b| key(a).cmp(&key(b)))
+        .or_else(|| at.max_by(|a, b| key(a).cmp(&key(b)).then_with(|| b.track.cmp(&a.track))))
 }
 
 #[derive(Deserialize)]
@@ -279,11 +301,11 @@ pub async fn resolve(
             newer_without_sim: None,
             version: tip_version_info(&e, label, &t),
         };
-        return Ok((tip_headers(trusted), Json(body)).into_response());
+        return Ok((axum::response::AppendHeaders(unreviewed_header(&e, None)), tip_headers(trusted), Json(body)).into_response());
     }
     // `#<sha>` names only a commit.
     if let Some(prefix) = slug.sha() {
-        return commit_answer(&state, &e, ip, prefix).await;
+        return commit_answer(&state, &e, ip, prefix, &reviewer).await;
     }
     let versions = servable_versions(&state, &e, &reviewer).await?;
     // For one sim of a multi-sim entry, only the versions that hold it.
@@ -344,7 +366,7 @@ pub async fn resolve(
     let best = match matched {
         Ok(v) => v,
         Err(err) => match slug.commit_fallback() {
-            Some(prefix) if e.kind == "package" => return commit_answer(&state, &e, ip, prefix).await,
+            Some(prefix) if e.kind == "package" => return commit_answer(&state, &e, ip, prefix, &reviewer).await,
             _ => return Err(err.into()),
         },
     };
@@ -436,15 +458,16 @@ async fn sims_list(state: &AppState, e: &Entry, version_id: Option<i64>) -> ApiR
 /// `@<commit>` (as a fallback) or `#<commit>` on `/resolve`: the version frozen at that commit if
 /// there is one, else the package read there, served under the untrusted-code rule. The answer
 /// always names the full commit (`owner/pkg#<sha>`).
-async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) -> ApiResult<Response> {
+async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str, reviewer: &Reviewer) -> ApiResult<Response> {
     if e.kind != "package" {
         return Err(AppError::bad("only a package can be named by commit; name a stack or sim by its version").into());
     }
     let commit = full_commit(state, e, ip, prefix).await?;
     let url = tracker::repo_of(state, e.id).await?.map(|r| r.url);
-    if let Some(v) = version_at_commit(state, e, &commit).await? {
+    if let Some(v) = version_at_commit(state, e, &commit, reviewer).await? {
         let contact = model::manifest_contact(v.manifest.as_ref()).or_else(|| url.as_deref().map(model::repo_page));
-        return Ok(Json(Resolved {
+        let marked = unreviewed_header(e, Some(&v));
+        return Ok((axum::response::AppendHeaders(marked), Json(Resolved {
             slug: format!("{}@{}", e.slug(), v.label()),
             kind: e.kind.clone(),
             url,
@@ -452,7 +475,7 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) 
             sim: None,
             newer_without_sim: None,
             version: version_info(&v),
-        })
+        }))
         .into_response());
     }
     let trusted = unreviewed_allowed(state, e, &commit, Unreviewed::Commit).await?;
@@ -467,7 +490,7 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) 
         newer_without_sim: None,
         version: tip_version_info(e, &commit, &t),
     };
-    Ok(([untrusted_header(trusted)], Json(body)).into_response())
+    Ok((axum::response::AppendHeaders(unreviewed_header(e, None)), [untrusted_header(trusted)], Json(body)).into_response())
 }
 
 /// The full commit id `prefix` names in the package's repo (abbreviated ids are resolved against
@@ -505,6 +528,7 @@ async fn full_commit(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) ->
 pub async fn package_tip(
     State(state): State<AppState>,
     ip: ClientIp,
+    reviewer: Reviewer,
     Path((owner, name, tip)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
     let at = tip.to_ascii_lowercase();
@@ -512,13 +536,14 @@ pub async fn package_tip(
     if !is_commit && at != "head" && at != "master" {
         return Err(AppError::NotFound.into());
     }
-    let e = public_entry(&state, &owner, &name, Some("package")).await?;
+    let e = entry_for(&state, &owner, &name, Some("package"), &reviewer).await?;
     let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url).unwrap_or_default();
     let commit = if is_commit { Some(full_commit(&state, &e, ip, &at).await?) } else { None };
     if let Some(c) = &commit
-        && let Some(v) = version_at_commit(&state, &e, c).await?
+        && let Some(v) = version_at_commit(&state, &e, c, &reviewer).await?
     {
-        return Ok(Json(version_body(&state, &v, &url).await?).into_response());
+        let marked = unreviewed_header(&e, Some(&v));
+        return Ok((axum::response::AppendHeaders(marked), Json(version_body(&state, &v, &url).await?)).into_response());
     }
     let label = commit.clone().unwrap_or(at);
     let kind = if commit.is_some() { Unreviewed::Commit } else { Unreviewed::Tip };
@@ -541,9 +566,10 @@ pub async fn package_tip(
             .collect(),
         claims: t.claims.iter().map(ClaimRec::info).collect(),
     };
+    let marked = axum::response::AppendHeaders(unreviewed_header(&e, None));
     Ok(match commit {
-        Some(_) => ([untrusted_header(trusted)], Json(body)).into_response(),
-        None => (tip_headers(trusted), Json(body)).into_response(),
+        Some(_) => (marked, [untrusted_header(trusted)], Json(body)).into_response(),
+        None => (marked, tip_headers(trusted), Json(body)).into_response(),
     })
 }
 
@@ -677,10 +703,15 @@ pub async fn stack_releases(
     State(state): State<AppState>,
     reviewer: Reviewer,
     Path((owner, name)): Path<(String, String)>,
-) -> ApiResult<Json<StackReleases>> {
+) -> ApiResult<Response> {
     let e = entry_for(&state, &owner, &name, Some("stack"), &reviewer).await?;
     let versions = servable_versions(&state, &e, &reviewer).await?;
-    Ok(Json(StackReleases { slug: e.slug(), releases: versions.iter().map(version_info).collect() }))
+    let marked = unreviewed_header(&e, versions.iter().find(|v| !v.approved()));
+    Ok((
+        axum::response::AppendHeaders(marked),
+        Json(StackReleases { slug: e.slug(), releases: versions.iter().map(version_info).collect() }),
+    )
+        .into_response())
 }
 
 /// A release's frozen form, or `head` / `master`: the unpinned forms, resolved now.
@@ -738,7 +769,8 @@ pub async fn stack_release(
         header::HeaderName::from_static(UNTRUSTED_HEADER),
         header::HeaderValue::from_static(if trusted { "false" } else { "true" }),
     );
-    Ok(([unpinned, contact_header, untrusted], Json(&*frozen)).into_response())
+    let marked = axum::response::AppendHeaders(unreviewed_header(&e, None));
+    Ok((marked, [unpinned, contact_header, untrusted], Json(&*frozen)).into_response())
 }
 
 /// The stack's definition as it stands now: its repo's default branch for a manifest repo, else
@@ -910,4 +942,65 @@ pub async fn package_refresh(
 
 pub async fn not_found() -> ApiError {
     ApiError(AppError::NotFound)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A version row for tests: `label` is `1.2.3` or `track:1.2.3`.
+    pub(crate) fn version(id: i64, label: &str, commit: &str, review: &str) -> Version {
+        let (track, v) = label.split_once(':').unwrap_or(("", label));
+        Version {
+            id,
+            entry_id: 1,
+            track: track.into(),
+            version: v.into(),
+            sort_key: model::semver_sort_key(&semver::Version::parse(v).unwrap()),
+            tag: Some(format!("v{v}")),
+            commit: Some(commit.into()),
+            tree: None,
+            is_virtual: false,
+            state: "ok".into(),
+            invalid_reason: None,
+            yanked: false,
+            yank_reason: None,
+            review: review.into(),
+            manifest: None,
+            readme_html: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// Several versions froze one commit: the newest on the default track names it; with none
+    /// there, the newest on any track, ties to the track name first in byte order.
+    #[test]
+    fn the_version_a_commit_is() {
+        let c = "3f2c9e1a00112233445566778899aabbccddeeff";
+        let vs = [
+            version(1, "zeta:9.0.0", c, "approved"),
+            version(2, "1.0.0", c, "approved"),
+            version(3, "1.1.0", c, "approved"),
+            version(4, "2.0.0", "0000000000000000000000000000000000000000", "approved"),
+        ];
+        assert_eq!(frozen_at(&vs, c).map(|v| v.id), Some(3));
+        let tracks = [version(1, "beta:1.0.0", c, "approved"), version(2, "alpha:1.0.0", c, "approved"), version(3, "alpha:0.9.0", c, "approved")];
+        assert_eq!(frozen_at(&tracks, c).map(|v| v.label()), Some("alpha:1.0.0".into()));
+        assert!(frozen_at(&vs, "ffff").is_none());
+    }
+
+    /// Who is served what awaits review: only a request that asked and may.
+    #[test]
+    fn what_awaits_review_is_served_only_to_reviewers() {
+        let c = "3f2c9e1a00112233445566778899aabbccddeeff";
+        let (ok, pending, rejected) = (version(1, "1.0.0", c, "approved"), version(2, "1.1.0", c, "pending"), version(3, "1.2.0", c, "rejected"));
+        let anyone = Reviewer::default();
+        let asked = Reviewer { releases: true, entries: false };
+        assert!(servable(&ok, &anyone) && !servable(&pending, &anyone) && !servable(&rejected, &anyone));
+        assert!(servable(&pending, &asked) && !servable(&rejected, &asked));
+        let invalid = Version { invalid_reason: Some("bad".into()), ..ok.clone() };
+        assert!(!servable(&invalid, &asked));
+        assert!(unreviewed_mark(false).is_none());
+        assert_eq!(unreviewed_mark(true).unwrap().0.as_str(), UNREVIEWED_HEADER);
+    }
 }
