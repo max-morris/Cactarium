@@ -3,9 +3,11 @@
 //! job fetches the URL once (under the outbound-fetch policy, with a size and time limit), checks
 //! the sha256, and keeps only the row: no copy of the file. Admins approve or reject a verified
 //! download on the admin pages, and can reopen a rejected one; trusted users' and admins'
-//! submissions are approved once verified, as their entries are.
+//! submissions are approved once verified, as their entries are. An admin can also approve a
+//! download without the server fetching it (vouched: too big, or on a host the server can't reach).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::Form;
@@ -19,7 +21,7 @@ use cactup_ecosystem_common::api::{
 use serde_json::json;
 
 use crate::audit::audit_with;
-use crate::auth::Admin;
+use crate::auth::{Admin, User};
 use crate::error::{ApiResult, AppError, AppResult};
 use crate::git::{self, GitPolicy};
 use crate::model::fmt_time;
@@ -32,46 +34,82 @@ use crate::web::api::TokenUser;
 pub const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// How long that fetch may take.
 const FETCH_TIME: Duration = Duration::from_secs(15 * 60);
+/// A download still being fetched this long after its fetch started was dropped (its outcome
+/// couldn't be stored, say): the sweep starts it again ([`requeue_stale`]).
+pub const STALE_FETCH: Duration = Duration::from_secs(FETCH_TIME.as_secs() + 15 * 60);
 /// The longest note a submitter may leave for the reviewer.
 const MAX_NOTE_CHARS: usize = 4000;
+/// How many submitted downloads one user may have being fetched at once.
+const MAX_FETCHING_PER_USER: i64 = 3;
+
+/// Downloads fetched at once, on slots of their own (never the mirrors' or the syncs').
+static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// The downloads this process is fetching (or has queued): each is fetched once at a time,
+/// however many submissions, requeues and sweeps ask.
+static IN_FLIGHT: std::sync::LazyLock<Mutex<HashSet<i64>>> = std::sync::LazyLock::new(Default::default);
 
 /// The command that submits a download for review, for messages that refuse a pin to one.
 pub fn submit_command(url: &str) -> String {
     format!("cactup download submit {url}")
 }
 
-/// The review of each (url, sha256), in order: `pending`, `approved`, `rejected`, or `None` when it
-/// was never submitted. The URL is compared as written.
-pub async fn reviews_of(state: &AppState, asked: &[DownloadQuery]) -> AppResult<Vec<Option<String>>> {
+/// What the Cactarium knows of a submitted download.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// `pending`, `approved` or `rejected`.
+    pub review: String,
+    /// `fetching`, `ok` (verified), `failed` or `vouched` (approved by an admin, not fetched).
+    pub fetch_state: String,
+    /// Why the fetch failed, when it did.
+    pub fetch_error: Option<String>,
+}
+
+impl Status {
+    /// Where its verification stands, for a message: "being verified", "verified", "approved
+    /// without being fetched" or "the server couldn't verify it: <why>".
+    pub fn verification(&self) -> String {
+        match (self.fetch_state.as_str(), &self.fetch_error) {
+            ("fetching", _) => "being verified".to_owned(),
+            ("failed", Some(e)) => format!("the server couldn't verify it: {e}"),
+            ("failed", None) => "the server couldn't verify it".to_owned(),
+            ("vouched", _) => "approved by an admin without being fetched".to_owned(),
+            _ => "verified".to_owned(),
+        }
+    }
+}
+
+/// What the Cactarium knows of each (url, sha256), in order; `None` when it was never submitted.
+/// The URL is compared as written.
+pub async fn statuses_of(state: &AppState, asked: &[DownloadQuery]) -> AppResult<Vec<Option<Status>>> {
     if asked.is_empty() {
         return Ok(vec![]);
     }
     let urls: Vec<&str> = asked.iter().map(|d| d.url.trim()).collect();
     let shas: Vec<&str> = asked.iter().map(|d| d.sha256.as_str()).collect();
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT d.url, d.sha256, d.review FROM downloads d
+    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT d.url, d.sha256, d.review, d.fetch_state, d.fetch_error FROM downloads d
          JOIN UNNEST($1::text[], $2::text[]) AS a(url, sha256) ON a.url = d.url AND a.sha256 = d.sha256",
     )
     .bind(&urls)
     .bind(&shas)
     .fetch_all(&state.db)
     .await?;
-    let known: HashMap<(String, String), String> = rows.into_iter().map(|(u, s, r)| ((u, s), r)).collect();
-    Ok(asked
-        .iter()
-        .map(|d| known.get(&(d.url.trim().to_owned(), d.sha256.clone())).cloned())
-        .collect())
+    let known: HashMap<(String, String), Status> = rows
+        .into_iter()
+        .map(|(u, s, review, fetch_state, fetch_error)| ((u, s), Status { review, fetch_state, fetch_error }))
+        .collect();
+    Ok(asked.iter().map(|d| known.get(&(d.url.trim().to_owned(), d.sha256.clone())).cloned()).collect())
 }
 
-/// The review of one download, if it was submitted.
-pub async fn review_of(state: &AppState, url: &str, sha256: &str) -> AppResult<Option<String>> {
+/// What the Cactarium knows of one download, if it was submitted.
+pub async fn status_of(state: &AppState, url: &str, sha256: &str) -> AppResult<Option<Status>> {
     let asked = [DownloadQuery { url: url.to_owned(), sha256: sha256.to_owned() }];
-    Ok(reviews_of(state, &asked).await?.pop().flatten())
+    Ok(statuses_of(state, &asked).await?.pop().flatten())
 }
 
-/// Checks a submission's fields before anything is fetched.
-fn validate(s: &DownloadSubmission) -> AppResult<()> {
-    let url = s.url.trim();
+/// Checks a download's fields (a submission's, or one an admin approves) before anything else.
+fn validate(url: &str, sha256: &str, note: Option<&str>) -> AppResult<()> {
     if url.is_empty() {
         return Err(AppError::bad("give the download's url"));
     }
@@ -84,44 +122,42 @@ fn validate(s: &DownloadSubmission) -> AppResult<()> {
         Ok(u) if matches!(u.scheme(), "https" | "http") && u.host_str().is_some() => {}
         _ => return Err(AppError::bad(format!("'{url}' is no https:// URL"))),
     }
-    if s.sha256.len() != 64 || !s.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(AppError::bad(format!("'{}' is not a sha256 (64 lowercase hex digits)", s.sha256)));
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(AppError::bad(format!("'{sha256}' is not a sha256 (64 lowercase hex digits)")));
     }
-    if s.note.as_deref().is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS) {
+    if note.is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS) {
         return Err(AppError::bad(format!("the note is longer than {MAX_NOTE_CHARS} characters")));
     }
     Ok(())
 }
 
-/// How many submitted downloads one user may have being fetched at once.
-const MAX_FETCHING_PER_USER: i64 = 3;
-
-/// Downloads fetched at once, on slots of their own (never the mirrors' or the syncs').
-static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-
 /// `POST /downloads`: stores the submission and answers at once, `pending`; a background job
 /// fetches the URL and checks its sha256 ([`verify`]), and only then can it be decided (a trusted
-/// user's or an admin's is approved then). One submitted before is answered 409 with its review,
-/// unless its fetch failed: then this submission tries it again.
+/// user's or an admin's is approved then). One submitted before is answered 409 with its review
+/// and where its verification stands. One whose fetch failed is tried again, and the 409 says why
+/// the last try failed.
 pub async fn submit(
     State(state): State<AppState>,
     TokenUser(user): TokenUser,
     ip: ClientIp,
     Json(s): Json<DownloadSubmission>,
 ) -> ApiResult<Response> {
-    validate(&s)?;
     let url = s.url.trim().to_owned();
-    let known: Option<(i64, String, String)> =
-        sqlx::query_as("SELECT id, review, fetch_state FROM downloads WHERE url = $1 AND sha256 = $2")
-            .bind(&url)
-            .bind(&s.sha256)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(AppError::from)?;
-    if let Some((id, review, fetch)) = &known
-        && fetch != "failed"
+    let note = s.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    validate(&url, &s.sha256, note)?;
+    let known: Option<(i64, Status)> = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        "SELECT id, review, fetch_state, fetch_error FROM downloads WHERE url = $1 AND sha256 = $2",
+    )
+    .bind(&url)
+    .bind(&s.sha256)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::from)?
+    .map(|(id, review, fetch_state, fetch_error)| (id, Status { review, fetch_state, fetch_error }));
+    if let Some((id, st)) = &known
+        && st.fetch_state != "failed"
     {
-        return Ok(conflict(DownloadReview { id: *id, review: review.clone() }));
+        return Ok(conflict(*id, st, None));
     }
     // Each fetch downloads the whole file: a few per user an hour, and a few at once.
     state.limiter.check_user("download-submit", user.id, 10, Duration::from_secs(3600))?;
@@ -135,19 +171,17 @@ pub async fn submit(
         return Err(AppError::bad(format!("you have {fetching} downloads being fetched; submit more once they are checked")).into());
     }
     let auto = crate::publish::skips_review(&user);
-    let note = s.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
     let mut tx = state.db.begin().await.map_err(AppError::from)?;
-    let id: Option<i64> = match known {
-        // A failed fetch is tried again, as this user's submission.
-        Some((id, _, _)) => sqlx::query_scalar(
-            "UPDATE downloads SET fetch_state = 'fetching', fetch_error = NULL, submitter = $2, auto_approve = $3,
-                    note = COALESCE($4, note), created_at = now()
+    let id: Option<i64> = match &known {
+        // A failed fetch is tried again. The row keeps its submitter and note; a trusted or admin
+        // retrier makes it approved once verified, as their own submission would be.
+        Some((id, _)) => sqlx::query_scalar(
+            "UPDATE downloads SET fetch_state = 'fetching', fetch_error = NULL, fetch_started_at = now(),
+                    auto_approve = auto_approve OR $2
              WHERE id = $1 AND fetch_state = 'failed' RETURNING id",
         )
         .bind(id)
-        .bind(user.id)
         .bind(auto)
-        .bind(note)
         .fetch_optional(&mut *tx)
         .await
         .map_err(AppError::from)?,
@@ -164,31 +198,70 @@ pub async fn submit(
         .await
         .map_err(AppError::from)?,
     };
-    let retry = known.is_some();
     let Some(id) = id else {
         // Submitted (or retried) by another request meanwhile.
         drop(tx);
-        let row: (i64, String) = sqlx::query_as("SELECT id, review FROM downloads WHERE url = $1 AND sha256 = $2")
-            .bind(&url)
-            .bind(&s.sha256)
-            .fetch_one(&state.db)
-            .await
-            .map_err(AppError::from)?;
-        return Ok(conflict(DownloadReview { id: row.0, review: row.1 }));
+        let id = row_id(&state, &url, &s.sha256).await?;
+        let st = status_of(&state, &url, &s.sha256).await?.ok_or(AppError::NotFound)?;
+        return Ok(conflict(id, &st, None));
     };
-    audit_with(&mut tx, Some(user.id), "download.submit", Some(&url), json!({ "id": id, "sha256": s.sha256, "retry": retry }), ip.0).await?;
+    let action = if known.is_some() { "download.retry" } else { "download.submit" };
+    audit_with(&mut tx, Some(user.id), action, Some(&url), json!({ "id": id, "sha256": s.sha256 }), ip.0).await?;
     tx.commit().await.map_err(AppError::from)?;
     spawn_verify(state.clone(), id);
-    Ok(Json(DownloadReview { id, review: "pending".to_owned() }).into_response())
+    match known {
+        // Known, and being verified again now: the 409 says why the last try failed.
+        Some((_, st)) => {
+            let now = Status { review: st.review.clone(), fetch_state: "fetching".into(), fetch_error: None };
+            Ok(conflict(id, &now, st.fetch_error.as_deref()))
+        }
+        None => Ok(Json(DownloadReview { id, review: "pending".to_owned() }).into_response()),
+    }
 }
 
-/// Verifies a submitted download in the background ([`verify`]).
+async fn row_id(state: &AppState, url: &str, sha256: &str) -> AppResult<i64> {
+    Ok(sqlx::query_scalar("SELECT id FROM downloads WHERE url = $1 AND sha256 = $2")
+        .bind(url)
+        .bind(sha256)
+        .fetch_one(&state.db)
+        .await?)
+}
+
+/// The words of the 409 answer to a download submitted before: its review and where its
+/// verification stands, and, for one tried again now, why the last try failed.
+fn conflict_message(id: i64, st: &Status, last_failure: Option<&str>) -> String {
+    match last_failure {
+        Some(why) => format!("already submitted (#{id}, {}); the server couldn't verify it ({why}), so it is being verified again now", st.review),
+        None => format!("already submitted (#{id}, {}; {})", st.review, st.verification()),
+    }
+}
+
+/// The 409 answer to a download submitted before: an error that also carries its review.
+fn conflict(id: i64, st: &Status, last_failure: Option<&str>) -> Response {
+    let body = DownloadConflict {
+        error: ErrorDetail { code: "conflict".into(), message: conflict_message(id, st, last_failure) },
+        known: DownloadReview { id, review: st.review.clone() },
+    };
+    (StatusCode::CONFLICT, Json(body)).into_response()
+}
+
+/// Verifies a submitted download in the background ([`verify`]), unless this process already is.
 pub fn spawn_verify(state: AppState, id: i64) {
+    if !IN_FLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id) {
+        return;
+    }
     tokio::spawn(async move {
         if let Err(e) = verify(&state, id).await {
             tracing::warn!("verifying download #{id}: {e}");
         }
+        IN_FLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
     });
+}
+
+/// Why a fetched file isn't the download submitted: its content has another sha256 (the commonest
+/// failure). The actual sha256 is told: the file is public.
+fn wrong_sha(actual: &str, submitted: &str) -> String {
+    format!("the file's sha256 is {actual}, not {submitted} (the file changed, or the sha256 submitted is wrong)")
 }
 
 /// Fetches a submitted download once, on one of [`FETCHES`], under the outbound-fetch policy and
@@ -196,16 +269,17 @@ pub fn spawn_verify(state: AppState, id: i64) {
 /// submitter), or `failed` with why. A row no longer being fetched is left alone.
 pub async fn verify(state: &AppState, id: i64) -> AppResult<()> {
     let _slot = FETCHES.acquire().await.map_err(anyhow::Error::from)?;
-    let row: Option<(String, String)> = sqlx::query_as("SELECT url, sha256 FROM downloads WHERE id = $1 AND fetch_state = 'fetching'")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT url, sha256 FROM downloads WHERE id = $1 AND fetch_state = 'fetching'")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
     let Some((url, want)) = row else { return Ok(()) };
     let policy = GitPolicy { allow_local: state.cfg.allow_local_repos };
     let outcome = match git::fetch_and_hash(policy, &url, MAX_DOWNLOAD_BYTES, FETCH_TIME).await {
         Ok(got) if got.sha256 == want => Ok(got.size),
-        Ok(got) => Err(format!("{url} has sha256 {}, not {want} (the file changed, or the sha256 is wrong)", got.sha256)),
-        Err(e) => Err(format!("cannot fetch {url}: {e:#}")),
+        Ok(got) => Err(wrong_sha(&got.sha256, &want)),
+        Err(e) => Err(format!("cannot fetch it: {e:#}")),
     };
     let mut tx = state.db.begin().await?;
     let (action, details) = match &outcome {
@@ -237,9 +311,21 @@ pub async fn verify(state: &AppState, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// Starts verifying again every download a stopped server left being fetched.
+/// Starts verifying again every download a stopped server left being fetched (at startup).
 pub async fn requeue(state: &AppState) -> AppResult<usize> {
-    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM downloads WHERE fetch_state = 'fetching' ORDER BY created_at")
+    requeue_where(state, "fetch_state = 'fetching'").await
+}
+
+/// Starts verifying again the downloads still being fetched [`STALE_FETCH`] after their fetch
+/// started: their outcome was never stored (the sweep runs this hourly). One this process is
+/// still fetching is left to it.
+pub async fn requeue_stale(state: &AppState) -> AppResult<usize> {
+    requeue_where(state, &format!("fetch_state = 'fetching' AND fetch_started_at < now() - interval '{} seconds'", STALE_FETCH.as_secs()))
+        .await
+}
+
+async fn requeue_where(state: &AppState, cond: &str) -> AppResult<usize> {
+    let ids: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM downloads WHERE {cond} ORDER BY fetch_started_at"))
         .fetch_all(&state.db)
         .await?;
     for id in &ids {
@@ -248,13 +334,39 @@ pub async fn requeue(state: &AppState) -> AppResult<usize> {
     Ok(ids.len())
 }
 
-/// The 409 answer to a download submitted before: an error that also carries its review.
-fn conflict(known: DownloadReview) -> Response {
-    let body = DownloadConflict {
-        error: ErrorDetail { code: "conflict".into(), message: format!("already submitted (#{}, {})", known.id, known.review) },
-        known,
+/// Approves a download without the server fetching it, as `admin` vouching for it (one too big
+/// for the fetch, or on a host the server can't reach): a new row, or one awaiting review, whose
+/// fetch failed or that was rejected, becomes approved with `fetch_state = 'vouched'` and no size.
+/// The audit log says it wasn't verified. Returns the row's id.
+pub async fn vouch(state: &AppState, admin: &User, url: &str, sha256: &str, note: Option<&str>) -> AppResult<i64> {
+    if !admin.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    let url = url.trim();
+    let note = note.map(str::trim).filter(|n| !n.is_empty());
+    validate(url, sha256, note)?;
+    let mut tx = state.db.begin().await?;
+    let id: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO downloads (url, sha256, note, fetch_state, review, submitter, reviewer, review_note, decided_at)
+         VALUES ($1, $2, $3, 'vouched', 'approved', $4, $4, $3, now())
+         ON CONFLICT (url, sha256) DO UPDATE SET fetch_state = 'vouched', fetch_error = NULL, review = 'approved',
+             reviewer = $4, review_note = COALESCE($3, downloads.review_note), decided_at = now()
+         WHERE downloads.review <> 'approved'
+         RETURNING id",
+    )
+    .bind(url)
+    .bind(sha256)
+    .bind(note)
+    .bind(admin.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(id) = id else {
+        return Err(AppError::Conflict(format!("{url} with that sha256 is approved already")));
     };
-    (StatusCode::CONFLICT, Json(body)).into_response()
+    audit_with(&mut tx, Some(admin.id), "download.vouch", Some(url), json!({ "id": id, "sha256": sha256, "verified": false, "note": note }), None)
+        .await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// A row of the admin page's query.
@@ -277,7 +389,8 @@ const ADMIN_COLS: &str =
     "d.id, d.url, d.sha256, d.size, d.fetch_state, d.fetch_error, d.note, d.review, d.review_note, s.username, r.username, d.created_at";
 
 /// `/admin/downloads`: every download awaiting review, oldest first (those still being fetched,
-/// or whose fetch failed, with why), then the latest decided ones.
+/// or whose fetch failed, with why), then the latest decided ones; and the form that approves one
+/// without fetching it.
 pub async fn admin_page(State(state): State<AppState>, Admin(a): Admin) -> AppResult<Response> {
     let from = "FROM downloads d LEFT JOIN users s ON s.id = d.submitter LEFT JOIN users r ON r.id = d.reviewer";
     let mut rows: Vec<Row> =
@@ -296,7 +409,7 @@ pub async fn admin_page(State(state): State<AppState>, Admin(a): Admin) -> AppRe
             id,
             url,
             sha256,
-            size: size.map(human_size).unwrap_or_default(),
+            size: size.map(human_size).unwrap_or_else(|| "size unknown".to_owned()),
             fetch: fetch_state,
             fetch_error: fetch_error.unwrap_or_default(),
             note: note.unwrap_or_default(),
@@ -311,12 +424,26 @@ pub async fn admin_page(State(state): State<AppState>, Admin(a): Admin) -> AppRe
         .into_response())
 }
 
+/// `POST /admin/downloads/vouch`: approves a download without fetching it ([`vouch`]).
+pub async fn admin_vouch(
+    State(state): State<AppState>,
+    Admin(a): Admin,
+    Form(f): Form<HashMap<String, String>>,
+) -> AppResult<Response> {
+    a.session.check_csrf(f.get("_csrf").map(String::as_str).unwrap_or(""))?;
+    let get = |k: &str| f.get(k).map(|v| v.trim().to_owned()).unwrap_or_default();
+    let note = get("note");
+    vouch(&state, &a.user, &get("url"), &get("sha256"), Some(note.as_str())).await?;
+    Ok(Redirect::to("/admin/downloads").into_response())
+}
+
 /// What an admin's decision does to a download in `review`: the new review, or why it can't be
 /// made. A verified download awaiting review is approved or rejected; a rejected one is reopened
-/// (back to pending) or approved at once. A download not verified yet can't be decided.
+/// (back to pending) or approved at once. A download not verified yet can't be decided (an admin
+/// approves one without fetching it with [`vouch`]).
 fn decision(review: &str, fetch: &str, decision: &str) -> Result<&'static str, String> {
     if fetch != "ok" {
-        return Err("this download isn't verified yet (its fetch is still running, or failed): it can be decided once it is".into());
+        return Err("this download isn't verified (its fetch is still running, or failed): it can be decided once it is, or approved without fetching it".into());
     }
     match (review, decision) {
         ("pending" | "rejected", "approve") => Ok("approved"),
@@ -395,23 +522,18 @@ fn human_size(n: i64) -> String {
 mod tests {
     use super::*;
 
-    fn sub(url: &str, sha: &str) -> DownloadSubmission {
-        DownloadSubmission { url: url.into(), sha256: sha.into(), note: None }
-    }
-
     #[test]
     fn submissions_are_checked_before_fetching() {
         let sha = "ab".repeat(32);
-        assert!(validate(&sub("https://x.org/id.tar.gz", &sha)).is_ok());
-        assert!(validate(&sub(" ", &sha)).is_err());
-        assert!(validate(&sub("file:///etc/hostname", &sha)).is_err(), "no fetchable URL");
-        assert!(validate(&sub("not a url", &sha)).is_err());
-        assert!(validate(&sub("https://x.org/a", &sha.to_uppercase())).is_err(), "lowercase hex");
-        assert!(validate(&sub("https://x.org/a", "abc")).is_err());
+        assert!(validate("https://x.org/id.tar.gz", &sha, None).is_ok());
+        assert!(validate("", &sha, None).is_err());
+        assert!(validate("file:///etc/hostname", &sha, None).is_err(), "no fetchable URL");
+        assert!(validate("not a url", &sha, None).is_err());
+        assert!(validate("https://x.org/a", &sha.to_uppercase(), None).is_err(), "lowercase hex");
+        assert!(validate("https://x.org/a", "abc", None).is_err());
         let long = format!("https://x.org/{}", "a".repeat(MAX_LOOKUP_URL_BYTES));
-        assert!(validate(&sub(&long, &sha)).is_err());
-        let chatty = DownloadSubmission { note: Some("x".repeat(MAX_NOTE_CHARS + 1)), ..sub("https://x.org/a", &sha) };
-        assert!(validate(&chatty).is_err());
+        assert!(validate(&long, &sha, None).is_err());
+        assert!(validate("https://x.org/a", &sha, Some(&"x".repeat(MAX_NOTE_CHARS + 1))).is_err());
     }
 
     /// Only a verified download is decided: one awaiting review is approved or rejected, a
@@ -425,18 +547,29 @@ mod tests {
         for (review, asked) in [("approved", "reject"), ("approved", "reopen"), ("approved", "approve"), ("pending", "reopen"), ("rejected", "reject")] {
             assert!(decision(review, "ok", asked).is_err(), "{review} {asked}");
         }
-        for fetch in ["fetching", "failed"] {
+        for fetch in ["fetching", "failed", "vouched"] {
             let e = decision("pending", fetch, "approve").unwrap_err();
-            assert!(e.contains("isn't verified yet"), "{e}");
+            assert!(e.contains("isn't verified"), "{e}");
         }
     }
 
+    /// A submitter learns where verification stands, and why a fetch failed.
     #[test]
-    fn the_conflict_reads_as_an_error_and_a_review() {
-        let r = conflict(DownloadReview { id: 7, review: "approved".into() });
+    fn the_conflict_says_where_verification_stands() {
+        let st = |fetch: &str, error: Option<&str>| Status { review: "pending".into(), fetch_state: fetch.into(), fetch_error: error.map(Into::into) };
+        assert_eq!(conflict_message(7, &st("fetching", None), None), "already submitted (#7, pending; being verified)");
+        assert_eq!(conflict_message(7, &st("ok", None), None), "already submitted (#7, pending; verified)");
+        let why = wrong_sha(&"ab".repeat(32), &"cd".repeat(32));
+        assert!(why.starts_with(&format!("the file's sha256 is {}, not {}", "ab".repeat(32), "cd".repeat(32))), "{why}");
+        assert_eq!(st("failed", Some(&why)).verification(), format!("the server couldn't verify it: {why}"));
+        let retried = conflict_message(7, &st("fetching", None), Some(&why));
+        assert!(retried.contains(&why) && retried.contains("being verified again now"), "{retried}");
+        assert!(st("vouched", None).verification().contains("without being fetched"));
+        let r = conflict(7, &st("ok", None), None);
         assert_eq!(r.status(), StatusCode::CONFLICT);
         assert_eq!(submit_command("https://x.org/a"), "cactup download submit https://x.org/a");
         assert_eq!(human_size(1_500_000), "1.5 MB");
         assert_eq!(human_size(12), "12 bytes");
+        assert_eq!(STALE_FETCH, Duration::from_secs(30 * 60));
     }
 }

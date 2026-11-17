@@ -78,7 +78,14 @@ say `x-cactarium-unreviewed: true`.
   submits it, a background job fetches it once to check the sha256 (keeping no copy; rows left
   fetching by a restart are fetched again at startup), and an admin decides it under Admin,
   Downloads once verified. A rejected download can be reopened or approved there; a tag that froze
-  invalid over it is read again with `reread`.
+  invalid over it is read again with `reread`. A submitter learns where verification stands from
+  the 409 for a known download (a failed one is tried again, and its 409 says why the last try
+  failed, such as "the file's sha256 is X, not Y"), and from the refusal of a sim that pins it.
+  Rows left being fetched past the fetch's time limit are fetched again by the hourly sweep. An
+  admin can approve a download without the server fetching it (too big, or on a host it can't
+  reach): Admin, Downloads, *Approve without fetching*, or `cactarium download approve <admin>
+  <url> <sha256> [--note ...]` (`just cli download approve ...`); its size is unknown and the
+  audit log records that it wasn't verified.
 - A package version (or stack release) whose dependency resolves to a version awaiting review, or
   to a package that isn't public, waits (left unread, retried) until it is reviewed; stack
   releases' dependencies are checked like packages', but for the CCL.
@@ -91,7 +98,7 @@ proxies to the app, which Docker Compose publishes on loopback only. Copy `deplo
 migrates and restarts.
 
 Server-side commands run in the app container with `just cli ...`:
-`admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
+`admin grant|revoke|trust|untrust|list`, `download approve <admin> <url> <sha256> [--note ...]`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>] [--only <name>]...`, `check <url> [--tag <tag>
 [--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`), `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.

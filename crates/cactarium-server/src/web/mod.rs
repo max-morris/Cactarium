@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/curated/{id}/hand-over", post(admin::hand_over))
         .route("/admin/curated/{id}/reapply", post(admin::reapply))
         .route("/admin/downloads", get(downloads::admin_page))
+        .route("/admin/downloads/vouch", post(downloads::admin_vouch))
         .route("/admin/downloads/{id}", post(downloads::admin_decide))
         .route("/admin/tags", get(admin::tags))
         .route("/admin/tags/{id}/ack", post(admin::ack_tag))

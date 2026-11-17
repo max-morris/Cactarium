@@ -2314,29 +2314,41 @@ s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": "0" * 64}, BOB)
 bad_id = r.get("id")
 check("a submission is answered at once, pending", s == 200 and r.get("review") == "pending" and bad_id, r)
 st = until_fetched(bad_id)
-check("its fetch in the background finds another sha256, and fails saying so", st.startswith("failed|pending|") and css_sha in st, st)
+check("its fetch in the background finds another sha256, and fails saying so",
+      st.startswith("failed|pending|") and f"the file's sha256 is {css_sha}, not {'0' * 64}" in st, st)
 text = page(maxv, "/admin/downloads", contains="fetch failed")
 check("the admin page shows the failed fetch and why, with no decision to make",
       css_sha in text and f'action="/admin/downloads/{bad_id}"' not in text)
 s, _, _ = maxv.post(f"/admin/downloads/{bad_id}", {"decision": "approve"})
 check("a download not verified can't be decided", s == 409, s)
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": "0" * 64}, BOB)
-check("submitting a failed one again tries it again", s == 200 and r.get("id") == bad_id and r.get("review") == "pending", r)
+check("submitting a failed one again tries it again, the 409 saying why the last try failed",
+      s == 409 and r.get("id") == bad_id and r.get("review") == "pending" and "the file's sha256 is" in r["error"]["message"]
+      and "being verified again now" in r["error"]["message"], r)
 check("and it fails again", until_fetched(bad_id).startswith("failed|"))
+s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": "0" * 64}, MAXAUTH)
+check("an admin retries bob's failed download", s == 409 and r.get("id") == bad_id, r)
+check("the row keeps its submitter and note, and the retry is recorded as the admin's",
+      psql(f"SELECT s.username FROM downloads d JOIN users s ON s.id = d.submitter WHERE d.id = {bad_id}") == "bob"
+      and psql(f"SELECT count(*) FROM audit_log a JOIN users u ON u.id = a.actor WHERE a.action = 'download.retry' AND u.username = 'max' AND a.details->>'id' = '{bad_id}'") == "1")
+check("which fails once more", until_fetched(bad_id).startswith("failed|pending|"))
 s, r, _ = api("POST", "/downloads", {"url": "file:///etc/hostname", "sha256": css_sha}, BOB)
 check("a URL no fetch could read is refused at once", s == 400 and "https://" in r["error"]["message"], r)
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha, "note": "the site's stylesheet"}, BOB)
 did = r.get("id")
 check("bob submits a download: pending", s == 200 and r.get("review") == "pending" and did, r)
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha}, BOB)
-check("submitting it again is a 409 that carries its review",
-      s == 409 and r.get("id") == did and r.get("review") == "pending" and r["error"]["code"] == "conflict", r)
+check("submitting it again is a 409 that carries its review and where verification stands",
+      s == 409 and r.get("id") == did and r.get("review") == "pending" and r["error"]["code"] == "conflict" and "verified" in r["error"]["message"], r)
 check("its fetch verifies it, still pending review", until_fetched(did) == "ok|pending|", download_state(did))
 s, r, _ = api("POST", "/lookup", {"pins": [], "downloads": [{"url": css_url, "sha256": css_sha}]})
 check("the lookup says it is pending", s == 200 and r["downloads"][0]["review"] == "pending" and r["pins"] == [], r)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
 check("a sim pinning a download that isn't approved is refused, naming the command",
       s == 400 and f"cactup download submit {css_url}" in body and "awaits review" in body, f"{s} {body[:400]}")
+s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.replace(css_sha, "0" * 64).encode(), headers=MAXAUTH)
+check("a sim pinning a download the server couldn't verify says why",
+      s == 400 and f"the server couldn't verify {css_url}" in body and "the file's sha256 is" in body, f"{s} {body[:400]}")
 page(bob, "/admin/downloads", expect=403)
 text = page(maxv, "/admin/downloads", contains=css_url)
 s, _, _ = maxv.post(f"/admin/downloads/{did}", {"decision": "approve", "note": "ours"})
@@ -2505,6 +2517,24 @@ check("and approves it", s == 303 and download_state(sid).startswith("ok|approve
 ok, out = cli("reread", "max", "max/dlrepo", "1.1.0")
 check("reread reads the invalid tag again: valid now", ok and "reads cleanly now" in out and has_version(anon, "max/dlrepo", "1.1.0")
       and psql("SELECT state FROM versions v JOIN entries e ON e.id = v.entry_id WHERE e.name = 'dlrepo' AND v.version = '1.1.0'") == "ok", out[-300:])
+
+# An admin approves a download without the server fetching it: on the admin page, and from the CLI.
+huge, huge_sha = "https://example.invalid/huge.tar.gz", "ab" * 32
+maxv.get("/admin/downloads")
+s, _, _ = maxv.post("/admin/downloads/vouch", {"url": huge, "sha256": huge_sha, "note": "40 GB, from the paper's site"})
+check("an admin approves a download without fetching it", s == 303
+      and psql(f"SELECT fetch_state || '|' || review || '|' || COALESCE(size::text, 'unknown') FROM downloads WHERE url = '{huge}'") == "vouched|approved|unknown")
+check("the audit log says it wasn't verified",
+      psql(f"SELECT details->>'verified' FROM audit_log WHERE action = 'download.vouch' AND target = '{huge}'") == "false")
+page(maxv, "/admin/downloads", contains="approved without fetching")
+s, r, _ = api("POST", "/lookup", {"downloads": [{"url": huge, "sha256": huge_sha}]})
+check("the lookup says it is approved", r.get("downloads", [{}])[0].get("review") == "approved", r)
+s, _, _ = maxv.post("/admin/downloads/vouch", {"url": huge, "sha256": huge_sha})
+check("one approved already can't be vouched again", s == 409, s)
+ok, out = cli("download", "approve", "max", css_url, "0" * 64, "--note", "vouched from the CLI")
+check("the CLI approves a download whose fetch failed, without fetching it", ok and download_state(bad_id).startswith("vouched|approved"), out[-300:])
+ok, out = cli("download", "approve", "bob", "https://example.invalid/x.tar.gz", huge_sha)
+check("only an admin vouches", not ok and "not an admin" in out, out[-300:])
 
 # A restart: a repo key a previous server left stale is recomputed, and a download left being
 # fetched is fetched again.
