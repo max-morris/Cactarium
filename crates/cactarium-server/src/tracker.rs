@@ -590,10 +590,8 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>, 
         }
     }
     drop(mirrors);
-    if new.is_empty() && skipped.is_empty() {
-        let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
-        return Err(AppError::bad(format!("{url} already has every entry its manifests give: {}; nothing to add", list.join(", "))));
-    }
+    // Nothing new and nothing left out: the plan is the entries already there
+    // ([`nothing_to_add`] says so to a person).
     let owner = match owner {
         Some(o) => o.to_owned(),
         None => existing
@@ -949,6 +947,16 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
     Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared, waits })
 }
 
+/// What to tell a person registering a repo that has every entry its manifests give, if it has:
+/// every row of the preview is an entry already there. The API answers such a preview as it is.
+pub fn nothing_to_add(p: &Preview) -> Option<String> {
+    if p.entries.iter().any(|e| e.status != "existing") {
+        return None;
+    }
+    let list: Vec<String> = p.entries.iter().map(|e| format!("{} ({})", e.slug, e.file)).collect();
+    Some(format!("{} already has every entry its manifests give: {}; nothing to add", p.url, list.join(", ")))
+}
+
 /// The preview's mark on a release whose manifest file isn't on the default branch anymore.
 fn off_head_note(p: &Planned) -> String {
     if p.off_head {
@@ -979,7 +987,19 @@ pub struct Registered {
     pub entries: Vec<Entry>,
     /// For each entry made: its manifest file, tag and version.
     pub from: Vec<(String, String, String)>,
+    /// Everything to tell the registrant, those below included.
     pub notes: Vec<String>,
+    /// For each entry made: what its first version waits for, and what its first check of tags
+    /// reported.
+    pub entry_notes: Vec<Vec<String>>,
+    /// For each entry made: the versions its first check stored, and how many of them await review.
+    pub counts: Vec<(usize, usize)>,
+    /// The preview it registered from: the entries made, those already on the repo, the manifests
+    /// left out.
+    pub preview: Preview,
+    /// The new entries a preview of the whole repo showed that weren't chosen (by `--only`; empty
+    /// for a confirmed preview, whose caller knows them).
+    pub not_chosen: Vec<PreviewEntry>,
 }
 
 /// Which new entries a registration makes.
@@ -1022,6 +1042,7 @@ pub async fn register(
     };
     // The new entries left out, for the notes.
     let mut left: Vec<String> = Vec::new();
+    let mut not_chosen: Vec<PreviewEntry> = Vec::new();
     let Previewed { preview, plan, prepared, waits } = match choice {
         Choice::All => preview(state, Some(user), Some(&owner), url, at(), None).await?,
         Choice::Names(names) => {
@@ -1038,6 +1059,7 @@ pub async fn register(
                 }
             }
             left = full.plan.new.iter().filter(|p| !names.contains(&p.name)).map(|p| format!("{}/{} ({})", full.plan.owner, p.name, p.file)).collect();
+            not_chosen = full.preview.entries.iter().filter(|e| !e.shown.is_empty() && !files.contains(&e.file)).cloned().collect();
             if files.len() == full.plan.new.len() {
                 full
             } else {
@@ -1072,18 +1094,20 @@ pub async fn register(
     }
     if plan.new.is_empty() {
         let notes: Vec<&str> = plan.skipped.iter().map(|s| s.note.as_str()).collect();
+        let why = nothing_to_add(&preview).unwrap_or_else(|| format!("nothing to register now: {}", notes.join("; ")));
         *refused = Some(preview);
-        return Err(AppError::bad(format!("nothing to register now: {}", notes.join("; "))));
+        return Err(AppError::bad(why));
     }
     let mut notes: Vec<String> = plan.skipped.iter().map(|s| s.note.clone()).collect();
     notes.extend(left.iter().map(|l| format!("{l} isn't registered now: not chosen; register again to add it")));
+    let mut entry_notes: Vec<Vec<String>> = Vec::with_capacity(plan.new.len());
     for (p, r) in plan.new.iter().zip(&prepared) {
-        if let Some(r) = r {
-            let label = format!("{owner}/{}@{}", p.name, p.tv);
-            notes.extend(r.deferred.iter().map(|d| format!("{label} waits: {d}")));
-        }
+        let label = format!("{owner}/{}@{}", p.name, p.tv);
+        let mut mine: Vec<String> = r.iter().flat_map(|r| &r.deferred).map(|d| format!("{label} waits: {d}")).collect();
+        mine.extend(waits.iter().filter(|(l, _)| *l == label).map(|(l, why)| format!("{l} waits: {why}")));
+        notes.extend(mine.iter().cloned());
+        entry_notes.push(mine);
     }
-    notes.extend(waits.iter().map(|(label, why)| format!("{label} waits: {why}")));
     let mut tx = state.db.begin().await?;
     let mut entries = Vec::new();
     let mut from = Vec::new();
@@ -1134,12 +1158,21 @@ pub async fn register(
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
     // The entries exist now, whatever the first sync says: a problem there is reported, kept as the
     // repo's poll error, and the poller tries again.
-    for e in &entries {
+    let mut counts = Vec::with_capacity(entries.len());
+    for (e, mine) in entries.iter().zip(entry_notes.iter_mut()) {
         if let Err(err) = sync_as(state, e, Some(user), Pace::Now).await {
-            notes.push(format!("{}: its first check of tags: {err}", e.slug()));
+            let said = format!("{}: its first check of tags: {err}", e.slug());
+            notes.push(said.clone());
+            mine.push(said);
         }
+        let (stored, pending): (i64, i64) =
+            sqlx::query_as("SELECT count(*), count(*) FILTER (WHERE review = 'pending') FROM versions WHERE entry_id = $1")
+                .bind(e.id)
+                .fetch_one(&state.db)
+                .await?;
+        counts.push((usize::try_from(stored).unwrap_or(0), usize::try_from(pending).unwrap_or(0)));
     }
-    Ok(Registered { entries, from, notes })
+    Ok(Registered { entries, from, notes, entry_notes, counts, preview, not_chosen })
 }
 
 /// Why a preview planned for the files chosen differs from what was shown (`rows`, as
@@ -1238,11 +1271,11 @@ pub async fn check(
     let mut lines = Vec::new();
     let mut clean = true;
     match preview(state, None, owner, url, at, None).await {
+        Ok(p) if nothing_to_add(&p.preview).is_some() => lines.push("nothing new to register".into()),
         Ok(p) => {
             clean = !p.preview.entries.iter().any(|e| e.status == "fails");
             lines.extend(preview_lines(&p.preview));
         }
-        Err(AppError::BadRequest(m)) if m.contains("nothing to add") => lines.push("nothing new to register".into()),
         Err(e) => {
             clean = false;
             lines.push(format!("registering would fail: {e}"));

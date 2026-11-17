@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/lookup", post(lookup::lookup).layer(DefaultBodyLimit::max(LOOKUP_BODY_LIMIT)))
         .route("/providers", get(lookup::providers))
         .route("/whoami", get(api::whoami))
+        .route("/repos", post(api::register_repo))
         .route("/downloads", post(downloads::submit))
         .fallback(api::not_found)
         .layer(SetResponseHeaderLayer::overriding(

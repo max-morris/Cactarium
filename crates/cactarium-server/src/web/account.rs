@@ -139,7 +139,10 @@ pub async fn new_repo(State(state): State<AppState>, s: SignedIn, ip: ClientIp, 
         }
         .await;
         return match result {
-            Ok(p) => repo_page(&state, &s, &url, &owner, &tag, None, Some(p.preview)),
+            Ok(p) => match tracker::nothing_to_add(&p.preview) {
+                Some(m) => repo_page(&state, &s, &url, &owner, &tag, Some(m), None),
+                None => repo_page(&state, &s, &url, &owner, &tag, None, Some(p.preview)),
+            },
             Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
                 repo_page(&state, &s, &url, &owner, &tag, Some(m), None)
             }

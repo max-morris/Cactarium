@@ -12,6 +12,7 @@ use cactup_ecosystem_common::api::{
     Published, Refreshed, ReleaseRequest, Resolved, SHA256_HEADER, StackReleases, ThornInfo,
     UNPINNED_HEADER, UNREVIEWED_HEADER, UNTRUSTED_HEADER, VersionInfo, WhoAmI,
 };
+use cactup_ecosystem_common::api::{RegisterRequest, Registered, RegisteredEntry};
 use cactup_ecosystem_common::ccl::ThornFacts;
 use cactup_ecosystem_common::manifest::{Manifest, STACK_FILE};
 use cactup_ecosystem_common::sim::ThornlistText;
@@ -940,6 +941,211 @@ pub async fn package_refresh(
     }))
 }
 
+/// `POST /repos`: registers the manifests a repo carries as entries, as the site's "register a
+/// repo" and `cactarium register` do (the same preview, the same registration). A dry run answers
+/// with the preview and an `expect` fingerprint; registering with it registers exactly what the
+/// preview showed, or nothing (409 when the repo or the entries on it changed since). Without
+/// `expect`, it registers what a preview would show now, every new entry or those `only` names.
+/// A repo with nothing to add is answered as it is: every entry `existing`.
+pub async fn register_repo(
+    State(state): State<AppState>,
+    TokenUser(user): TokenUser,
+    ip: ClientIp,
+    Json(req): Json<RegisterRequest>,
+) -> ApiResult<Json<Registered>> {
+    // A preview reads the repo as registering does; both count against the user's hourly budget.
+    state.limiter.check_user("register-preview", user.id, state.cfg.previews_per_hour, std::time::Duration::from_secs(3600))?;
+    if req.dry_run || req.expect.is_none() {
+        state.limiter.check("register-preview", ip.0, 60)?;
+    }
+    if !req.dry_run {
+        state.limiter.check("register", ip.0, 10)?;
+    }
+    let owner = tracker::registrant_owner(&state, &user, req.owner.as_deref()).await?;
+    let tag = req.tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let at = || match tag {
+        Some(t) => tracker::At::Tag(t),
+        None => tracker::At::Newest,
+    };
+    let request_id = register_request_id(&req.url, &owner, tag, &req.only);
+    if req.dry_run {
+        // As registering will read it: the full preview, then, when only some entries are chosen,
+        // the preview with only them as new siblings (as their syncs will judge their tags).
+        let full = tracker::preview(&state, Some(&user), Some(&owner), &req.url, at(), None).await?.preview;
+        let (files, others) = chosen_files(&full, &owner, &req.only)?;
+        let shown = if others.is_empty() {
+            full
+        } else {
+            let mut chosen = tracker::preview(&state, Some(&user), Some(&owner), &req.url, at(), Some(&files)).await?.preview;
+            chosen.entries.extend(full.entries.into_iter().filter(|e| others.contains(&e.file)).map(|mut e| {
+                e.status = "skipped";
+                e.note = Some("only leaves it out".to_owned());
+                e.review = None;
+                e
+            }));
+            chosen
+        };
+        // Every planned row, chosen or not: registering says which weren't chosen.
+        let rows: Vec<String> = shown.entries.iter().filter(|e| !e.shown.is_empty()).map(|e| e.shown.clone()).collect();
+        let left: Vec<RegisteredEntry> = shown.entries.iter().filter(|e| others.contains(&e.file)).map(registered_entry).collect();
+        let expect = Expect { id: request_id, files, rows, fingerprint: shown.fingerprint.clone(), left }.encode();
+        return Ok(Json(Registered {
+            entries: shown.entries.iter().map(registered_entry).collect(),
+            warnings: vec![],
+            expect: (tracker::nothing_to_add(&shown).is_none()).then_some(expect),
+        }));
+    }
+    let mut refused = None;
+    let expected = match &req.expect {
+        Some(e) => {
+            let e = Expect::decode(e).ok_or_else(|| AppError::bad("expect is no fingerprint a dry run gave; preview again"))?;
+            if e.id != request_id {
+                return Err(AppError::Conflict(
+                    "expect is from a dry run of another request (url, owner, tag or only differ); preview again".into(),
+                )
+                .into());
+            }
+            Some(e)
+        }
+        None => None,
+    };
+    let choice = match &expected {
+        Some(e) => tracker::Choice::Shown { files: &e.files, rows: &e.rows, fingerprint: &e.fingerprint },
+        None if req.only.is_empty() => tracker::Choice::All,
+        None => tracker::Choice::Names(&req.only),
+    };
+    let done = match tracker::register(&state, &user, &req.url, Some(&owner), tag, choice, &mut refused).await {
+        Ok(done) => done,
+        // Nothing to add: the repo is registered, as asked.
+        Err(AppError::BadRequest(_)) if refused.as_ref().is_some_and(|p| tracker::nothing_to_add(p).is_some()) => {
+            let p = refused.expect("checked above");
+            return Ok(Json(Registered { entries: p.entries.iter().map(registered_entry).collect(), warnings: vec![], expect: None }));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // Every entry on the repo: those made now, with what their first check found, then the rest
+    // as the preview showed them, then the new ones not chosen.
+    let mut entries = Vec::new();
+    for (i, e) in done.entries.iter().enumerate() {
+        let (file, _, _) = &done.from[i];
+        let (stored, pending) = done.counts[i];
+        let mut row = done
+            .preview
+            .entries
+            .iter()
+            .find(|r| &r.file == file && r.status == "new")
+            .map(registered_entry)
+            .unwrap_or_else(|| RegisteredEntry {
+                slug: e.slug(),
+                kind: e.kind.clone(),
+                url: None,
+                file: file.clone(),
+                tag: Some(done.from[i].1.clone()),
+                version: Some(done.from[i].2.clone()),
+                rule: None,
+                review: None,
+                status: "new".into(),
+                note: None,
+                new_versions: 0,
+                awaiting_review: 0,
+                warnings: vec![],
+            });
+        row.url = Some(state.cfg.url(&e.url()));
+        row.new_versions = stored;
+        row.awaiting_review = pending;
+        row.warnings = done.entry_notes[i].clone();
+        entries.push(row);
+    }
+    entries.extend(done.preview.entries.iter().filter(|r| r.status != "new" && r.status != "fails").map(registered_entry));
+    let not_chosen: Vec<RegisteredEntry> = match &expected {
+        Some(e) => e.left.clone(),
+        None => done.not_chosen.iter().map(registered_entry).collect(),
+    };
+    entries.extend(not_chosen.into_iter().map(|mut r| {
+        r.status = "skipped".into();
+        r.note = Some("only leaves it out".into());
+        r.review = None;
+        r
+    }));
+    let attributed: Vec<&String> = done.entry_notes.iter().flatten().collect();
+    let warnings = done.notes.iter().filter(|n| !attributed.contains(n)).cloned().collect();
+    Ok(Json(Registered { entries, warnings, expect: None }))
+}
+
+/// A preview row in the API's words: a new entry's review is `pending` (its versions wait for an
+/// admin's review) or `approved`, as `VersionInfo::review` says it.
+fn registered_entry(e: &tracker::PreviewEntry) -> RegisteredEntry {
+    RegisteredEntry {
+        slug: e.slug.clone(),
+        kind: e.kind.clone(),
+        url: None,
+        file: e.file.clone(),
+        tag: e.tag.clone(),
+        version: e.version.clone(),
+        rule: e.rule.clone(),
+        review: e.review.as_deref().map(|r| if r == "auto-approved" { "approved" } else { "pending" }.to_owned()),
+        status: e.status.to_owned(),
+        note: e.note.clone(),
+        new_versions: 0,
+        awaiting_review: 0,
+        warnings: vec![],
+    }
+}
+
+/// The manifest files of the new (or failing) entries `only` names (by manifest name), and those
+/// of the others; every one when `only` is empty. A name that is no new entry here is refused.
+fn chosen_files(p: &tracker::Preview, owner: &str, only: &[String]) -> ApiResult<(Vec<String>, Vec<String>)> {
+    let planned: Vec<&tracker::PreviewEntry> = p.entries.iter().filter(|e| !e.shown.is_empty()).collect();
+    if only.is_empty() {
+        return Ok((planned.iter().map(|e| e.file.clone()).collect(), vec![]));
+    }
+    for name in only {
+        if !planned.iter().any(|e| e.slug == format!("{owner}/{name}")) {
+            let new: Vec<&str> = planned.iter().map(|e| e.slug.rsplit('/').next().unwrap_or("")).collect();
+            return Err(AppError::bad(format!("no new entry named '{name}' to register (new here: {})", new.join(", "))).into());
+        }
+    }
+    let (chosen, others): (Vec<&tracker::PreviewEntry>, Vec<&tracker::PreviewEntry>) =
+        planned.into_iter().partition(|e| only.iter().any(|n| e.slug == format!("{owner}/{n}")));
+    Ok((chosen.iter().map(|e| e.file.clone()).collect(), others.iter().map(|e| e.file.clone()).collect()))
+}
+
+/// Which registration request a dry run answered: its URL, owner, tag and `only`.
+fn register_request_id(url: &str, owner: &str, tag: Option<&str>, only: &[String]) -> String {
+    use sha2::Digest;
+    let mut only = only.to_vec();
+    only.sort();
+    let text = format!("{}\n{owner}\n{}\n{}", url.trim(), tag.unwrap_or(""), only.join(","));
+    hex::encode(&sha2::Sha256::digest(text.as_bytes())[..8])
+}
+
+/// What a dry run showed, as `RegisterRequest::expect` carries it back: the request it answered,
+/// the manifest files chosen, each row as shown (`PreviewEntry::shown`), and the fingerprint of the
+/// entries already on the repo. Registering checks them all against the repo as it is then, so a
+/// changed one is never trusted.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Expect {
+    id: String,
+    files: Vec<String>,
+    rows: Vec<String>,
+    fingerprint: String,
+    /// The new entries `only` left out, as the dry run showed them (for the answer).
+    left: Vec<RegisteredEntry>,
+}
+
+impl Expect {
+    fn encode(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    fn decode(s: &str) -> Option<Expect> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
 /// `GET /whoami`: who the bearer token belongs to.
 pub async fn whoami(TokenUser(user): TokenUser) -> Json<WhoAmI> {
     let admin = user.is_admin();
@@ -1008,5 +1214,68 @@ pub(crate) mod tests {
         assert!(!servable(&invalid, &asked));
         assert!(unreviewed_mark(false).is_none());
         assert_eq!(unreviewed_mark(true).unwrap().0.as_str(), UNREVIEWED_HEADER);
+    }
+
+    fn row(slug: &str, file: &str, status: &'static str, review: Option<&str>) -> tracker::PreviewEntry {
+        tracker::PreviewEntry {
+            slug: slug.into(),
+            kind: "package".into(),
+            file: file.into(),
+            tag: Some("v1.0.0".into()),
+            version: Some("1.0.0".into()),
+            rule: Some("tags vX.Y.Z".into()),
+            review: review.map(Into::into),
+            status,
+            note: None,
+            shown: if matches!(status, "new" | "fails") { format!("{file}|v1.0.0|c|1.0.0|{status}") } else { String::new() },
+        }
+    }
+
+    /// The API says `pending` or `approved` where the server's preview says `reviewed` or
+    /// `auto-approved`.
+    #[test]
+    fn registration_rows_in_the_api_words() {
+        assert_eq!(registered_entry(&row("et/a", "cactarium.toml", "new", Some("reviewed"))).review.as_deref(), Some("pending"));
+        assert_eq!(registered_entry(&row("et/a", "cactarium.toml", "new", Some("auto-approved"))).review.as_deref(), Some("approved"));
+        let existing = registered_entry(&row("et/b", "cactarium-sim.toml", "existing", None));
+        assert_eq!((existing.status.as_str(), existing.review, existing.url), ("existing", None, None));
+    }
+
+    /// `only` names manifests; the rest of the new entries are the others. A name that is no new
+    /// entry is refused.
+    #[test]
+    fn only_chooses_by_manifest_name() {
+        let p = tracker::Preview {
+            url: "https://x.org/r".into(),
+            owner: "et".into(),
+            entries: vec![
+                row("et/cottonmouth", "cactarium.toml", "new", Some("reviewed")),
+                row("et/cottonmouth-sims", "cactarium-sim.toml", "new", Some("reviewed")),
+                row("et/old", "cactarium-stack.toml", "existing", None),
+            ],
+            fingerprint: "f".into(),
+        };
+        let (all, none) = chosen_files(&p, "et", &[]).unwrap();
+        assert_eq!((all.len(), none.len()), (2, 0));
+        let (chosen, others) = chosen_files(&p, "et", &["cottonmouth".into()]).unwrap();
+        assert_eq!((chosen, others), (vec!["cactarium.toml".to_owned()], vec!["cactarium-sim.toml".to_owned()]));
+        assert!(chosen_files(&p, "et", &["old".into()]).is_err(), "already registered");
+    }
+
+    /// The fingerprint round-trips, and names the request it answered.
+    #[test]
+    fn expect_round_trips() {
+        let e = Expect {
+            id: register_request_id("https://x.org/r", "et", Some("v1"), &["b".into(), "a".into()]),
+            files: vec!["cactarium.toml".into()],
+            rows: vec!["cactarium.toml|v1|c|1.0.0|new".into()],
+            fingerprint: "abc".into(),
+            left: vec![],
+        };
+        assert_eq!(Expect::decode(&e.encode()), Some(e));
+        assert!(Expect::decode("not one").is_none());
+        let id = |only: &[String], tag| register_request_id(" https://x.org/r", "et", tag, only);
+        assert_eq!(id(&["a".into(), "b".into()], Some("v1")), id(&["b".into(), "a".into()], Some("v1")));
+        assert_ne!(id(&[], Some("v1")), id(&[], None));
     }
 }
