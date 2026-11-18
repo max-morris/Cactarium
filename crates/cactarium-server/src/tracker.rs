@@ -3660,6 +3660,10 @@ pub async fn package_tip_commit(state: &AppState, entry: &Entry) -> AppResult<St
 /// likely one not pushed yet (404). Details are logged; the answers stay generic.
 async fn checkout_failure(state: &AppState, url: &str, commit: &str, e: anyhow::Error) -> AppError {
     tracing::warn!("checking out {commit} from {url}: {e:#}");
+    // A fact about the commit, not about the host.
+    if let Some(big) = e.downcast_ref::<git::TooLarge>() {
+        return AppError::bad(format!("{url} at {commit}: {big}"));
+    }
     if format!("{e:#}").contains("timed out") {
         return AppError::Upstream(format!("{url} didn't send commit {commit} in time; try again later"));
     }
