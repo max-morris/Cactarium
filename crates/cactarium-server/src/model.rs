@@ -103,6 +103,72 @@ impl Version {
     }
 }
 
+/// Among `versions`, the one that names `commit` when several froze it: the newest on the default
+/// track; with none there, the newest on any track, ties going to the track name first in byte
+/// order (the rule the crate's `PinInfo::version` documents). Yanked versions count; the caller
+/// chooses which versions may be named.
+pub fn frozen_at<'a>(versions: &'a [Version], commit: &str) -> Option<&'a Version> {
+    let at = versions.iter().filter(|v| v.commit.as_deref() == Some(commit));
+    let key = |v: &Version| tracked(v).map(|t| t.version);
+    at.clone()
+        .filter(|v| v.track.is_empty())
+        .max_by(|a, b| key(a).cmp(&key(b)))
+        .or_else(|| at.max_by(|a, b| key(a).cmp(&key(b)).then_with(|| b.track.cmp(&a.track))))
+}
+
+/// The label a pin at `commit` of the package `owner/name` carries (`RepoPin::cactarium`):
+/// `owner/name@<version>` when an approved, valid version froze the commit ([`frozen_at`] among
+/// them), else none. Never `owner/name#<sha>`: older CactUp can't read one, and the pin's commit
+/// already says it.
+pub async fn pin_label(
+    db: &mut sqlx::PgConnection,
+    entry_id: i64,
+    slug: &str,
+    commit: &str,
+) -> AppResult<Option<cactup_ecosystem_common::slug::Slug>> {
+    let versions: Vec<Version> = sqlx::query_as::<_, Version>(&format!(
+        "SELECT {VERSION_COLS} FROM versions WHERE entry_id = $1 AND commit = $2 AND review = 'approved'"
+    ))
+    .bind(entry_id)
+    .bind(commit)
+    .fetch_all(&mut *db)
+    .await?;
+    let valid: Vec<Version> = versions.into_iter().filter(Version::valid).collect();
+    Ok(frozen_at(&valid, commit).and_then(|v| format!("{slug}@{}", v.label()).parse().ok()))
+}
+
+/// Labels each git pin of `pins` with the version of its package that froze its commit
+/// ([`pin_label`]), matching repos as a sim's pins are matched ([`find_repo`] among public
+/// packages). A label the pin carries is replaced by the derived one; one the Cactarium can't
+/// confirm is dropped, except a bare `owner/name` naming the package matched. Downloads (sha256
+/// pins) carry none. Returns whether anything changed.
+pub async fn label_pins(db: &mut sqlx::PgConnection, pins: &mut [cactup_ecosystem_common::sim::RepoPin]) -> AppResult<bool> {
+    let packages: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT e.id, e.owner, e.name, r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.kind = 'package' AND e.visibility = 'public' ORDER BY e.created_at, e.id",
+    )
+    .fetch_all(&mut *db)
+    .await?;
+    let mut changed = false;
+    for pin in pins.iter_mut() {
+        let label = match (&pin.commit, find_repo(&pin.url, &packages, |p| &p.3)) {
+            (Some(commit), Some((id, owner, name, _))) => {
+                let slug = format!("{owner}/{name}");
+                match pin_label(db, *id, &slug, commit).await? {
+                    Some(l) => Some(l),
+                    None => pin.cactarium.clone().filter(|l| l.at.is_none() && l.sha.is_none() && l.thorn.is_none() && l.entry() == slug),
+                }
+            }
+            _ => None,
+        };
+        if pin.cactarium != label {
+            pin.cactarium = label;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// A key that sorts versions within a track by semver precedence (release after its pre-releases).
 pub fn semver_sort_key(v: &semver::Version) -> String {
     let pre = if v.pre.is_empty() { "~".to_owned() } else { format!("-{}", v.pre) };
@@ -221,6 +287,26 @@ pub fn tracks_of(versions: &[Version], default_track: Option<&str>) -> Vec<Strin
 pub fn latest_on<'a>(versions: &'a [Version], track: &str) -> Option<&'a Version> {
     let on: Vec<&Version> = versions.iter().filter(|v| v.track == track).collect();
     on.iter().find(|v| v.usable()).or(on.first()).copied()
+}
+
+/// The key two repo URLs are compared by, the one CactUp compares with too (the crate's
+/// `url::normalize_repo_url`): what `source_pins.url_norm` stores.
+pub fn repo_key(url: &str) -> String {
+    cactup_ecosystem_common::url::normalize_repo_url(url)
+}
+
+/// The candidate whose repo `url` names: the first whose URL has `url`'s key, else, on a forge
+/// that ignores path case (GitHub, GitLab, Bitbucket), the first equal to it but for case
+/// (`url::same_repo_lenient`), unless those name more than one repo (then none: a guess between
+/// two registered repos would be wrong half the time).
+pub fn find_repo<'a, T>(url: &str, candidates: &'a [T], url_of: impl Fn(&T) -> &str) -> Option<&'a T> {
+    use cactup_ecosystem_common::url::{same_repo, same_repo_lenient};
+    if let Some(c) = candidates.iter().find(|c| same_repo(url, url_of(c))) {
+        return Some(c);
+    }
+    let lenient: Vec<&T> = candidates.iter().filter(|c| same_repo_lenient(url, url_of(c))).collect();
+    let first = *lenient.first()?;
+    lenient.iter().all(|c| same_repo(url_of(c), url_of(first))).then_some(first)
 }
 
 /// A git URL as a page a person can open: `https://host/x/y.git` → `https://host/x/y`.
@@ -353,6 +439,26 @@ mod tests {
         assert!(!v.valid() && !v.usable());
         let ok = Version { state: "tag-moved".into(), invalid_reason: None, ..v };
         assert!(ok.valid() && ok.usable());
+    }
+
+    /// Pins find their package by the shared key, then by the lenient match on caseless forges,
+    /// never by guessing between two repos.
+    #[test]
+    fn repos_are_found_by_the_shared_key() {
+        let urls = ["https://github.com/EinsteinToolkit/Cottonmouth.git", "https://git.example.org/X/Y"];
+        let find = |u: &str| find_repo(u, &urls, |s| s).copied();
+        assert_eq!(find("git@github.com:EinsteinToolkit/Cottonmouth"), Some(urls[0]));
+        assert_eq!(find("https://github.com/einsteintoolkit/cottonmouth/"), Some(urls[0]), "lenient on GitHub");
+        assert_eq!(find("https://git.example.org/x/y"), None, "path case counts elsewhere");
+        assert_eq!(find("https://git.example.org/X/Y.git"), Some(urls[1]));
+        // Two registered repos equal but for case: an exact match wins, a lenient one is ambiguous.
+        let two = ["https://github.com/a/Repo", "https://github.com/A/repo"];
+        assert_eq!(find_repo("https://github.com/A/repo", &two, |s| s), Some(&two[1]));
+        assert_eq!(find_repo("https://github.com/a/repo", &two, |s| s), None);
+        // Keys: ordinary https URLs keep theirs, scp-like and local ones change.
+        assert_eq!(repo_key("https://GitHub.com/max-morris/CarpetX.git/"), "github.com/max-morris/CarpetX");
+        assert_eq!(repo_key("git@github.com:max-morris/CarpetX.git"), "github.com/max-morris/CarpetX");
+        assert_eq!(repo_key("file:///srv/repos/x.git"), "file:///srv/repos/x");
     }
 
     #[test]

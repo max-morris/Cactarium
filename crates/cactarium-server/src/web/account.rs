@@ -139,7 +139,10 @@ pub async fn new_repo(State(state): State<AppState>, s: SignedIn, ip: ClientIp, 
         }
         .await;
         return match result {
-            Ok(p) => repo_page(&state, &s, &url, &owner, &tag, None, Some(p.preview)),
+            Ok(p) => match tracker::nothing_to_add(&p.preview) {
+                Some(m) => repo_page(&state, &s, &url, &owner, &tag, Some(m), None),
+                None => repo_page(&state, &s, &url, &owner, &tag, None, Some(p.preview)),
+            },
             Err(AppError::BadRequest(m) | AppError::Conflict(m) | AppError::Denied(m) | AppError::Upstream(m)) => {
                 repo_page(&state, &s, &url, &owner, &tag, Some(m), None)
             }
@@ -331,6 +334,7 @@ pub async fn cut_release(
     // Resolve before anything is created, so a definition that fails leaves no trace.
     let own = thornlist.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("{t}\n"));
     let resolution = stacks::resolve(state, &owner, stack, own.as_deref(), None).await.map_err(stacks::for_a_person)?;
+    crate::deps::check_stack(state, &ClaimRec::of_manifest(&m)).await.map_err(stacks::for_a_person)?;
     let slug = format!("{owner}/{name}@{label}").parse().map_err(AppError::bad)?;
     let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
     let entry = match existing {

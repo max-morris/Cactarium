@@ -66,19 +66,40 @@ pub async fn check_url(policy: GitPolicy, raw: &str) -> anyhow::Result<String> {
 
 async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
     let url = url::Url::parse(raw.trim()).with_context(|| format!("'{raw}' is not a URL"))?;
+    if url.scheme() == "file" && policy.allow_local {
+        return Ok(Target { url: url.to_string(), resolve: None });
+    }
+    let (url, address) = vet(policy, url, "repo URLs").await?;
+    let normalized = url.as_str().trim_end_matches('/').to_owned();
+    Ok(Target {
+        url: normalized,
+        resolve: address.map(|(host, addr)| {
+            let ip = match addr.ip() {
+                IpAddr::V4(v) => v.to_string(),
+                IpAddr::V6(v) => format!("[{v}]"),
+            };
+            format!("{host}:{}:{ip}", addr.port())
+        }),
+    })
+}
+
+/// The outbound-fetch policy every URL the server reads goes through: https only (plus http, and
+/// private hosts, when local repos are allowed, for development and tests), no credentials, and a
+/// host that resolves only to public addresses. Returns the URL and, unless local repos are
+/// allowed, the host (without brackets) and the checked address to connect to, so the fetch can't
+/// be sent elsewhere by a second lookup (DNS rebinding). `what` names the URLs in messages.
+async fn vet(policy: GitPolicy, url: url::Url, what: &str) -> anyhow::Result<(url::Url, Option<(String, std::net::SocketAddr)>)> {
     if !url.username().is_empty() || url.password().is_some() {
-        bail!("repo URLs must not contain credentials");
+        bail!("{what} must not contain credentials");
     }
     match url.scheme() {
         "https" => {}
-        "file" if policy.allow_local => return Ok(Target { url: url.to_string(), resolve: None }),
         "http" if policy.allow_local => {}
-        _ => bail!("repo URLs must be https://"),
+        _ => bail!("{what} must be https://"),
     }
-    let host = url.host_str().ok_or_else(|| anyhow!("'{raw}' has no host"))?.to_owned();
-    let normalized = url.as_str().trim_end_matches('/').to_owned();
+    let host = url.host_str().ok_or_else(|| anyhow!("'{url}' has no host"))?.to_owned();
     if policy.allow_local {
-        return Ok(Target { url: normalized, resolve: None });
+        return Ok((url, None));
     }
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
@@ -88,12 +109,72 @@ async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
     if addrs.is_empty() || addrs.iter().any(|a| private(a.ip())) {
         bail!("'{host}' is not a public host");
     }
-    let ip = match addrs[0].ip() {
-        IpAddr::V4(v) => v.to_string(),
-        IpAddr::V6(v) => format!("[{v}]"),
-    };
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    Ok(Target { url: normalized, resolve: Some(format!("{bare}:{port}:{ip}")) })
+    let bare = host.trim_start_matches('[').trim_end_matches(']').to_owned();
+    Ok((url, Some((bare, addrs[0]))))
+}
+
+/// What fetching a download read: its content's sha256 (hex) and size.
+#[derive(Debug)]
+pub struct Fetched {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Fetches `raw` once, under the outbound-fetch policy ([`vet`], applied again to every redirect,
+/// at most 5), hashing the body as it streams and stopping past `max_bytes`. Nothing is kept.
+pub async fn fetch_and_hash(policy: GitPolicy, raw: &str, max_bytes: u64, time_limit: Duration) -> anyhow::Result<Fetched> {
+    use sha2::Digest;
+    let mut url = url::Url::parse(raw.trim()).with_context(|| format!("'{raw}' is not a URL"))?;
+    let started = std::time::Instant::now();
+    for _ in 0..=5 {
+        let (checked, address) = vet(policy, url, "download URLs").await?;
+        let mut client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(60))
+            .user_agent("cactarium");
+        if let Some((host, addr)) = &address {
+            client = client.resolve(host, *addr);
+        }
+        let client = client.build()?;
+        let left = time_limit.saturating_sub(started.elapsed());
+        let mut resp = tokio::time::timeout(left, client.get(checked.clone()).send())
+            .await
+            .map_err(|_| anyhow!("it took over {} minutes", time_limit.as_secs() / 60))??;
+        if resp.status().is_redirection() {
+            let to = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .ok_or_else(|| anyhow!("a redirect without a location"))?;
+            url = checked.join(to).with_context(|| format!("a redirect to '{to}'"))?;
+            continue;
+        }
+        if !resp.status().is_success() {
+            bail!("the server answered {}", resp.status());
+        }
+        if let Some(n) = resp.content_length()
+            && n > max_bytes
+        {
+            bail!("it is {n} bytes, more than the {max_bytes} the Cactarium reads");
+        }
+        let mut h = sha2::Sha256::new();
+        let mut size: u64 = 0;
+        loop {
+            let left = time_limit.saturating_sub(started.elapsed());
+            let chunk = tokio::time::timeout(left, resp.chunk())
+                .await
+                .map_err(|_| anyhow!("it took over {} minutes", time_limit.as_secs() / 60))??;
+            let Some(chunk) = chunk else { break };
+            size += chunk.len() as u64;
+            if size > max_bytes {
+                bail!("it is more than the {max_bytes} bytes the Cactarium reads");
+            }
+            h.update(&chunk);
+        }
+        return Ok(Fetched { sha256: hex::encode(h.finalize()), size });
+    }
+    bail!("more than 5 redirects")
 }
 
 fn git_to(policy: GitPolicy, home: &Path, target: &Target) -> Command {
@@ -453,6 +534,10 @@ const STALE_CLONE: Duration = Duration::from_secs(3600);
 /// At most this many mirrors are cloned or fetched at once, whatever the requests ask for.
 static MIRROR_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 
+/// Lookups (`POST /lookup`, anonymous) update kept mirrors one at a time, on a slot of their own:
+/// however many lookups arrive, they never take one of the slots syncing uses.
+static LOOKUP_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Registration previews' temporary mirrors are cloned one at a time, on their own slot: a preview
 /// never takes one of the slots syncing uses.
 static PREVIEW_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
@@ -649,6 +734,40 @@ async fn lacks_commits(policy: GitPolicy, dir: &Path, commits: &[String]) -> boo
     object_types(policy, dir, commits).await.iter().any(Option::is_none)
 }
 
+/// What a kept mirror says of some commits ([`mirror_has_commits`]).
+pub struct MirrorAnswer {
+    /// For each commit asked: `Some(true)` when the mirror has it, `Some(false)` when it doesn't
+    /// after an update (or one within [`MIRROR_REFRESH`]), `None` when it can't tell just now (the
+    /// update failed, or none was allowed).
+    pub has: Vec<Option<bool>>,
+    /// Whether an update was asked for (whether or not one ran: the window may have answered).
+    pub updated: bool,
+}
+
+/// Whether the repo's kept history mirror has each of `commits` (full ids), as commits. `None`
+/// when no mirror is kept for the repo yet: this never clones one. A mirror that lacks some is
+/// brought up to date first when `refresh` allows it (asked only then), at most once per
+/// [`MIRROR_REFRESH`], on the lookups' own slot ([`LOOKUP_UPDATES`]).
+pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String], refresh: impl FnOnce() -> bool) -> Option<MirrorAnswer> {
+    let (root, key, dir) = mirror_of(url).await.ok()?;
+    if !mirror_complete(&dir).await {
+        return None;
+    }
+    let is_commit = |types: Vec<Option<String>>| types.into_iter().map(|t| t.as_deref() == Some("commit")).collect::<Vec<bool>>();
+    let first = is_commit(object_types(policy, &dir, commits).await);
+    if first.iter().all(|&b| b) {
+        return Some(MirrorAnswer { has: first.into_iter().map(Some).collect(), updated: false });
+    }
+    if !refresh() {
+        return Some(MirrorAnswer { has: first.into_iter().map(|b| b.then_some(true)).collect(), updated: false });
+    }
+    // Never queued: a lookup that finds the slot busy says "can't tell" for what the mirror lacks.
+    let error = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &LOOKUP_UPDATES, Wait::Never).await;
+    let after = is_commit(object_types(policy, &dir, commits).await);
+    let has = after.into_iter().map(|b| if b { Some(true) } else if error.is_none() { Some(false) } else { None }).collect();
+    Some(MirrorAnswer { has, updated: true })
+}
+
 /// A file as a commit has it.
 #[derive(Clone, Debug)]
 pub enum FileAt {
@@ -686,7 +805,11 @@ pub async fn read_files_in(policy: GitPolicy, mirrors: &Mirrors, url: &str, want
     commits.dedup();
     let mut types = object_types(policy, &dir, &commits).await;
     if types.iter().any(Option::is_none) {
-        let error = update_mirror_in(policy, mirrors, key.clone(), root, dir.clone(), false, Some(commits.clone())).await;
+        let slots = match mirrors {
+            Mirrors::Shared => &MIRROR_UPDATES,
+            Mirrors::Temp(_) => &PREVIEW_UPDATES,
+        };
+        let error = update_mirror_in(policy, mirrors, key.clone(), root, dir.clone(), false, Some(commits.clone()), slots, Wait::Queue).await;
         if let Some(e) = error {
             bail!("{e}");
         }
@@ -861,13 +984,14 @@ async fn update_mirror(
     dir: PathBuf,
     broken: bool,
 ) -> Option<String> {
-    update_mirror_in(policy, &Mirrors::Shared, url, root, dir, broken, None).await
+    update_mirror_in(policy, &Mirrors::Shared, url, root, dir, broken, None, &MIRROR_UPDATES, Wait::Queue).await
 }
 
 /// [`update_mirror`]; with `needed`, the update skips the window when those commits (which the repo
 /// just listed, so they exist) aren't in the mirror yet, once the lock is held: a tag pushed a
 /// moment after the last update is read at once, and concurrent callers fetch once.
-/// Among `mirrors`: a temporary mirror is updated on [`PREVIEW_UPDATES`], and the update holds its
+/// The update waits for one of `slots` ([`MIRROR_UPDATES`] for syncing, [`PREVIEW_UPDATES`] for a
+/// temporary mirror, [`LOOKUP_UPDATES`] for lookups). The update of a temporary mirror holds its
 /// root, so it is deleted only after the update ends. Once no request holds it anymore (the
 /// client went away), the update is given up: a queued one never takes the slot, and a running
 /// clone is stopped (its git killed).
@@ -880,20 +1004,57 @@ async fn update_mirror_in(
     dir: PathBuf,
     broken: bool,
     needed: Option<Vec<String>>,
+    slots: &'static tokio::sync::Semaphore,
+    wait: Wait,
 ) -> Option<String> {
     let lock = mirror_lock(&dir);
     let held = mirrors.clone();
     let task = tokio::spawn(async move {
-        let slots = match &held {
-            Mirrors::Shared => &MIRROR_UPDATES,
-            Mirrors::Temp(_) => &PREVIEW_UPDATES,
+        // Up to date (or updated by another request within the window): answered without a slot.
+        let fresh = |state: &MirrorState, lacking: bool| !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH);
+        let lacking = || async {
+            match &needed {
+                Some(commits) => lacks_commits(policy, &dir, commits).await,
+                None => false,
+            }
         };
-        let mut state = lock.lock_owned().await;
-        let lacking = match &needed {
-            Some(commits) => lacks_commits(policy, &dir, commits).await,
-            None => false,
+        {
+            let state = lock.lock().await;
+            if fresh(&state, lacking().await) {
+                return state.error.clone();
+            }
+        }
+        // Only this task holds a temporary mirror once its requests are gone.
+        let watched = match &held {
+            Mirrors::Shared => None,
+            Mirrors::Temp(t) => Some(std::sync::Arc::downgrade(t)),
         };
-        if !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH) {
+        let abandoned = || {
+            let watched = watched.clone();
+            async move {
+                let Some(w) = watched else { return std::future::pending().await };
+                while w.strong_count() > 1 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        };
+        // A slot first, and only then the repo's lock: nobody holds a repo's lock while waiting
+        // for a slot, so syncs and lookups of a repo never wait behind a queue of other repos.
+        let _permit = match wait {
+            Wait::Queue => tokio::select! {
+                p = slots.acquire() => match p {
+                    Ok(p) => p,
+                    Err(e) => return Some(format!("updating the mirror failed: {e}")),
+                },
+                () = abandoned() => return Some("the preview this mirror was for went away".to_owned()),
+            },
+            Wait::Never => match slots.try_acquire() {
+                Ok(p) => p,
+                Err(_) => return Some(SLOT_BUSY.to_owned()),
+            },
+        };
+        let mut state = lock.clone().lock_owned().await;
+        if fresh(&state, lacking().await) {
             return state.error.clone();
         }
         let limit = match &held {
@@ -901,7 +1062,6 @@ async fn update_mirror_in(
             Mirrors::Temp(_) => Some(MAX_PREVIEW_MIRROR_BYTES),
         };
         let work = async {
-            let _permit = slots.acquire().await?;
             let t = check(policy, &url).await?;
             let home = tempfile::tempdir()?;
             if broken {
@@ -913,20 +1073,9 @@ async fn update_mirror_in(
                 clone_mirror(policy, home.path(), &t, &root, &dir, limit).await
             }
         };
-        // Only this task holds a temporary mirror once its requests are gone.
-        let watched = match &held {
-            Mirrors::Shared => None,
-            Mirrors::Temp(t) => Some(std::sync::Arc::downgrade(t)),
-        };
-        let abandoned = async move {
-            let Some(w) = watched else { return std::future::pending().await };
-            while w.strong_count() > 1 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        };
         let result = tokio::select! {
             r = work => r,
-            () = abandoned => Err(anyhow!("the preview this mirror was for went away")),
+            () = abandoned() => Err(anyhow!("the preview this mirror was for went away")),
         };
         state.finished = Some(std::time::Instant::now());
         state.error = result.err().map(|e| {
@@ -940,6 +1089,17 @@ async fn update_mirror_in(
     });
     task.await.unwrap_or_else(|e| Some(format!("updating the mirror failed: {e}")))
 }
+
+/// Whether an update waits for a slot ([`Wait::Queue`]) or gives up when none is free
+/// ([`Wait::Never`], for lookups: the answer is then "can't tell just now").
+#[derive(Clone, Copy, PartialEq)]
+enum Wait {
+    Queue,
+    Never,
+}
+
+/// What an update that gave up for want of a slot answers.
+const SLOT_BUSY: &str = "no slot is free to update the repo's history just now";
 
 /// Fetches every branch and tag, by URL with explicit refspecs: a bare clone has no fetch refspec,
 /// and the stored remote isn't consulted, so the mirror's config can't redirect the fetch.
@@ -1217,17 +1377,6 @@ pub fn read_in(co: &Checkout, rel: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(std::fs::read_to_string(&real).with_context(|| format!("'{rel}' is not UTF-8 text"))?))
 }
 
-/// A URL in canonical form for matching (scheme-less, no `.git`, no trailing slash, lowercase host).
-pub fn normalize_url(url: &str) -> String {
-    let u = url.trim().trim_end_matches('/');
-    let u = u.strip_suffix(".git").unwrap_or(u);
-    let u = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
-    match u.split_once('/') {
-        Some((host, path)) => format!("{}/{}", host.to_ascii_lowercase(), path),
-        None => u.to_ascii_lowercase(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,6 +1445,134 @@ mod tests {
         for m in misses {
             assert!(matches!(m.await.unwrap().unwrap(), PrefixMatch::None));
         }
+    }
+
+    /// A download is fetched once and hashed as it streams: redirects are followed (each checked
+    /// again), a server error and an oversized body are refused, and so is anything but https
+    /// outside development.
+    #[tokio::test]
+    async fn downloads_are_fetched_and_hashed() {
+        use sha2::Digest;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = b"tarball bytes".repeat(100);
+        let served = body.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let head = |status: &str, extra: &str, len: usize| format!("HTTP/1.1 {status}\r\n{extra}content-length: {len}\r\nconnection: close\r\n\r\n");
+                    let reply: Vec<u8> = match path.as_str() {
+                        "/file" => [head("200 OK", "", served.len()).into_bytes(), served].concat(),
+                        "/moved" => head("302 Found", "location: /file\r\n", 0).into_bytes(),
+                        _ => head("404 Not Found", "", 0).into_bytes(),
+                    };
+                    let _ = s.write_all(&reply).await;
+                });
+            }
+        });
+        let dev = GitPolicy { allow_local: true };
+        let limit = Duration::from_secs(30);
+        let got = fetch_and_hash(dev, &format!("http://{addr}/file"), 1 << 20, limit).await.unwrap();
+        assert_eq!((got.sha256, got.size), (hex::encode(sha2::Sha256::digest(&body)), body.len() as u64));
+        let moved = fetch_and_hash(dev, &format!("http://{addr}/moved"), 1 << 20, limit).await.unwrap();
+        assert_eq!(moved.size, body.len() as u64);
+        let e = fetch_and_hash(dev, &format!("http://{addr}/gone"), 1 << 20, limit).await.unwrap_err();
+        assert!(format!("{e:#}").contains("404"), "{e:#}");
+        let e = fetch_and_hash(dev, &format!("http://{addr}/file"), 100, limit).await.unwrap_err();
+        assert!(format!("{e:#}").contains("more than the 100"), "{e:#}");
+        let strict = GitPolicy { allow_local: false };
+        for bad in [format!("http://{addr}/file"), "https://127.0.0.1/x".to_owned(), "https://u:p@example.org/x".to_owned(), "file:///etc/hostname".to_owned()] {
+            assert!(fetch_and_hash(strict, &bad, 1 << 20, limit).await.is_err(), "{bad}");
+        }
+    }
+
+    /// The tests that use the lookups' only slot run one at a time.
+    static LOOKUP_SLOT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Nobody holds a repo's lock while waiting for a slot: a queued update leaves the repo's
+    /// lock free, and a lookup that finds its slot busy answers "can't tell" at once.
+    #[tokio::test]
+    async fn slots_are_taken_before_locks() {
+        let _one = LOOKUP_SLOT_TESTS.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        sh(&up, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(up.join("f"), "x").unwrap();
+        sh(&up, &["add", "f"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let first = sh(&up, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", up.display());
+        let policy = GitPolicy { allow_local: true };
+        resolve_commit_prefix(policy, &url, &first[..7]).await.unwrap();
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        // The lookups' only slot is busy: a lookup lacking a commit can't tell, and doesn't wait.
+        let busy = LOOKUP_UPDATES.acquire().await.unwrap();
+        let none = "0".repeat(40);
+        let a = tokio::time::timeout(Duration::from_secs(5), mirror_has_commits(policy, &url, std::slice::from_ref(&none), || true))
+            .await
+            .expect("answered at once")
+            .unwrap();
+        assert_eq!(a.has, vec![None]);
+        drop(busy);
+        // Every syncing slot busy: an update waits for one without the repo's lock.
+        let all = MIRROR_UPDATES.acquire_many(3).await.unwrap();
+        let queued = {
+            let url = url.clone();
+            tokio::spawn(async move { resolve_commit_prefix(policy, &url, "0000000").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(mirror_lock(&dir).try_lock().is_ok(), "the repo's lock is free while the update waits for a slot");
+        drop(all);
+        assert!(matches!(queued.await.unwrap().unwrap(), PrefixMatch::None));
+    }
+
+    /// What a kept mirror says of commits: nothing before one exists (it never clones one), then
+    /// the commits it has; one pushed since is found once an update may run; a tree is no commit.
+    #[tokio::test]
+    async fn mirrors_answer_whether_they_have_commits() {
+        let _one = LOOKUP_SLOT_TESTS.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        sh(&up, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(up.join("f"), "x").unwrap();
+        sh(&up, &["add", "f"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let first = sh(&up, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", up.display());
+        let policy = GitPolicy { allow_local: true };
+        assert!(mirror_has_commits(policy, &url, std::slice::from_ref(&first), || true).await.is_none(), "no mirror kept yet");
+        resolve_commit_prefix(policy, &url, &first[..7]).await.unwrap();
+        let none = "0".repeat(40);
+        let a = mirror_has_commits(policy, &url, &[first.clone(), none.clone()], || false).await.unwrap();
+        assert_eq!((a.has, a.updated), (vec![Some(true), None], false), "without an update, a miss can't tell");
+        let later = commit_on(&up, "later", "later");
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        let asked = std::cell::Cell::new(false);
+        let a = mirror_has_commits(policy, &url, &[later.clone(), none], || {
+            asked.set(true);
+            true
+        })
+        .await
+        .unwrap();
+        assert!(asked.get(), "asked, since the mirror lacked them");
+        assert_eq!((a.has, a.updated), (vec![Some(true), Some(false)], true));
+        let tree = sh(&up, &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(mirror_has_commits(policy, &url, &[tree], || true).await.unwrap().has, vec![Some(false)]);
+        // A mirror that has every commit asked never asks for an update.
+        let a = mirror_has_commits(policy, &url, &[first], || panic!("no update needed")).await.unwrap();
+        assert_eq!((a.has, a.updated), (vec![Some(true)], false));
     }
 
     /// Files at commits from a blobless mirror: blobs fetched by id, a symbolic link left to a
@@ -1443,18 +1720,6 @@ mod tests {
         for a in ["140.82.112.3", "2606:50c0:8000::153"] {
             assert!(!private(a.parse().unwrap()), "{a}");
         }
-    }
-
-    #[test]
-    fn url_normalization() {
-        assert_eq!(
-            normalize_url("https://GitHub.com/max-morris/CarpetX.git/"),
-            "github.com/max-morris/CarpetX"
-        );
-        assert_eq!(
-            normalize_url("https://github.com/max-morris/CarpetX"),
-            "github.com/max-morris/CarpetX"
-        );
     }
 
     #[tokio::test]

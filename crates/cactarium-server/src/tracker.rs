@@ -346,19 +346,26 @@ fn kind_of(file: &str) -> &'static str {
 }
 
 
-/// Every entry whose repo is `url`, compared normalized (`https://github.com/x/y.git` and
-/// `https://github.com/x/y` are one repo): the entries on one repo are each other's siblings.
+/// Every entry whose repo is `url`, compared by the shared key, and on GitHub, GitLab and
+/// Bitbucket also case-insensitively (`url::same_repo_lenient`: `https://github.com/X/y.git` and
+/// `https://github.com/x/Y` are one repo there): the entries on one repo are each other's
+/// siblings, and a second registration of a repo can't slip past them through another spelling.
 pub async fn entries_on(state: &AppState, url: &str) -> AppResult<Vec<(Entry, String)>> {
-    let norm = git::normalize_url(url);
     let rows: Vec<(i64, String, String)> =
         sqlx::query_as("SELECT entry_id, url, manifest_file FROM entry_repos ORDER BY entry_id").fetch_all(&state.db).await?;
     let mut out = Vec::new();
     for (id, u, file) in rows {
-        if git::normalize_url(&u) == norm {
+        if one_repo(&u, url) {
             out.push((model::entry_by_id(state, id).await?, file));
         }
     }
     Ok(out)
+}
+
+/// Whether two registered URLs are one repo, for registering and moving repos: the shared key,
+/// or on a forge that ignores path case, the same path in another case.
+pub fn one_repo(a: &str, b: &str) -> bool {
+    cactup_ecosystem_common::url::same_repo_lenient(a, b)
 }
 
 /// The other entries on the same repo as `entry_id`.
@@ -591,10 +598,8 @@ pub async fn plan(state: &AppState, owner: Option<&str>, url: &str, at: At<'_>, 
         }
     }
     drop(mirrors);
-    if new.is_empty() && skipped.is_empty() {
-        let list: Vec<String> = existing.iter().map(|(e, f)| format!("{} ({f})", e.slug())).collect();
-        return Err(AppError::bad(format!("{url} already has every entry its manifests give: {}; nothing to add", list.join(", "))));
-    }
+    // Nothing new and nothing left out: the plan is the entries already there
+    // ([`nothing_to_add`] says so to a person).
     let owner = match owner {
         Some(o) => o.to_owned(),
         None => existing
@@ -863,6 +868,8 @@ pub struct Previewed {
     pub preview: Preview,
     plan: Plan,
     prepared: Vec<Option<Prepared>>,
+    /// New entries whose first version would wait: (`owner/name@version`, why).
+    waits: Vec<(String, String)>,
 }
 
 /// The dry run of registering `url` under `owner` (as `user`, if known: whether new entries are
@@ -872,8 +879,8 @@ pub struct Previewed {
 pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>, url: &str, at: At<'_>, files: Option<&[String]>) -> AppResult<Previewed> {
     let plan = plan(state, owner, url, at, files).await?;
     let registering: Vec<String> =
-        if plan.new.iter().any(|p| p.kind == "package") { vec![git::normalize_url(&plan.url)] } else { vec![] };
-    let opts = PrepOpts { defer_pins: true, registering };
+        if plan.new.iter().any(|p| p.kind == "package") { vec![plan.url.clone()] } else { vec![] };
+    let opts = PrepOpts { defer_pins: true, registering, reading: crate::deps::Reading::Freeze };
     let skips = user.is_some_and(publish::skips_review) || publish::owner_trusted(state, &plan.owner).await?;
     let mut entries = Vec::new();
     for (e, file) in &plan.existing {
@@ -891,6 +898,7 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
         });
     }
     let mut prepared = Vec::with_capacity(plan.new.len());
+    let mut waits = Vec::new();
     for p in &plan.new {
         let slug = format!("{}/{}", plan.owner, p.name);
         let (status, note, ready) = match &p.problem {
@@ -900,6 +908,13 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
                 match prepare(state, &entry, &repo, &p.co, &p.tag, &p.tv, &opts).await {
                     Ok(r) if r.deferred.is_empty() => ("new", format!("reads cleanly{}{}", sims_note(&r), off_head_note(p)), Some(r)),
                     Ok(r) => ("new", format!("would wait (left unread, tried again): {}{}", r.deferred.join("; "), off_head_note(p)), Some(r)),
+                    // What may change without a new commit (a dependency awaiting review, a
+                    // package not registered yet): the entry registers, and its first version
+                    // waits for it, as its sync would.
+                    Err(AppError::Upstream(why)) => {
+                        waits.push((format!("{slug}@{}", p.tv), why.clone()));
+                        ("new", format!("would wait (left unread, tried again): {why}{}", off_head_note(p)), None)
+                    }
                     Err(e) => ("fails", e.to_string(), None),
                 }
             }
@@ -937,7 +952,18 @@ pub async fn preview(state: &AppState, user: Option<&User>, owner: Option<&str>,
         sha2::Digest::update(&mut h, format!("{}|{}\n", e.slug, e.file).as_bytes());
     }
     let fingerprint = hex::encode(&sha2::Digest::finalize(h)[..12]);
-    Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared })
+    Ok(Previewed { preview: Preview { url: plan.url.clone(), owner: plan.owner.clone(), entries, fingerprint }, plan, prepared, waits })
+}
+
+/// What to tell a person registering a repo that has every entry its manifests give, if it has:
+/// every row of the preview is an entry already there. The API answers such a preview as it is.
+pub fn nothing_to_add(p: &Preview) -> Option<String> {
+    // A preview with no entries at all (one planned for no file) is no registered repo.
+    if p.entries.is_empty() || p.entries.iter().any(|e| e.status != "existing") {
+        return None;
+    }
+    let list: Vec<String> = p.entries.iter().map(|e| format!("{} ({})", e.slug, e.file)).collect();
+    Some(format!("{} already has every entry its manifests give: {}; nothing to add", p.url, list.join(", ")))
 }
 
 /// The preview's mark on a release whose manifest file isn't on the default branch anymore.
@@ -970,7 +996,19 @@ pub struct Registered {
     pub entries: Vec<Entry>,
     /// For each entry made: its manifest file, tag and version.
     pub from: Vec<(String, String, String)>,
+    /// Everything to tell the registrant, those below included.
     pub notes: Vec<String>,
+    /// For each entry made: what its first version waits for, and what its first check of tags
+    /// reported.
+    pub entry_notes: Vec<Vec<String>>,
+    /// For each entry made: the versions its first check stored, and how many of them await review.
+    pub counts: Vec<(usize, usize)>,
+    /// The preview it registered from: the entries made, those already on the repo, the manifests
+    /// left out.
+    pub preview: Preview,
+    /// The new entries a preview of the whole repo showed that weren't chosen (by `--only`; empty
+    /// for a confirmed preview, whose caller knows them).
+    pub not_chosen: Vec<PreviewEntry>,
 }
 
 /// Which new entries a registration makes.
@@ -1013,7 +1051,8 @@ pub async fn register(
     };
     // The new entries left out, for the notes.
     let mut left: Vec<String> = Vec::new();
-    let Previewed { preview, plan, prepared } = match choice {
+    let mut not_chosen: Vec<PreviewEntry> = Vec::new();
+    let Previewed { preview, plan, prepared, waits } = match choice {
         Choice::All => preview(state, Some(user), Some(&owner), url, at(), None).await?,
         Choice::Names(names) => {
             let full = preview(state, Some(user), Some(&owner), url, at(), None).await?;
@@ -1029,6 +1068,7 @@ pub async fn register(
                 }
             }
             left = full.plan.new.iter().filter(|p| !names.contains(&p.name)).map(|p| format!("{}/{} ({})", full.plan.owner, p.name, p.file)).collect();
+            not_chosen = full.preview.entries.iter().filter(|e| !e.shown.is_empty() && !files.contains(&e.file)).cloned().collect();
             if files.len() == full.plan.new.len() {
                 full
             } else {
@@ -1040,6 +1080,9 @@ pub async fn register(
                 }
                 chosen
             }
+        }
+        Choice::Shown { files: [], .. } => {
+            return Err(AppError::bad("choose at least one entry to register"));
         }
         Choice::Shown { files, rows, fingerprint } => {
             left = rows.iter().filter_map(|r| r.split('|').next()).filter(|f| !files.iter().any(|x| x == f)).map(str::to_owned).collect();
@@ -1063,16 +1106,19 @@ pub async fn register(
     }
     if plan.new.is_empty() {
         let notes: Vec<&str> = plan.skipped.iter().map(|s| s.note.as_str()).collect();
+        let why = nothing_to_add(&preview).unwrap_or_else(|| format!("nothing to register now: {}", notes.join("; ")));
         *refused = Some(preview);
-        return Err(AppError::bad(format!("nothing to register now: {}", notes.join("; "))));
+        return Err(AppError::bad(why));
     }
     let mut notes: Vec<String> = plan.skipped.iter().map(|s| s.note.clone()).collect();
     notes.extend(left.iter().map(|l| format!("{l} isn't registered now: not chosen; register again to add it")));
+    let mut entry_notes: Vec<Vec<String>> = Vec::with_capacity(plan.new.len());
     for (p, r) in plan.new.iter().zip(&prepared) {
-        if let Some(r) = r {
-            let label = format!("{owner}/{}@{}", p.name, p.tv);
-            notes.extend(r.deferred.iter().map(|d| format!("{label} waits: {d}")));
-        }
+        let label = format!("{owner}/{}@{}", p.name, p.tv);
+        let mut mine: Vec<String> = r.iter().flat_map(|r| &r.deferred).map(|d| format!("{label} waits: {d}")).collect();
+        mine.extend(waits.iter().filter(|(l, _)| *l == label).map(|(l, why)| format!("{l} waits: {why}")));
+        notes.extend(mine.iter().cloned());
+        entry_notes.push(mine);
     }
     let mut tx = state.db.begin().await?;
     let mut entries = Vec::new();
@@ -1124,12 +1170,21 @@ pub async fn register(
     // The registrant vouches for the tags that exist now; later tags are reviewed on their own.
     // The entries exist now, whatever the first sync says: a problem there is reported, kept as the
     // repo's poll error, and the poller tries again.
-    for e in &entries {
+    let mut counts = Vec::with_capacity(entries.len());
+    for (e, mine) in entries.iter().zip(entry_notes.iter_mut()) {
         if let Err(err) = sync_as(state, e, Some(user), Pace::Now).await {
-            notes.push(format!("{}: its first check of tags: {err}", e.slug()));
+            let said = format!("{}: its first check of tags: {err}", e.slug());
+            notes.push(said.clone());
+            mine.push(said);
         }
+        let (stored, pending): (i64, i64) =
+            sqlx::query_as("SELECT count(*), count(*) FILTER (WHERE review = 'pending') FROM versions WHERE entry_id = $1")
+                .bind(e.id)
+                .fetch_one(&state.db)
+                .await?;
+        counts.push((usize::try_from(stored).unwrap_or(0), usize::try_from(pending).unwrap_or(0)));
     }
-    Ok(Registered { entries, from, notes })
+    Ok(Registered { entries, from, notes, entry_notes, counts, preview, not_chosen })
 }
 
 /// Why a preview planned for the files chosen differs from what was shown (`rows`, as
@@ -1228,11 +1283,11 @@ pub async fn check(
     let mut lines = Vec::new();
     let mut clean = true;
     match preview(state, None, owner, url, at, None).await {
+        Ok(p) if nothing_to_add(&p.preview).is_some() => lines.push("nothing new to register".into()),
         Ok(p) => {
             clean = !p.preview.entries.iter().any(|e| e.status == "fails");
             lines.extend(preview_lines(&p.preview));
         }
-        Err(AppError::BadRequest(m)) if m.contains("nothing to add") => lines.push("nothing new to register".into()),
         Err(e) => {
             clean = false;
             lines.push(format!("registering would fail: {e}"));
@@ -1831,7 +1886,7 @@ pub async fn move_repo(state: &AppState, admin: &User, entry: &Entry, new_url: &
             .bind(e.id)
             .fetch_one(&mut *tx)
             .await?;
-        if git::normalize_url(&from) != git::normalize_url(&repo.url) {
+        if !one_repo(&from, &repo.url) {
             return Err(AppError::Conflict(format!("{} moved while this ran; reload and try again", e.slug())));
         }
         sqlx::query("UPDATE entry_repos SET url = $2, poll_error = NULL WHERE entry_id = $1")
@@ -3405,24 +3460,46 @@ pub async fn package_tip_commit(state: &AppState, entry: &Entry) -> AppResult<St
     let repo = repo_of(state, entry.id)
         .await?
         .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
-    git::resolve_ref(policy(state), &repo.url, None).await.map_err(AppError::bad)
+    git::resolve_ref(policy(state), &repo.url, None).await.map_err(|e| {
+        tracing::warn!("{}: reading the default branch of {}: {e:#}", entry.slug(), repo.url);
+        AppError::Upstream(format!("couldn't reach {} to read its default branch; try again later", repo.url))
+    })
+}
+
+/// Why a checkout of `commit` from `url` failed, as the answer to a read at that commit: the host
+/// didn't answer (in time), so try again later (502); or it answers but has no such commit, most
+/// likely one not pushed yet (404). Details are logged; the answers stay generic.
+async fn checkout_failure(state: &AppState, url: &str, commit: &str, e: anyhow::Error) -> AppError {
+    tracing::warn!("checking out {commit} from {url}: {e:#}");
+    if format!("{e:#}").contains("timed out") {
+        return AppError::Upstream(format!("{url} didn't send commit {commit} in time; try again later"));
+    }
+    // The fetch failed though the host may be fine: ask it for its default branch to tell which.
+    match git::resolve_ref(policy(state), url, None).await {
+        Ok(_) => AppError::Missing(format!("no commit {commit} in {url} (is it pushed?)")),
+        Err(e) => {
+            tracing::warn!("reaching {url}: {e:#}");
+            AppError::Upstream(format!("couldn't reach {url}; try again later"))
+        }
+    }
 }
 
 /// Reads a package at `commit` (its default branch's tip, or a commit someone named) the way a
 /// release is read: the manifest (the curated one, for a curated package) and the thorns there.
-pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str) -> AppResult<PackageTip> {
+pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str, reading: crate::deps::Reading) -> AppResult<PackageTip> {
     if entry.kind != "package" {
         return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
     }
     let repo = repo_of(state, entry.id)
         .await?
         .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
-    let co = git::checkout(policy(state), &repo.url, commit, None)
-        .await
-        .map_err(AppError::bad)?;
+    let co = match git::checkout(policy(state), &repo.url, commit, None).await {
+        Ok(co) => co,
+        Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await),
+    };
     let r = RemoteRef { name: "HEAD".into(), commit: commit.to_owned() };
     let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
-    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts::default())
+    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts { reading, ..PrepOpts::default() })
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
     let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);
@@ -3468,9 +3545,12 @@ struct PrepOpts {
     /// Return sim pins that can't be checked yet as `deferred` instead of failing with
     /// [`AppError::Upstream`] (a registration's dry read).
     defer_pins: bool,
-    /// Normalized URLs of packages being registered along with this entry: a pin to one is a
-    /// package not public yet, not a repo nobody registered.
+    /// The URLs of packages being registered along with this entry: a pin to one is a package not
+    /// public yet, not a repo nobody registered.
     registering: Vec<String>,
+    /// A version to freeze, or a branch tip or commit read now for a requester, whose
+    /// dependencies count only what that requester could be served and never wait.
+    reading: crate::deps::Reading,
 }
 
 /// Reads one commit of an entry the way a version is read, checking everything a version must
@@ -3617,9 +3697,11 @@ async fn prepare(
             }
         }
         // The CCL and the dependencies must agree; what reviewers should see comes back as smells.
-        p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path).await?;
+        p.smells = crate::deps::check(state, &m, &p.thorns, &p.claims, &co.path, opts.reading).await?;
     }
     if let Some(stack) = &m.stack {
+        // A stack's dependencies name packages, as a package's do: each must be there, reviewed.
+        crate::deps::check_stack(state, &p.claims).await?;
         let own = match &stack.thornlist {
             Some(path) => Some(
                 git::read_in(co, path)
@@ -3913,13 +3995,43 @@ pub async fn store_pins(
             .bind(sim)
             .bind(&p.name)
             .bind(&p.url)
-            .bind(git::normalize_url(&p.url))
+            .bind(model::repo_key(&p.url))
             .bind(&p.git_ref)
             .bind(p.commit.as_ref().or(p.sha256.as_ref()))
             .execute(&mut *db)
             .await?;
     }
     Ok(())
+}
+
+/// Recomputes every stored repo key (`source_pins.url_norm`) from its URL with [`model::repo_key`],
+/// for the `shared-url-keys` data migration: only rows whose key differs are written. Returns how
+/// many changed.
+pub async fn rekey_source_pins(db: &mut sqlx::PgConnection) -> AppResult<usize> {
+    let rows: Vec<(i64, String, String, String, String)> =
+        sqlx::query_as("SELECT version_id, sim, repo, url, url_norm FROM source_pins").fetch_all(&mut *db).await?;
+    let (mut vids, mut sims, mut repos, mut keys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (vid, sim, repo, url, old) in rows {
+        let key = model::repo_key(&url);
+        if key != old {
+            vids.push(vid);
+            sims.push(sim);
+            repos.push(repo);
+            keys.push(key);
+        }
+    }
+    sqlx::query(
+        "UPDATE source_pins p SET url_norm = k.key
+         FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[]) AS k(vid, sim, repo, key)
+         WHERE p.version_id = k.vid AND p.sim = k.sim AND p.repo = k.repo",
+    )
+    .bind(&vids)
+    .bind(&sims)
+    .bind(&repos)
+    .bind(&keys)
+    .execute(&mut *db)
+    .await?;
+    Ok(keys.len())
 }
 
 /// Admin-only: a curated version (a commit that exists upstream, named by the admin).
@@ -4012,6 +4124,18 @@ async fn poll_once(state: &AppState) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repo registered once can't be registered again through another spelling, case included
+    /// on the forges that ignore it.
+    #[test]
+    fn one_repo_by_any_spelling() {
+        let registered = "https://github.com/EinsteinToolkit/Cottonmouth";
+        for other in ["https://github.com/einsteintoolkit/cottonmouth.git", "git@github.com:EinsteinToolkit/Cottonmouth", "https://www.github.com/EINSTEINTOOLKIT/cottonmouth/"] {
+            assert!(one_repo(registered, other), "{other}");
+        }
+        assert!(!one_repo("https://git.example.org/X/Y", "https://git.example.org/x/y"));
+        assert!(!one_repo(registered, "https://github.com/EinsteinToolkit/Cottonmouth2"));
+    }
 
     fn rule(pattern: Option<&str>) -> TagRule {
         TagRule { pattern: pattern.map(|p| p.parse().unwrap()), since: None }

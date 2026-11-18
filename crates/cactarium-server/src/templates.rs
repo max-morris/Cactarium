@@ -736,6 +736,34 @@ pub struct AdminAuditPage {
     pub rows: Vec<AuditRow>,
 }
 
+/// A submitted download, for the admin page.
+#[derive(Clone, Debug)]
+pub struct DownloadRow {
+    pub id: i64,
+    pub url: String,
+    pub sha256: String,
+    /// Empty until the fetch read it.
+    pub size: String,
+    /// `fetching`, `ok` (verified) or `failed`.
+    pub fetch: String,
+    pub fetch_error: String,
+    pub note: String,
+    /// `pending`, `approved` or `rejected`.
+    pub review: String,
+    pub review_note: String,
+    pub submitter: String,
+    pub reviewer: String,
+    pub when: String,
+}
+
+#[derive(Template)]
+#[template(path = "admin_downloads.html")]
+pub struct AdminDownloadsPage {
+    pub ctx: PageCtx,
+    pub nav: String,
+    pub downloads: Vec<DownloadRow>,
+}
+
 #[derive(Template)]
 #[template(path = "admin_tags.html")]
 pub struct AdminTagsPage {

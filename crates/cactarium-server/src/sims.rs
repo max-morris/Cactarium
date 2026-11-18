@@ -183,9 +183,11 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
 
 /// Every repo a sim pins must be a registered package's, at a commit that package's repo has: a
 /// downstream user must be able to rebuild the sim from the Cactarium alone. The pin's identity is
-/// then `owner/pkg@version` (a commit a version froze) or `owner/pkg#sha` (any other commit of
-/// the repo). A tarball pin (sha256 only) has no package identity. Refuses with every pin that
-/// fails, and what to do about it. For an upload, where the uploader sees the answer and can try
+/// then `owner/pkg@version` (a commit a version froze) or `owner/pkg` at that commit (any other
+/// commit of the repo). A download (a tarball component pinned by sha256) has no package identity:
+/// it must be one the Cactarium's reviewers approved (`cactup download submit <url>`), and so must
+/// every `[[input]]` downloaded by url and sha256. Refuses with every pin that fails, and what to
+/// do about it. For an upload, where the uploader sees the answer and can try
 /// again; a tag read from a repo uses [`check_pins_at_tag`].
 pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
     let p = pin_problems(state, sim, &[]).await?;
@@ -197,19 +199,22 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// sim's repo.
 #[derive(Default)]
 pub struct PinProblems {
-    /// Facts about the commit: a tarball pin (it has no package identity, and never will).
+    /// Facts about the commit: a download (a tarball pin or an input's) the Cactarium's reviewers
+    /// rejected.
     pub facts: Vec<String>,
     /// Things the world can change: no package for the repo is registered yet, or it is but isn't
     /// public yet (awaiting review, a sibling entry not yet approved, or being registered along
-    /// with this one), its history can't be read right now (the network, the host), or the pinned
-    /// commit isn't in its repo yet (pushed after the tag).
+    /// with this one), its history can't be read right now (the network, the host), the pinned
+    /// commit isn't in its repo yet (pushed after the tag), or a download isn't approved yet
+    /// (never submitted, or awaiting review).
     pub passing: Vec<String>,
 }
 
 /// What is wrong with `sim`'s pins, for an upload ([`check_pins`]) or a tag (`tracker::prepare`,
 /// where facts make the version invalid and passing problems leave the tag unread).
-/// `registering` holds normalized URLs of packages being registered right now, in the same
-/// registration: a pin to one is a package that isn't public yet.
+/// `registering` holds the URLs of packages being registered right now, in the same registration:
+/// a pin to one is a package that isn't public yet. A pin's URL matches a package's by the shared
+/// key ([`model::find_repo`]).
 pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String]) -> AppResult<PinProblems> {
     // Public packages first (oldest first), then any other package entry, which only tells a
     // registered-but-not-public repo from one nobody registered.
@@ -221,17 +226,26 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     .await?;
     let policy = crate::git::GitPolicy { allow_local: state.cfg.allow_local_repos };
     let mut out = PinProblems::default();
+    // An input's download is pinned by its sha256 like a tarball component, and reviewed the same
+    // way (one read from the sim's own repo, `repo-file`, is pinned by the commit instead).
+    for i in &sim.inputs {
+        if let (Some(url), Some(sha)) = (&i.url, &i.sha256) {
+            download_problem(state, &format!("input {}", i.knob), url, sha, &mut out).await?;
+        }
+    }
     for pin in &sim.repos {
         let Some(commit) = pin.commit.as_deref() else {
-            out.facts.push(format!(
-                "{}: a tarball pin has no package identity; every repo a sim builds from must be a registered package's",
-                pin.name
-            ));
+            // A download (a tarball component pinned by sha256) belongs to no package: it must be
+            // one the Cactarium's reviewers approved, at exactly this content.
+            if let Some(sha) = &pin.sha256 {
+                download_problem(state, &pin.name, &pin.url, sha, &mut out).await?;
+            } else {
+                out.facts.push(format!("{}: pinned to neither a commit nor a sha256", pin.name));
+            }
             continue;
         };
-        let norm = crate::git::normalize_url(&pin.url);
-        let Some((owner, name, url, public)) = packages.iter().find(|(_, _, u, _)| crate::git::normalize_url(u) == norm) else {
-            if registering.contains(&norm) {
+        let Some((owner, name, url, public)) = model::find_repo(&pin.url, &packages, |(_, _, u, _)| u) else {
+            if model::find_repo(&pin.url, registering, |u| u).is_some() {
                 out.passing.push(format!("{} ({}) is the repo of a package registered along with this entry, not public yet", pin.name, pin.url));
                 continue;
             }
@@ -282,6 +296,35 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
         }
     }
     Ok(out)
+}
+
+/// What is wrong with a download a sim pins (`url` with content `sha256`), if anything: it must be
+/// approved on the Cactarium. Never submitted, or awaiting review, may change (an upload is refused
+/// saying how to submit it; a tag waits); rejected is a fact.
+async fn download_problem(state: &AppState, name: &str, url: &str, sha: &str, out: &mut PinProblems) -> AppResult<()> {
+    let submit = crate::web::downloads::submit_command(url);
+    let short = &sha[..12];
+    let Some(st) = crate::web::downloads::status_of(state, url, sha).await? else {
+        out.passing.push(format!(
+            "{name}: the download {url} (sha256 {short}) hasn't been reviewed by the Cactarium: submit it with `{submit}`, and publish once it is approved"
+        ));
+        return Ok(());
+    };
+    match (st.review.as_str(), st.fetch_state.as_str()) {
+        ("approved", _) => {}
+        ("rejected", _) => out.facts.push(format!("{name}: the download {url} (sha256 {short}) was rejected by the Cactarium's reviewers")),
+        (_, "fetching") => out.passing.push(format!(
+            "{name}: the download {url} (sha256 {short}) is being verified by the Cactarium (`{submit}` shows how it stands); publish once it is approved"
+        )),
+        (_, "failed") => out.passing.push(format!(
+            "{name}: the server couldn't verify {url}: {}; fix the url or the sha256, or submit it again with `{submit}`",
+            st.fetch_error.as_deref().unwrap_or("its fetch failed")
+        )),
+        _ => out.passing.push(format!(
+            "{name}: the download {url} (sha256 {short}) awaits review on the Cactarium (`{submit}` shows its review); publish once it is approved"
+        )),
+    }
+    Ok(())
 }
 
 /// Publishes a checked sim as a version of `owner/name`: `owner` is the user or one of their
@@ -418,8 +461,10 @@ pub fn stamped(entry: &Entry, name: &str, label: &str, sim: &SimFile) -> AppResu
 }
 
 /// Stores a checked sim as version `vid` (`label`) of `entry`, as its sim `name` ("" for the
-/// entry's only sim): stamps it ([`stamped`]), keeps the file, its pins and the thorns it builds
-/// (the version's thorn index is the union of its sims'). Returns the stored file's sha256.
+/// entry's only sim): labels its pins with the versions that froze their commits
+/// ([`model::label_pins`]: `owner/pkg@X.Y.Z`, format 1, never `#<sha>`), stamps it ([`stamped`]),
+/// keeps the file, its pins and the thorns it builds (the version's thorn index is the union of
+/// its sims'). Returns the stored file's sha256.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_version(
     db: &mut sqlx::PgConnection,
@@ -431,9 +476,12 @@ pub async fn store_version(
     checked: Checked,
     text: EntryText<'_>,
 ) -> AppResult<String> {
-    let Checked { sim, index } = checked;
-    let (stored, sha) = stamped(entry, name, label, &sim)?;
+    let Checked { mut sim, index } = checked;
     let mut tx = sqlx::Connection::begin(&mut *db).await?;
+    // Each pin says which package version it is, as the Cactarium knows it now (a label: the
+    // commit is what gets fetched). Only files stored from now on; stored ones never change.
+    model::label_pins(&mut tx, &mut sim.repos).await?;
+    let (stored, sha) = stamped(entry, name, label, &sim)?;
     sqlx::query("INSERT INTO sim_files (version_id, name, sha256, content, index) VALUES ($1, $2, $3, $4, $5)")
         .bind(vid)
         .bind(name)
@@ -554,5 +602,52 @@ commit = "{SHA}"
         let unpinned = sim(false, "").replace(&format!("commit = \"{SHA}\"\n"), "");
         let e = check(unpinned.as_bytes()).err().unwrap().to_string();
         assert!(e.contains("fully specified"), "{e}");
+    }
+
+    /// A pin's label (`owner/pkg@X.Y.Z`, on a track too) needs nothing past `.sim` format 1, so a
+    /// stored sim keeps the format its content needs; a sha256 pin can't carry one.
+    #[test]
+    fn pin_labels_keep_format_1() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let entry = Entry {
+            id: 1,
+            kind: "sim".into(),
+            owner: "max".into(),
+            name: "qc0".into(),
+            summary: None,
+            description: None,
+            visibility: "public".into(),
+            verified: false,
+            trusted: false,
+            curated: false,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut parsed = SimFile::from_toml(&sim(false, "x = 1")).unwrap();
+        for label in ["max/carpetx@1.0.0", "max/carpetx@mixed-precision:1.2.0", "max/carpetx"] {
+            parsed.repos[0].cactarium = Some(label.parse().unwrap());
+            let (stored, _) = stamped(&entry, "", "2.0.0", &parsed).unwrap();
+            assert!(stored.starts_with("format = 1\n"), "{label}: {stored}");
+            assert!(stored.contains(&format!("cactarium = \"{label}\"")), "{stored}");
+            assert_eq!(SimFile::from_toml(&stored).unwrap().repos[0].cactarium, parsed.repos[0].cactarium);
+        }
+        parsed.repos[0].commit = None;
+        parsed.repos[0].sha256 = Some("ab".repeat(32));
+        assert!(stamped(&entry, "", "2.0.0", &parsed).is_err(), "a download carries no label");
+    }
+    /// A sim may pin a download (a tarball component) by its sha256 beside its git repos: the
+    /// file's checks pass, and whether the download is approved is up to `pin_problems`.
+    #[test]
+    fn a_download_pin_passes_the_file_checks() {
+        let h = "ab".repeat(32);
+        let section = format!(
+            "CarpetX/Loop\n\n!TARGET = $ROOT/dl\n!TYPE = https\n!URL = https://x.org/files/lib.tar.gz\n!CHECKSUM_SHA256 = {h}\n!CHECKOUT = lib.tar.gz\n"
+        );
+        let text = sim(false, "x = 1").replacen("CarpetX/Loop\n", &section, 1)
+            + &format!("[[repo]]\nname = \"lib.tar.gz\"\nurl = \"https://x.org/files/lib.tar.gz\"\nsha256 = \"{h}\"\n");
+        let c = check(text.as_bytes()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.index.repos, ["CarpetX", "lib.tar.gz"]);
+        assert_eq!(c.sim.repos[1].pin(), Some(cactup_ecosystem_common::crl::Pin::Sha256(h)));
     }
 }

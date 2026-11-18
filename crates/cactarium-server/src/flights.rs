@@ -22,6 +22,17 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
         Flights { cells: Mutex::new(HashMap::new()), ttl, cap }
     }
 
+    /// The value for `key` if it is known (computed, and not expired), without computing it or
+    /// waiting for a computation under way.
+    pub fn peek(&self, key: &K) -> Option<V> {
+        let cells = self.cells.lock().unwrap_or_else(PoisonError::into_inner);
+        let (made, cell) = cells.get(key)?;
+        if self.ttl.is_some_and(|ttl| made.elapsed() >= ttl) {
+            return None;
+        }
+        cell.get().cloned()
+    }
+
     /// The value for `key`, computing it with `make` unless it is known or being computed. A
     /// failure isn't kept: the next request tries again. If the request computing it goes away,
     /// one of the waiting ones takes over.
@@ -80,5 +91,18 @@ mod tests {
         assert_eq!(f.get_or_try_init(1, || async { Ok::<_, &str>(3) }).await, Ok(2), "kept");
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(f.get_or_try_init(1, || async { Ok::<_, &str>(4) }).await, Ok(4), "expired");
+    }
+
+    /// A peek answers only what is known, and computes nothing.
+    #[tokio::test]
+    async fn peeks_compute_nothing() {
+        let f: Flights<u32, u32> = Flights::new(Some(Duration::from_millis(30)), 10);
+        assert_eq!(f.peek(&1), None);
+        assert_eq!(f.get_or_try_init(1, || async { Err::<u32, _>("no") }).await, Err("no"));
+        assert_eq!(f.peek(&1), None, "a failure isn't known");
+        assert_eq!(f.get_or_try_init(1, || async { Ok::<_, &str>(2) }).await, Ok(2));
+        assert_eq!(f.peek(&1), Some(2));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(f.peek(&1), None, "expired");
     }
 }

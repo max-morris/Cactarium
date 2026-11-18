@@ -7,10 +7,13 @@
 //! package itself, or by the `needs` thorns of a dependency that applies to that thorn (for an
 //! `any-of`, by every alternative). Smells are what a reviewer should look at but that don't block:
 //! needs the CCL doesn't explain, includes that reach another thorn's sources by path, and so on.
+//!
+//! What a requirement is and what meets it is the crate's (`ccl::needs_of`, `meets`, `unmet`),
+//! shared with CactUp's composition and trim, so the two can't disagree about what a thorn needs.
 
 use std::path::Path;
 
-use cactup_ecosystem_common::ccl::ThornFacts;
+use cactup_ecosystem_common::ccl::{Need, ThornFacts, meets, unmet};
 use cactup_ecosystem_common::manifest::Manifest;
 use cactup_ecosystem_common::version::{TrackedReq, TrackedVersion};
 
@@ -21,65 +24,60 @@ use crate::state::AppState;
 /// A published thorn as `prepare` scanned it: (arrangement, name, directory in the repo, facts).
 pub type Thorn = (String, String, String, ThornFacts);
 
-/// A hard CCL requirement.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Need {
-    Impl(String),
-    Cap(String),
-    Thorn(String),
-    Func(String),
-}
-
-impl Need {
-    fn says(&self) -> String {
-        match self {
-            Need::Impl(i) => format!("inherits or befriends {i}"),
-            Need::Cap(c) => format!("requires the capability {c}"),
-            Need::Thorn(t) => format!("requires the thorn {t}"),
-            Need::Func(f) => format!("requires the function {f}"),
-        }
-    }
-}
-
-fn needs_of(f: &ThornFacts) -> Vec<Need> {
-    let mut v: Vec<Need> = Vec::new();
-    v.extend(f.inherits.iter().chain(&f.friends).map(|i| Need::Impl(i.clone())));
-    v.extend(f.requires.iter().map(|c| Need::Cap(c.clone())));
-    v.extend(f.requires_thorns.iter().map(|t| Need::Thorn(t.clone())));
-    v.extend(f.requires_functions.iter().map(|x| Need::Func(x.clone())));
-    v.dedup();
-    v
-}
-
-/// Whether thorn `name` (with `facts`) meets the requirement. CCL names are case-insensitive.
-fn meets(name: &str, facts: &ThornFacts, need: &Need) -> bool {
-    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-    match need {
-        Need::Impl(i) => facts.implements.as_deref().is_some_and(|x| eq(x, i)),
-        Need::Cap(c) => facts.provides.iter().any(|p| eq(p, c)),
-        Need::Thorn(t) => eq(name, t),
-        Need::Func(x) => facts.provides_functions.iter().any(|p| eq(p, x)),
-    }
-}
-
 /// The version of a dependency's target that the check reads: the newest one on the Cactarium
-/// within its range (or at its commit), reviewed or awaiting review.
+/// within its range (or at its commit), reviewed or awaiting review (a rejected one never counts).
+/// One awaiting review, or of an entry that isn't public, makes the dependent wait ([`judge`]).
 struct TargetVersion {
     label: String,
     flesh: bool,
     library: bool,
     thorns: Vec<(String, ThornFacts)>,
+    /// `approved` or `pending`.
+    review: String,
+    /// The target entry's visibility: `public`, `pending` (awaiting its first review) or `hidden`.
+    visibility: String,
 }
 
-async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetVersion>> {
-    let rows: Vec<(i64, String, String, Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT v.id, v.track, v.version, v.commit, v.manifest FROM versions v JOIN entries e ON e.id = v.entry_id
-         WHERE e.owner = $1 AND e.name = $2 AND e.kind = 'package' AND v.state <> 'invalid'
-           AND v.review IN ('approved', 'pending')
+/// How a commit's dependencies are read: as a version to freeze, or as a tip read now for someone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reading {
+    /// A version to freeze (a tag, a registration's preview, a snapshot release): every target
+    /// the Cactarium has counts, and one awaiting review, or not public, makes it wait ([`judge`]).
+    /// What it reports goes to the entry's managers and the admins.
+    #[default]
+    Freeze,
+    /// A branch tip or commit read now for a requester, which freezes nothing: only what that
+    /// requester could be served counts (public entries and approved versions; versions awaiting
+    /// review of public entries when `releases`, entries awaiting their first review when
+    /// `entries`, as the include-unreviewed rules allow), and nothing waits. Anything else is no
+    /// version at all, so an answer never names it.
+    Tip { releases: bool, entries: bool },
+}
+
+/// Which target entries (by visibility) and versions (by review) count: all of them when freezing
+/// (a wait decides), what the requester could be served for a tip.
+fn counted(reading: Reading) -> (Vec<&'static str>, Vec<&'static str>) {
+    match reading {
+        Reading::Freeze => (vec!["public", "pending", "hidden"], vec!["approved", "pending"]),
+        Reading::Tip { releases, entries } => (
+            if entries { vec!["public", "pending"] } else { vec!["public"] },
+            if releases { vec!["approved", "pending"] } else { vec!["approved"] },
+        ),
+    }
+}
+
+async fn target_version(state: &AppState, alt: &Alt, reading: Reading) -> AppResult<Option<TargetVersion>> {
+    let (entries, releases) = counted(reading);
+    let rows: Vec<(i64, String, String, Option<String>, Option<serde_json::Value>, String, String)> = sqlx::query_as(
+        "SELECT v.id, v.track, v.version, v.commit, v.manifest, v.review, e.visibility FROM versions v JOIN entries e ON e.id = v.entry_id
+         WHERE e.owner = $1 AND e.name = $2 AND e.kind = 'package' AND v.state <> 'invalid' AND v.invalid_reason IS NULL
+           AND v.review = ANY($3) AND e.visibility = ANY($4)
          ORDER BY v.sort_key DESC",
     )
     .bind(&alt.owner)
     .bind(&alt.name)
+    .bind(&releases)
+    .bind(&entries)
     .fetch_all(&state.db)
     .await?;
     let req: Option<TrackedReq> = match (&alt.sha, &alt.range) {
@@ -90,7 +88,7 @@ async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetV
         },
         (None, None) => Some(TrackedReq::any()),
     };
-    let chosen = rows.into_iter().find(|(_, track, version, commit, _)| match (&alt.sha, &req) {
+    let chosen = rows.into_iter().find(|(_, track, version, commit, ..)| match (&alt.sha, &req) {
         (Some(sha), _) => commit.as_deref().is_some_and(|c| c.starts_with(sha.as_str())),
         (None, Some(q)) => {
             let label = if track.is_empty() { version.clone() } else { format!("{track}:{version}") };
@@ -98,7 +96,7 @@ async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetV
         }
         (None, None) => false,
     });
-    let Some((id, track, version, _, manifest)) = chosen else { return Ok(None) };
+    let Some((id, track, version, _, manifest, review, visibility)) = chosen else { return Ok(None) };
     let thorns: Vec<(String, serde_json::Value)> =
         sqlx::query_as("SELECT name, facts FROM thorns WHERE version_id = $1 ORDER BY name")
             .bind(id)
@@ -112,7 +110,31 @@ async fn target_version(state: &AppState, alt: &Alt) -> AppResult<Option<TargetV
             .into_iter()
             .map(|(n, f)| (n, serde_json::from_value(f).unwrap_or_default()))
             .collect(),
+        review,
+        visibility,
     }))
+}
+
+/// Why a dependent can't be judged against a target version yet, if it can't: the target entry
+/// isn't public (it awaits its first review, or an admin hid it), or the version awaits review.
+/// Clients aren't served either, so the dependent waits (left unread, tried again) until it is
+/// reviewed rather than freeze against something nobody can install; once it is approved the
+/// dependent is read against it, and once it is rejected, against the next version in range.
+/// The words name no version nor say why a package isn't public: they reach the dependent's
+/// registrant and its version page, who may not see the target.
+fn judge(target: &str, tv: &TargetVersion) -> Option<String> {
+    if tv.visibility != "public" {
+        return Some(no_public_version(target, ""));
+    }
+    (tv.review == "pending").then(|| {
+        format!("the dependency on {target}: the newest version of {target} in its range awaits review; this waits until it is reviewed")
+    })
+}
+
+/// What a dependent waits for when the Cactarium has no public version of its target in range: one
+/// not registered yet, not public yet, or with none in range yet, said alike.
+fn no_public_version(target: &str, at: &str) -> String {
+    format!("the dependency on {target}{at}: the Cactarium has no public version of that package in that range yet; this waits until it has")
 }
 
 /// Whether the target of `alt` has tags in its range not read yet (see
@@ -135,6 +157,11 @@ async fn alt_unread(state: &AppState, alt: &Alt) -> AppResult<crate::tracker::Un
     })
 }
 
+/// The thorn among a dependency's `needs` that meets `need`, of the target version's `thorns`.
+fn supplier(needs: &[String], thorns: &[(String, ThornFacts)], need: &Need) -> Option<String> {
+    needs.iter().find(|n| thorns.iter().any(|(t, f)| t == *n && meets(t, f, need))).cloned()
+}
+
 /// Whether a library's checkout can't go at `path`: something is there already (a file, or a
 /// folder with anything in it).
 fn occupied(path: &Path) -> bool {
@@ -145,19 +172,31 @@ fn occupied(path: &Path) -> bool {
     }
 }
 
-/// Checks a package version's dependencies against its thorns' CCL. `own` is what will be
-/// published; `repo` is the checkout (for the includes reviewers should see). Returns the smells,
-/// or refuses with every problem and, where it can tell, the line that fixes it.
-pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[ClaimRec], repo: &Path) -> AppResult<Vec<String>> {
-    let Some(pkg) = &m.package else { return Ok(Vec::new()) };
-    let mut problems: Vec<String> = Vec::new();
-    // What may become true without a new commit: a target nobody registered yet, or one with no
-    // version in range yet. A version read at a tag waits for these instead of freezing invalid.
-    let mut waiting: Vec<String> = Vec::new();
-    let mut smells: Vec<String> = Vec::new();
+/// Whose dependencies are checked: a package's (its thorns' CCL is checked against the targets'
+/// `needs` thorns, and `needs` and `into` must fit each target) or a stack's (its own thornlist
+/// names the thorns it builds: `needs`, when given, must exist in the target, and nothing more).
+#[derive(Clone, Copy)]
+enum Of<'a> {
+    Package { repo: &'a Path },
+    Stack,
+}
 
-    // Each dependency, with the target version every alternative resolves to.
-    let mut deps: Vec<(&ClaimRec, Vec<(Alt, TargetVersion)>)> = Vec::new();
+/// Each dependency with the target version every alternative resolves to, what is wrong (facts
+/// about the commit) and what may become true without a new commit (a version read at a tag waits
+/// for these instead of freezing invalid).
+struct Resolution<'a> {
+    deps: Vec<(&'a ClaimRec, Vec<(Alt, TargetVersion)>)>,
+    problems: Vec<String>,
+    waiting: Vec<String>,
+}
+
+/// `reading` says which targets count and whether what awaits review makes it wait ([`Reading`]).
+async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: Of<'_>, reading: Reading) -> AppResult<Resolution<'a>> {
+    let mut r = Resolution { deps: Vec::new(), problems: Vec::new(), waiting: Vec::new() };
+    let what = match of {
+        Of::Package { .. } => "package",
+        Of::Stack => "stack",
+    };
     for c in claims.iter().filter(|c| c.kind == "dependency") {
         let mut resolved = Vec::new();
         for alt in c.options() {
@@ -166,60 +205,70 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                 (None, Some(h)) => format!("#{h}"),
                 (None, None) => String::new(),
             };
-            match target_version(state, &alt).await? {
+            match target_version(state, &alt, reading).await? {
                 None => {
-                    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM entries WHERE owner = $1 AND name = $2")
+                    // Only a public entry's kind is told: another's existence isn't anyone's to learn.
+                    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM entries WHERE owner = $1 AND name = $2 AND visibility = 'public'")
                         .bind(&alt.owner)
                         .bind(&alt.name)
                         .fetch_optional(&state.db)
                         .await?;
-                    problems.push(match kind.as_deref() {
-                        Some(k) if k != "package" => format!(
-                            "the dependency on {}: that is a {k}; a package depends on packages, whose thorns it names in needs (say works-with for a {k})",
+                    match kind.as_deref() {
+                        Some(k) if k != "package" => r.problems.push(format!(
+                            "the dependency on {}: that is a {k}; a {what} depends on packages, whose thorns it names in needs (say works-with for a {k})",
                             alt.target()
-                        ),
-                        _ => {
-                            waiting.push(format!(
-                                "the dependency on {}{at}: the Cactarium has no version of that package in that range yet; publish it first",
-                                alt.target()
-                            ));
-                            continue;
-                        }
-                    });
+                        )),
+                        _ => r.waiting.push(no_public_version(&alt.target(), &at)),
+                    }
                 }
                 Some(tv) => {
-                    let at = format!("{}@{}", alt.target(), tv.label);
-                    // needs exactly when the target has thorns; into exactly when it is a library.
-                    match (tv.library, tv.flesh, &c.into) {
-                        (true, _, _) if !c.alternatives.is_empty() => problems.push(format!(
-                            "{at} is a library, which can't be an alternative in an any-of: depend on it with target and into"
-                        )),
-                        (true, _, None) => problems.push(format!(
-                            "{at} is a library: say where its checkout goes with into = \"<folder in this repo>\" on the dependency{}",
-                            if alt.needs.is_empty() { "" } else { ", and drop needs (a library has no thorns)" }
-                        )),
-                        (false, _, Some(into)) => problems.push(format!(
-                            "the dependency on {} gives into = \"{into}\", but {at} isn't a library (library = true): drop into",
-                            alt.target()
-                        )),
-                        (false, true, _) if !alt.needs.is_empty() => problems.push(format!(
-                            "{at} is a flesh, which has no thorns: drop the needs of the dependency on {}",
-                            alt.target()
-                        )),
-                        (false, false, _) if alt.needs.is_empty() => problems.push(format!(
-                            "the dependency on {} has no needs, but {at} has thorns: name the ones this package uses",
-                            alt.target()
-                        )),
-                        _ => {}
+                    if reading == Reading::Freeze && let Some(why) = judge(&alt.target(), &tv) {
+                        r.waiting.push(why);
+                        continue;
                     }
-                    if let Some(into) = &c.into
-                        && tv.library
-                        && occupied(&repo.join(into))
-                    {
-                        problems.push(format!(
-                            "the dependency on {} puts its checkout into {into}, which this commit already has: choose a folder the repo doesn't use",
+                    let at = format!("{}@{}", alt.target(), tv.label);
+                    match of {
+                        // needs exactly when the target has thorns; into exactly when it is a library.
+                        Of::Package { repo } => {
+                            match (tv.library, tv.flesh, &c.into) {
+                                (true, _, _) if !c.alternatives.is_empty() => r.problems.push(format!(
+                                    "{at} is a library, which can't be an alternative in an any-of: depend on it with target and into"
+                                )),
+                                (true, _, None) => r.problems.push(format!(
+                                    "{at} is a library: say where its checkout goes with into = \"<folder in this repo>\" on the dependency{}",
+                                    if alt.needs.is_empty() { "" } else { ", and drop needs (a library has no thorns)" }
+                                )),
+                                (false, _, Some(into)) => r.problems.push(format!(
+                                    "the dependency on {} gives into = \"{into}\", but {at} isn't a library (library = true): drop into",
+                                    alt.target()
+                                )),
+                                (false, true, _) if !alt.needs.is_empty() => r.problems.push(format!(
+                                    "{at} is a flesh, which has no thorns: drop the needs of the dependency on {}",
+                                    alt.target()
+                                )),
+                                (false, false, _) if alt.needs.is_empty() => r.problems.push(format!(
+                                    "the dependency on {} has no needs, but {at} has thorns: name the ones this package uses",
+                                    alt.target()
+                                )),
+                                _ => {}
+                            }
+                            if let Some(into) = &c.into
+                                && tv.library
+                                && occupied(&repo.join(into))
+                            {
+                                r.problems.push(format!(
+                                    "the dependency on {} puts its checkout into {into}, which this commit already has: choose a folder the repo doesn't use",
+                                    alt.target()
+                                ));
+                            }
+                        }
+                        // A stack's needs are optional, but a flesh or a library has no thorns to name.
+                        Of::Stack if (tv.flesh || tv.library) && !alt.needs.is_empty() => r.problems.push(format!(
+                            "{at} is a {}, which has no thorns: drop the needs of the dependency on {}",
+                            if tv.flesh { "flesh" } else { "library" },
                             alt.target()
-                        ));
+                        )),
+                        Of::Stack => {}
                     }
                     let missing: Vec<&String> = alt
                         .needs
@@ -234,11 +283,11 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                         for n in missing {
                             let said = format!("the dependency on {} needs {n}, which {}@{} doesn't have", alt.target(), alt.target(), tv.label);
                             match unread {
-                                Unread::Yes => waiting.push(format!("{said}, and a version of it in range isn't read yet")),
-                                Unread::CantTell => waiting.push(format!(
+                                Unread::Yes => r.waiting.push(format!("{said}, and a version of it in range isn't read yet")),
+                                Unread::CantTell => r.waiting.push(format!(
                                     "{said}, and its repo can't be listed right now to see whether a version in range not read yet has it"
                                 )),
-                                Unread::No => problems.push(said),
+                                Unread::No => r.problems.push(said),
                             }
                         }
                     }
@@ -246,17 +295,57 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
                 }
             }
         }
-        deps.push((c, resolved));
+        r.deps.push((c, resolved));
     }
+    Ok(r)
+}
+
+/// Refuses what [`resolve_dependencies`] found wrong, with every problem (and what waits beside
+/// them); else, when something waits, [`AppError::Upstream`] (the tag is left unread and tried
+/// again; a person publishing now sees it as an error, `stacks::for_a_person`).
+fn refuse(mut problems: Vec<String>, mut waiting: Vec<String>) -> AppResult<()> {
+    problems.dedup();
+    waiting.dedup();
+    if !problems.is_empty() {
+        problems.extend(waiting);
+        return Err(AppError::bad(problems.join("; ")));
+    }
+    if !waiting.is_empty() {
+        return Err(AppError::Upstream(waiting.join("; ")));
+    }
+    Ok(())
+}
+
+/// Checks a stack release's dependencies as a package version's are checked, but for the CCL (its
+/// own thornlist names what it builds): each target (every alternative of an any-of) is a package
+/// with a version on the Cactarium in range (or at the commit) that has the `needs` thorns, if any
+/// are named. A target awaiting review, or not public, makes the release wait ([`judge`]).
+pub async fn check_stack(state: &AppState, claims: &[ClaimRec]) -> AppResult<()> {
+    let r = resolve_dependencies(state, claims, Of::Stack, Reading::Freeze).await?;
+    refuse(r.problems, r.waiting)
+}
+
+/// Checks a package version's dependencies against its thorns' CCL. `own` is what will be
+/// published; `repo` is the checkout (for the includes reviewers should see). Returns the smells,
+/// or refuses with every problem and, where it can tell, the line that fixes it. `reading` says
+/// which targets count, and whether one awaiting review makes it wait ([`Reading`]).
+pub async fn check(
+    state: &AppState,
+    m: &Manifest,
+    own: &[Thorn],
+    claims: &[ClaimRec],
+    repo: &Path,
+    reading: Reading,
+) -> AppResult<Vec<String>> {
+    let Some(pkg) = &m.package else { return Ok(Vec::new()) };
+    let mut smells: Vec<String> = Vec::new();
+    let Resolution { deps, mut problems, waiting } =
+        resolve_dependencies(state, claims, Of::Package { repo }, reading).await?;
 
     // The CCL can only be checked against what the dependencies resolve to: with one still missing,
     // the facts found so far decide, else the version waits.
     if !waiting.is_empty() {
-        if !problems.is_empty() {
-            problems.extend(waiting);
-            return Err(AppError::bad(problems.join("; ")));
-        }
-        return Err(AppError::Upstream(waiting.join("; ")));
+        return refuse(problems, waiting).map(|()| Vec::new());
     }
 
     // Every hard CCL requirement of every published thorn is met. One unmet while an applicable
@@ -264,19 +353,16 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
     let mut ccl_waiting: Vec<String> = Vec::new();
     let mut explained: Vec<(String, String)> = Vec::new(); // (target, needs thorn) some requirement used
     for (arr, name, _, facts) in own {
-        for need in needs_of(facts) {
-            if own.iter().any(|(_, n, _, f)| meets(n, f, &need)) {
-                continue;
-            }
+        // What CactUp reads a thorn's requirements as, and meets them by (the crate's `ccl`): the
+        // needs the package's own thorns leave unmet.
+        for need in unmet(facts, own.iter().map(|(_, n, _, f)| (n.as_str(), f))) {
             let applicable: Vec<&(&ClaimRec, Vec<(Alt, TargetVersion)>)> = deps
                 .iter()
                 .filter(|(c, opts)| (c.needed_by.is_empty() || c.needed_by.contains(name)) && !opts.is_empty())
                 .collect();
             let mut met = false;
             for (_, opts) in &applicable {
-                let supplies = |(alt, tv): &(Alt, TargetVersion)| {
-                    alt.needs.iter().find(|n| tv.thorns.iter().any(|(t, f)| t == *n && meets(t, f, &need))).cloned()
-                };
+                let supplies = |(alt, tv): &(Alt, TargetVersion)| supplier(&alt.needs, &tv.thorns, &need);
                 let found: Vec<Option<String>> = opts.iter().map(supplies).collect();
                 if found.iter().all(Option::is_some) {
                     met = true;
@@ -300,7 +386,7 @@ pub async fn check(state: &AppState, m: &Manifest, own: &[Thorn], claims: &[Clai
             });
             let said = format!(
                 "{arr}/{name} {}, which neither this package nor a dependency's needs supplies{}",
-                need.says(),
+                need,
                 hint.unwrap_or_else(|| ": add a [[dependency]] on the package that provides it, with needs naming its thorn, or exclude-thorns this thorn if it can't build".to_owned())
             );
             let mut unread = None;
@@ -443,4 +529,94 @@ fn includes_leaving(repo: &Path, thorn_dir: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(interface: &str, configuration: Option<&str>) -> ThornFacts {
+        ThornFacts::scan(interface, configuration)
+    }
+
+    /// The package's own thorns meet what they can, by the crate's rule: names compare
+    /// case-insensitively, each need is read once, and words an older scanner stored that are no
+    /// CCL names make no need (nothing could meet them).
+    #[test]
+    fn own_thorns_meet_needs_by_the_shared_rule() {
+        let z4c = facts("IMPLEMENTS: Z4c\nINHERITS: ADMBase, admbase, CarpetX\nREQUIRES FUNCTION GetLevel", Some("REQUIRES Loop\n"));
+        let admbase = facts("IMPLEMENTS: ADMBASE", None);
+        let own = [("Z4c", &z4c), ("ADMBase", &admbase)];
+        let left: Vec<String> = unmet(&z4c, own).iter().map(ToString::to_string).collect();
+        assert_eq!(left, ["inherits or befriends CarpetX", "requires the capability Loop", "requires the function GetLevel"]);
+        let old: ThornFacts = serde_json::from_value(serde_json::json!({
+            "implements": "X", "inherits": ["b@d"], "friends": [], "requires-functions": ["Get X"], "uses-functions": [],
+            "provides-functions": [], "uses-includes": [], "requires": [], "requires-thorns": ["no/pe"], "optional": [], "provides": []
+        }))
+        .unwrap();
+        assert!(unmet(&old, []).is_empty(), "no CCL name, no need");
+    }
+
+    /// A dependency supplies a need through one of its `needs` thorns that meets it; a thorn
+    /// without an IMPLEMENTS line implements nothing, even what its name spells.
+    #[test]
+    fn a_dependency_supplies_through_its_needs() {
+        let carpetx = facts("IMPLEMENTS: driver\nPROVIDES FUNCTION GetLevel WITH X LANGUAGE C", None);
+        let loop_ = facts("IMPLEMENTS: Loop", Some("PROVIDES Loop\n{\n}\n"));
+        let bare = facts("INHERITS: grid", None);
+        let thorns = vec![("CarpetX".to_owned(), carpetx), ("Loop".to_owned(), loop_), ("Grid".to_owned(), bare)];
+        let needs = ["CarpetX".to_owned(), "Loop".to_owned()];
+        assert_eq!(supplier(&needs, &thorns, &Need::Implementation("Driver".into())).as_deref(), Some("CarpetX"));
+        assert_eq!(supplier(&needs, &thorns, &Need::Capability("loop".into())).as_deref(), Some("Loop"));
+        assert_eq!(supplier(&needs, &thorns, &Need::Function("GetLevel".into())).as_deref(), Some("CarpetX"));
+        assert_eq!(supplier(&needs[..1], &thorns, &Need::Capability("Loop".into())), None, "not among its needs");
+        let all = ["Grid".to_owned()];
+        assert_eq!(supplier(&all, &thorns, &Need::Implementation("Grid".into())), None);
+        assert_eq!(supplier(&all, &thorns, &Need::Thorn("grid".into())).as_deref(), Some("Grid"));
+    }
+
+    /// A dependent waits while its target version awaits review or the target entry isn't public;
+    /// an approved version of a public package is judged.
+    #[test]
+    fn targets_awaiting_review_make_dependents_wait() {
+        let tv = |review: &str, visibility: &str| TargetVersion {
+            label: "2026.5.1".into(),
+            flesh: false,
+            library: false,
+            thorns: vec![],
+            review: review.into(),
+            visibility: visibility.into(),
+        };
+        assert_eq!(judge("et/carpet", &tv("approved", "public")), None);
+        let pending = judge("et/carpet", &tv("pending", "public")).unwrap();
+        assert!(pending.contains("in its range awaits review") && !pending.contains("2026.5.1"), "{pending}");
+        for vis in ["pending", "hidden"] {
+            let why = judge("et/carpet", &tv("approved", vis)).unwrap();
+            assert_eq!(why, no_public_version("et/carpet", ""), "a hidden or pending target is said like a missing one");
+            assert!(!why.contains("hidden") && !why.contains("review"), "{why}");
+        }
+    }
+
+    /// Problems refuse (with what waits beside them); what only waits is Upstream, which leaves a
+    /// tag unread.
+    #[test]
+    fn problems_refuse_and_waits_wait() {
+        assert!(refuse(vec![], vec![]).is_ok());
+        match refuse(vec!["a".into(), "a".into()], vec!["w".into()]) {
+            Err(AppError::BadRequest(m)) => assert_eq!(m, "a; w"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(refuse(vec![], vec!["w".into()]), Err(AppError::Upstream(m)) if m == "w"));
+    }
+
+    /// A tip read counts only what its requester could be served; freezing counts every target
+    /// and lets a wait decide. Rejected versions and hidden entries never count for a tip.
+    #[test]
+    fn tips_count_only_what_the_requester_sees() {
+        assert_eq!(Reading::default(), Reading::Freeze);
+        assert_eq!(counted(Reading::Freeze), (vec!["public", "pending", "hidden"], vec!["approved", "pending"]));
+        assert_eq!(counted(Reading::Tip { releases: false, entries: false }), (vec!["public"], vec!["approved"]));
+        assert_eq!(counted(Reading::Tip { releases: true, entries: false }), (vec!["public"], vec!["approved", "pending"]));
+        assert_eq!(counted(Reading::Tip { releases: true, entries: true }), (vec!["public", "pending"], vec!["approved", "pending"]));
+    }
 }

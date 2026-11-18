@@ -136,6 +136,11 @@ enum Command {
     MoveRepo { username: String, slug: String, url: String },
     /// Local development only: create a user who can use the development sign-in.
     DevUser { username: String },
+    /// Reviewed downloads, as an admin.
+    Download {
+        #[command(subcommand)]
+        action: DownloadAction,
+    },
     /// Create an API token for a user (scope "publish") and print it. It is shown only once.
     Token {
         username: String,
@@ -143,6 +148,20 @@ enum Command {
         name: String,
         #[arg(long, default_value_t = 90)]
         days: i32,
+    },
+}
+
+#[derive(Subcommand)]
+enum DownloadAction {
+    /// Approve a download without the server fetching it (too big, or on a host it can't reach),
+    /// as ADMIN vouching for it: a new one, or one awaiting review, whose fetch failed or that was
+    /// rejected. The audit log records that it wasn't verified.
+    Approve {
+        admin: String,
+        url: String,
+        sha256: String,
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -220,7 +239,8 @@ async fn main() -> anyhow::Result<()> {
     let migrate = || async {
         let mut m = sqlx::migrate!("./migrations");
         m.set_ignore_missing(true);
-        m.run(&db).await
+        m.run(&db).await?;
+        data_migrations(&db).await
     };
     match cli.command {
         Command::Migrate => {
@@ -445,6 +465,16 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(failed == 0, "{failed} of {} failed", entries.len());
             Ok(())
         }
+        Command::Download { action: DownloadAction::Approve { admin, url, sha256, note } } => {
+            let state = make_state(cfg, db)?;
+            let admin = cli_user(&state, &admin).await?;
+            anyhow::ensure!(admin.is_admin(), "{} is not an admin", admin.username);
+            let id = web::downloads::vouch(&state, &admin, &url, &sha256, note.as_deref())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Approved download #{id} without fetching it: {url}");
+            Ok(())
+        }
         Command::Token { username, name, days } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
@@ -479,9 +509,51 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve => {
             migrate().await?;
+            // A pin stored by the previous server between `migrate` and this start has its old
+            // key: recomputing is idempotent and writes only keys that differ.
+            let mut conn = db.acquire().await?;
+            match tracker::rekey_source_pins(&mut conn).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("{n} repo keys recomputed at startup"),
+                Err(e) => tracing::warn!("recomputing repo keys failed: {e}"),
+            }
+            drop(conn);
             serve(cfg, db).await
         }
     }
+}
+
+/// The data migrations a schema migration queued (`data_migrations`) that can't be written in SQL,
+/// run once each, right after the schema migrations: by `migrate` (which `just update` runs before
+/// the new server starts) or, failing that, by `serve`. Each runs in one transaction with its
+/// mark, so a step that fails is tried again next time and leaves nothing half done.
+async fn data_migrations(db: &sqlx::PgPool) -> anyhow::Result<()> {
+    let due: Vec<String> = sqlx::query_scalar("SELECT name FROM data_migrations WHERE done_at IS NULL ORDER BY name")
+        .fetch_all(db)
+        .await?;
+    for name in due {
+        let mut tx = db.begin().await?;
+        // Locked: a `migrate` and a `serve` starting together run each step once.
+        let still: Option<String> =
+            sqlx::query_scalar("SELECT name FROM data_migrations WHERE name = $1 AND done_at IS NULL FOR UPDATE")
+                .bind(&name)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if still.is_none() {
+            continue;
+        }
+        match name.as_str() {
+            "shared-url-keys" => {
+                let n = tracker::rekey_source_pins(&mut tx).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                tracing::info!("data migration {name}: {n} repo keys recomputed");
+            }
+            // Queued by a newer release: left for it.
+            _ => continue,
+        }
+        sqlx::query("UPDATE data_migrations SET done_at = now() WHERE name = $1").bind(&name).execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 async fn admin(db: &sqlx::PgPool, action: AdminAction) -> anyhow::Result<()> {
@@ -653,6 +725,12 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
                 .await;
             // Registration previews' temporary mirrors left by a process that died.
             let _ = tokio::task::spawn_blocking(git::sweep_temp_mirrors).await;
+            // Submitted downloads whose fetch outcome was never stored.
+            match web::downloads::requeue_stale(&sweeper).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("{n} submitted downloads left being fetched queued again"),
+                Err(e) => tracing::warn!("queueing stale download fetches again failed: {e}"),
+            }
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
@@ -661,6 +739,13 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("cannot listen on {bind}"))?;
     tracing::info!("listening on {bind}, serving {}", state.cfg.base_url);
+    // Downloads a stopped server left being fetched are fetched again, now that this server
+    // accepts connections (a download may be served by the site itself, in development).
+    match web::downloads::requeue(&state).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("{n} submitted downloads queued to be fetched again"),
+        Err(e) => tracing::warn!("queueing submitted downloads again failed: {e}"),
+    }
     axum::serve(listener, web::router(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
