@@ -2726,7 +2726,10 @@ for row in psql("SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e 
     paths.add(path)
 relaunch(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000)
 singles = {p: single(*p) for p in pairs}
-kinds = sorted({(o[0], o[1]["version"] == p[1] if o[0] == 200 else o[1]["error"]["code"]) for p, o in singles.items()}, key=str)
+def kind_of(p, one):
+    """What a single read answered: a version (False), a reading made now (True), or an error code."""
+    return (one[0], one[1]["version"] == p[1] if one[0] == 200 else one[1]["error"]["code"])
+kinds = sorted({kind_of(p, o) for p, o in singles.items()}, key=str)
 print(f"     {len(pairs)} (package, commit) pairs; single reads answered {kinds}")
 
 def compare(what, knobs):
@@ -2739,8 +2742,16 @@ def compare(what, knobs):
             differ.append((chunk[0], s, str(r)[:200]))
             continue
         for p, item in zip(chunk, r["items"]):
-            if not answers_alike(singles[p], item):
-                differ.append((p, singles[p][0], str(singles[p][1])[:300], str(item)[:300]))
+            if answers_alike(singles[p], item):
+                continue
+            # The background sync may have frozen a version at the commit since the single read
+            # (or the other way round): then the single read says something else now too.
+            now = single(*p)
+            if kind_of(p, now) != kind_of(p, singles[p]) and answers_alike(now, item):
+                print(f"     {p[0]} at {p[1][:12]} changed since: {kind_of(p, singles[p])} -> {kind_of(p, now)}")
+                singles[p] = now
+                continue
+            differ.append((p, singles[p][0], str(singles[p][1])[:300], str(item)[:300]))
     check(f"for all {len(pairs)} commits of the demo packages, the batch read is the single read's ({what})", pairs and not differ, differ[:3])
 
 # Cold for real: the demo repos let clients filter (as forges do; without it a clone gets every
