@@ -143,6 +143,12 @@ fn client_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Whole seconds from `now` until `then`, at least 1: what `Retry-After` says.
+fn retry_after(then: Instant, now: Instant) -> u64 {
+    let d = then.saturating_duration_since(now);
+    (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
+}
+
 impl RateLimiter {
     /// Allows `limit` requests per minute per client in `bucket`.
     pub fn check(&self, bucket: &'static str, ip: Option<IpAddr>, limit: u32) -> Result<(), AppError> {
@@ -158,10 +164,14 @@ impl RateLimiter {
         if now.duration_since(hit.0) >= WINDOW {
             hit = (now, 0);
         }
-        hit.1 += 1;
-        let count = hit.1;
+        // A refused request isn't counted: a client that waits out its window gets through.
+        let refused = hit.1 >= limit;
+        if !refused {
+            hit.1 += 1;
+        }
+        let started = hit.0;
         w.current.insert(key, hit);
-        if count > limit { Err(AppError::TooManyRequests) } else { Ok(()) }
+        if refused { Err(AppError::TooManyRequests(retry_after(started + WINDOW, now))) } else { Ok(()) }
     }
 
     /// Allows `limit` requests per `window` per signed-in user in `bucket` (a sliding window). Users
@@ -175,7 +185,9 @@ impl RateLimiter {
             times.pop_front();
         }
         if times.len() >= limit as usize {
-            return Err(AppError::TooManyRequests);
+            // The oldest request leaving the window frees a place.
+            let free = times.front().map_or(now, |t| *t + window);
+            return Err(AppError::TooManyRequests(retry_after(free, now)));
         }
         times.push_back(now);
         Ok(())
@@ -185,6 +197,34 @@ impl RateLimiter {
 #[cfg(test)]
 mod limiter_tests {
     use super::*;
+
+    /// A refused request isn't counted, and says when to try again: once the client's window has
+    /// passed it gets through.
+    #[test]
+    fn refusals_say_when_and_are_not_counted() {
+        let l = RateLimiter::default();
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        assert!(l.check("r", Some(ip), 1).is_ok());
+        for _ in 0..5 {
+            match l.check("r", Some(ip), 1) {
+                Err(AppError::TooManyRequests(s)) => assert!((1..=60).contains(&s), "{s}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // The window, moved back, has passed: the refusals didn't extend it.
+        {
+            let mut w = l.windows.lock().unwrap();
+            for (_, hit) in w.current.iter_mut() {
+                hit.0 -= WINDOW;
+            }
+        }
+        assert!(l.check("r", Some(ip), 1).is_ok());
+        let t0 = Instant::now();
+        assert_eq!(retry_after(t0 + Duration::from_millis(1500), t0), 2);
+        assert_eq!(retry_after(t0, t0 + Duration::from_secs(3)), 1, "at least 1");
+        assert!(l.check_user("u", 1, 1, Duration::from_secs(3600)).is_ok());
+        assert!(matches!(l.check_user("u", 1, 1, Duration::from_secs(3600)), Err(AppError::TooManyRequests(s)) if s > 3500));
+    }
 
     #[test]
     fn limits_per_client_and_groups_ipv6_by_64() {

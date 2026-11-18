@@ -155,6 +155,11 @@ enum Command {
     MoveRepo { username: String, slug: String, url: String },
     /// Local development only: create a user who can use the development sign-in.
     DevUser { username: String },
+    /// Reviewed downloads, as an admin.
+    Download {
+        #[command(subcommand)]
+        action: DownloadAction,
+    },
     /// Create an API token for a user (scope "publish") and print it. It is shown only once.
     Token {
         username: String,
@@ -162,6 +167,20 @@ enum Command {
         name: String,
         #[arg(long, default_value_t = 90)]
         days: i32,
+    },
+}
+
+#[derive(Subcommand)]
+enum DownloadAction {
+    /// Approve a download without the server fetching it (too big, or on a host it can't reach),
+    /// as ADMIN vouching for it: a new one, or one awaiting review, whose fetch failed or that was
+    /// rejected. The audit log records that it wasn't verified.
+    Approve {
+        admin: String,
+        url: String,
+        sha256: String,
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -504,6 +523,16 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(failed == 0, "{failed} of {} failed", entries.len());
             Ok(())
         }
+        Command::Download { action: DownloadAction::Approve { admin, url, sha256, note } } => {
+            let state = make_state(cfg, db)?;
+            let admin = cli_user(&state, &admin).await?;
+            anyhow::ensure!(admin.is_admin(), "{} is not an admin", admin.username);
+            let id = web::downloads::vouch(&state, &admin, &url, &sha256, note.as_deref())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Approved download #{id} without fetching it: {url}");
+            Ok(())
+        }
         Command::Token { username, name, days } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
@@ -754,6 +783,12 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
                 .await;
             // Registration previews' temporary mirrors left by a process that died.
             let _ = tokio::task::spawn_blocking(git::sweep_temp_mirrors).await;
+            // Submitted downloads whose fetch outcome was never stored.
+            match web::downloads::requeue_stale(&sweeper).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("{n} submitted downloads left being fetched queued again"),
+                Err(e) => tracing::warn!("queueing stale download fetches again failed: {e}"),
+            }
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

@@ -315,19 +315,25 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
 /// saying how to submit it; a tag waits); rejected is a fact.
 async fn download_problem(state: &AppState, name: &str, url: &str, sha: &str, out: &mut PinProblems) -> AppResult<()> {
     let submit = crate::web::downloads::submit_command(url);
-    match crate::web::downloads::review_of(state, url, sha).await?.as_deref() {
-        Some("approved") => {}
-        Some("rejected") => out.facts.push(format!(
-            "{name}: the download {url} (sha256 {}) was rejected by the Cactarium's reviewers",
-            &sha[..12]
+    let short = &sha[..12];
+    let Some(st) = crate::web::downloads::status_of(state, url, sha).await? else {
+        out.passing.push(format!(
+            "{name}: the download {url} (sha256 {short}) hasn't been reviewed by the Cactarium: submit it with `{submit}`, and publish once it is approved"
+        ));
+        return Ok(());
+    };
+    match (st.review.as_str(), st.fetch_state.as_str()) {
+        ("approved", _) => {}
+        ("rejected", _) => out.facts.push(format!("{name}: the download {url} (sha256 {short}) was rejected by the Cactarium's reviewers")),
+        (_, "fetching") => out.passing.push(format!(
+            "{name}: the download {url} (sha256 {short}) is being verified by the Cactarium (`{submit}` shows how it stands); publish once it is approved"
         )),
-        Some(_) => out.passing.push(format!(
-            "{name}: the download {url} (sha256 {}) awaits review on the Cactarium (`{submit}` shows its review); publish once it is approved",
-            &sha[..12]
+        (_, "failed") => out.passing.push(format!(
+            "{name}: the server couldn't verify {url}: {}; fix the url or the sha256, or submit it again with `{submit}`",
+            st.fetch_error.as_deref().unwrap_or("its fetch failed")
         )),
-        None => out.passing.push(format!(
-            "{name}: the download {url} (sha256 {}) hasn't been reviewed by the Cactarium: submit it with `{submit}`, and publish once it is approved",
-            &sha[..12]
+        _ => out.passing.push(format!(
+            "{name}: the download {url} (sha256 {short}) awaits review on the Cactarium (`{submit}` shows its review); publish once it is approved"
         )),
     }
     Ok(())

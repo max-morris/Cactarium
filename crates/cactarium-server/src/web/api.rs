@@ -279,7 +279,7 @@ pub async fn resolve(
         }
         let label = tip_label(tip);
         let trusted = unreviewed_allowed(&state, &e, label, Unreviewed::Tip).await?;
-        let t = package_snapshot(&state, &e, ip, None, &reviewer).await?;
+        let t = package_snapshot(&state, &e, ip, None, false, &reviewer).await?;
         let url = tracker::repo_of(&state, e.id).await?.map(|r| r.url);
         let contact = model::entry_contact(&state, &e, url.as_deref(), None).await?;
         let body = Resolved {
@@ -469,7 +469,7 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str, 
         .into_response());
     }
     let trusted = unreviewed_allowed(state, e, &commit, Unreviewed::Commit).await?;
-    let t = package_snapshot(state, e, ip, Some(&commit), reviewer).await?;
+    let t = package_snapshot(state, e, ip, Some(&commit), is_full_commit(prefix), reviewer).await?;
     let contact = model::entry_contact(state, e, url.as_deref(), None).await?;
     let body = Resolved {
         slug: format!("{}#{commit}", e.slug()),
@@ -481,6 +481,12 @@ async fn commit_answer(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str, 
         version: tip_version_info(e, &commit, &t),
     };
     Ok((axum::response::AppendHeaders(unreviewed_header(e, None)), [untrusted_header(trusted)], Json(body)).into_response())
+}
+
+/// Whether a request named a full commit id (40 or 64 hex digits), which needs no remote work to
+/// resolve.
+fn is_full_commit(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The full commit id `prefix` names in the package's repo (abbreviated ids are resolved against
@@ -498,7 +504,9 @@ async fn full_commit(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) ->
     })?;
     match found {
         git::PrefixMatch::One(c) => Ok(c),
-        git::PrefixMatch::None => Err(AppError::bad(format!("{} has no commit {prefix}", e.slug())).into()),
+        git::PrefixMatch::None => {
+            Err(AppError::Missing(format!("no commit {prefix} in {} (is it pushed?)", repo.url)).into())
+        }
         git::PrefixMatch::Many(all) => {
             let shown: Vec<String> = all.iter().take(5).map(|c| c[..12].to_owned()).collect();
             Err(AppError::bad(format!(
@@ -524,6 +532,13 @@ pub async fn package_tip(
     let at = tip.to_ascii_lowercase();
     let is_commit = cactup_ecosystem_common::slug::is_commit_prefix(&at);
     if !is_commit && at != "head" && at != "master" {
+        if !at.is_empty() && at.len() < cactup_ecosystem_common::slug::MIN_COMMIT_PREFIX && at.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::bad(format!(
+                "abbreviated commits need at least {} hex digits",
+                cactup_ecosystem_common::slug::MIN_COMMIT_PREFIX
+            ))
+            .into());
+        }
         return Err(AppError::NotFound.into());
     }
     let e = entry_for(&state, &owner, &name, Some("package"), &reviewer).await?;
@@ -535,10 +550,11 @@ pub async fn package_tip(
         let marked = unreviewed_header(&e, Some(&v));
         return Ok((axum::response::AppendHeaders(marked), Json(version_body(&state, &v, &url).await?)).into_response());
     }
+    let exact = is_full_commit(&at);
     let label = commit.clone().unwrap_or(at);
     let kind = if commit.is_some() { Unreviewed::Commit } else { Unreviewed::Tip };
     let trusted = unreviewed_allowed(&state, &e, &label, kind).await?;
-    let t = package_snapshot(&state, &e, ip, commit.as_deref(), &reviewer).await?;
+    let t = package_snapshot(&state, &e, ip, commit.as_deref(), exact, &reviewer).await?;
     let body = PackageVersion {
         version: tip_version_info(&e, &label, &t),
         url,
@@ -641,13 +657,27 @@ fn tip_headers(trusted: bool) -> [(header::HeaderName, header::HeaderValue); 2] 
 /// The package read at `commit`, else at its default branch's current commit; cached by commit.
 /// Its dependencies are read against what `reviewer` could be served, and nothing else
 /// (`deps::Reading::Tip`), so an answer never names a hidden entry or a version it can't see.
+///
+/// `exact` says the request named the full commit id itself: a reading of it already cached is
+/// then answered without counting against the per-minute limit (it costs no remote work), so a
+/// client reading a whole base of packages at unfrozen commits isn't throttled by what it read
+/// before. A tip, a prefix (both resolved remotely) and a reading not cached yet still count.
 async fn package_snapshot(
     state: &AppState,
     e: &Entry,
     ip: ClientIp,
     commit: Option<&str>,
+    exact: bool,
     reviewer: &Reviewer,
 ) -> ApiResult<std::sync::Arc<tracker::PackageTip>> {
+    let key = |commit: &str, fingerprint: String| (e.id, commit.to_owned(), fingerprint);
+    let fingerprint = snapshot_fingerprint(state, e, reviewer).await?;
+    if exact
+        && let Some(c) = commit
+        && let Some(t) = state.package_tips.peek(&key(c, fingerprint.clone()))
+    {
+        return Ok(t);
+    }
     // Reading a package outside its versions fetches the remote repo; keep anonymous callers from
     // turning that into a flood.
     state.limiter.check("tip", ip.0, 12)?;
@@ -655,28 +685,29 @@ async fn package_snapshot(
         Some(c) => c.to_owned(),
         None => tracker::package_tip_commit(state, e).await?,
     };
-    // The reading also depends on the owner, the repo and a curated overlay, which can change
-    // under the same commit (a transfer, a move, a curated update or hand-over).
-    let repo = tracker::repo_of(state, e.id).await?;
-    let fingerprint = {
-        use sha2::Digest;
-        let mut h = sha2::Sha256::new();
-        // What the requester may see decides which dependency targets count.
-        let sees = format!("{}{}", u8::from(reviewer.releases), u8::from(reviewer.entries));
-        for part in [e.owner.as_str(), repo.as_ref().map_or("", |r| r.url.as_str()), repo.as_ref().and_then(|r| r.overlay_manifest.as_deref()).unwrap_or(""), sees.as_str()] {
-            h.update(part.as_bytes());
-            h.update([0]);
-        }
-        hex::encode(h.finalize())
-    };
     let t = state
         .package_tips
-        .get_or_try_init((e.id, commit.clone(), fingerprint), || async {
+        .get_or_try_init(key(&commit, fingerprint), || async {
             let reading = crate::deps::Reading::Tip { releases: reviewer.releases, entries: reviewer.entries };
             tracker::package_tip(state, e, &commit, reading).await.map(std::sync::Arc::new)
         })
         .await?;
     Ok(t)
+}
+
+/// What a package's reading depends on besides its commit: its owner, repo and curated overlay,
+/// which can change under the same commit (a transfer, a move, a curated update or hand-over),
+/// and what the requester may see, which decides the dependency targets that count.
+async fn snapshot_fingerprint(state: &AppState, e: &Entry, reviewer: &Reviewer) -> ApiResult<String> {
+    let repo = tracker::repo_of(state, e.id).await?;
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    let sees = format!("{}{}", u8::from(reviewer.releases), u8::from(reviewer.entries));
+    for part in [e.owner.as_str(), repo.as_ref().map_or("", |r| r.url.as_str()), repo.as_ref().and_then(|r| r.overlay_manifest.as_deref()).unwrap_or(""), sees.as_str()] {
+        h.update(part.as_bytes());
+        h.update([0]);
+    }
+    Ok(hex::encode(h.finalize()))
 }
 
 fn tip_version_info(e: &Entry, label: &str, t: &tracker::PackageTip) -> VersionInfo {
@@ -1205,6 +1236,12 @@ pub(crate) mod tests {
         let tracks = [version(1, "beta:1.0.0", c, "approved"), version(2, "alpha:1.0.0", c, "approved"), version(3, "alpha:0.9.0", c, "approved")];
         assert_eq!(frozen_at(&tracks, c).map(|v| v.label()), Some("alpha:1.0.0".into()));
         assert!(frozen_at(&vs, "ffff").is_none());
+    }
+
+    #[test]
+    fn full_commits_need_no_remote_work() {
+        assert!(is_full_commit(&"a".repeat(40)) && is_full_commit(&"0".repeat(64)));
+        assert!(!is_full_commit("3f2c9e1") && !is_full_commit("head") && !is_full_commit(&"g".repeat(40)));
     }
 
     /// Who is served what awaits review: only a request that asked and may.

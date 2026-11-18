@@ -5,10 +5,22 @@
 {% include "_admin_nav.html" %}
 <section class="stack">
   <p class="muted">Files a sim pins by sha256 (a tarball component, an input's download), submitted with <code>cactup download submit &lt;url&gt;</code>. The Cactarium fetches each once in the background and checks its sha256; it keeps no copy. Only a verified download can be decided. A sim pinning a download that isn't approved isn't published: an upload is refused, a tag waits, and a tag pinning a rejected download becomes an invalid version. Trusted users' and admins' submissions are approved once verified.</p>
+  <form method="post" action="/admin/downloads/vouch" class="card stack-sm">
+    <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+    <h2 class="h-small">Approve without fetching</h2>
+    <p class="small muted">For a download too big for the server to fetch, or on a host it can't reach: approved as you vouch for it, without the server checking its sha256 (the audit log says so). Also approves one awaiting review, whose fetch failed, or that was rejected. The same as <code>just cli download approve &lt;admin&gt; &lt;url&gt; &lt;sha256&gt; [--note …]</code>.</p>
+    <label for="vouch-url">URL</label>
+    <input id="vouch-url" name="url" type="url" required>
+    <label for="vouch-sha">sha256</label>
+    <input id="vouch-sha" name="sha256" type="text" pattern="[0-9a-f]{64}" required>
+    <label for="vouch-note">Note</label>
+    <input id="vouch-note" name="note" type="text">
+    <button class="button small" type="submit">Approve without fetching</button>
+  </form>
   <p class="muted small">A rejected download can be reopened (back to pending) or approved. Sim tags that became invalid over it stay invalid until read again: <code>just cli reread &lt;admin&gt; &lt;owner/name&gt; &lt;version&gt;</code> (or Admin, Entries, <em>Re-read invalid version</em>).</p>
   {% for d in downloads %}
   <div class="card stack-sm">
-    <span class="small"><strong class="{% if d.review == "pending" %}warn-text{% else if d.review == "approved" %}good-text{% endif %}">{{ d.review }}</strong> · {% if d.fetch == "fetching" %}being fetched{% else if d.fetch == "failed" %}<strong class="warn-text">fetch failed</strong>{% else %}verified, {{ d.size }}{% endif %} · #{{ d.id }} · by <span class="mono">{{ d.submitter }}</span> · {{ d.when }}{% if !d.reviewer.is_empty() %} · decided by <span class="mono">{{ d.reviewer }}</span>{% endif %}</span>
+    <span class="small"><strong class="{% if d.review == "pending" %}warn-text{% else if d.review == "approved" %}good-text{% endif %}">{{ d.review }}</strong> · {% if d.fetch == "fetching" %}being fetched{% else if d.fetch == "failed" %}<strong class="warn-text">fetch failed</strong>{% else if d.fetch == "vouched" %}approved without fetching, {{ d.size }}{% else %}verified, {{ d.size }}{% endif %} · #{{ d.id }} · by <span class="mono">{{ d.submitter }}</span> · {{ d.when }}{% if !d.reviewer.is_empty() %} · decided by <span class="mono">{{ d.reviewer }}</span>{% endif %}</span>
     <a class="mono strong break" href="{{ d.url }}" rel="nofollow noopener">{{ d.url }}</a>
     <span class="mono small break">sha256 {{ d.sha256 }}</span>
     {% if !d.fetch_error.is_empty() %}<p class="alert warn small">{{ d.fetch_error }} (submitting it again tries again)</p>{% endif %}

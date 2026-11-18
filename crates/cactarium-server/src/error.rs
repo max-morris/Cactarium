@@ -12,6 +12,9 @@ use crate::templates::{ErrorPage, PageCtx, render};
 pub enum AppError {
     #[error("not found")]
     NotFound,
+    /// Not found, with the reason shown (a commit the repo doesn't have).
+    #[error("{0}")]
+    Missing(String),
     #[error("sign in to do that")]
     Unauthorized,
     #[error("you are not allowed to do that")]
@@ -23,8 +26,9 @@ pub enum AppError {
     BadRequest(String),
     #[error("{0}")]
     Conflict(String),
-    #[error("too many requests; try again in a minute")]
-    TooManyRequests,
+    /// With the whole seconds until the client may try again (sent as `Retry-After`).
+    #[error("too many requests; try again in {}", in_seconds(*.0))]
+    TooManyRequests(u64),
     /// Something we depend on (an author's repo host) failed; the message is shown, so keep it
     /// generic and log the details.
     #[error("{0}")]
@@ -52,12 +56,12 @@ impl AppError {
 
     pub fn status(&self) -> StatusCode {
         match self {
-            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::NotFound | AppError::Missing(_) => StatusCode::NOT_FOUND,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden | AppError::Denied(_) => StatusCode::FORBIDDEN,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
-            AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -83,14 +87,30 @@ impl IntoResponse for AppError {
             status: status.as_u16(),
             message: self.public_message(),
         };
+        let retry = axum::response::AppendHeaders(self.retry_after());
         match render(&page) {
-            Ok(html) => (status, Html(html)).into_response(),
-            Err(_) => (status, "error").into_response(),
+            Ok(html) => (status, retry, Html(html)).into_response(),
+            Err(_) => (status, retry, "error").into_response(),
         }
     }
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+/// `1 second`, `30 seconds`, for a message.
+fn in_seconds(n: u64) -> String {
+    if n == 1 { "1 second".to_owned() } else { format!("{n} seconds") }
+}
+
+impl AppError {
+    /// The `Retry-After` header of a refusal for too many requests.
+    fn retry_after(&self) -> Option<(axum::http::HeaderName, axum::http::HeaderValue)> {
+        match self {
+            AppError::TooManyRequests(s) => Some((axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(*s))),
+            _ => None,
+        }
+    }
+}
 
 /// Capitalizes a message, unless it starts with something case-significant: a slug, a path, a
 /// version, a quoted name, an identifier.
@@ -132,18 +152,18 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.0.status();
         let code = match &self.0 {
-            AppError::NotFound => "not-found",
+            AppError::NotFound | AppError::Missing(_) => "not-found",
             AppError::Unauthorized => "unauthorized",
             AppError::Forbidden | AppError::Denied(_) => "forbidden",
             AppError::BadRequest(_) => "bad-request",
             AppError::Conflict(_) => "conflict",
-            AppError::TooManyRequests => "rate-limited",
+            AppError::TooManyRequests(_) => "rate-limited",
             AppError::Upstream(_) => "upstream",
             AppError::Internal(_) => "internal",
         };
         let body =
             ErrorBody { error: ErrorDetail { code: code.into(), message: self.0.public_message() } };
-        (status, Json(body)).into_response()
+        (status, axum::response::AppendHeaders(self.0.retry_after()), Json(body)).into_response()
     }
 }
 

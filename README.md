@@ -65,6 +65,22 @@ Every read honors `x-cactarium-include-unreviewed: true` (CactUp's
 releases awaiting review of public entries when the site serves unreviewed code, and such answers
 say `x-cactarium-unreviewed: true`.
 
+- Rate limits answer 429 (`rate-limited`) with `Retry-After`: the whole seconds (at least 1) until
+  that client's window resets, or for a per-user limit until a place frees. A refused request isn't
+  counted, so a client that waits that long gets through.
+- `/packages/{o}/{n}/versions/{commit}` (and `/resolve` with `#<commit>`) named by a full commit id
+  is answered from the cache without counting against the per-minute limit on reads made now when
+  that reading is cached already; `head`, `master`, abbreviated commits and readings not cached
+  yet count.
+- A read at a commit (`/packages/{o}/{n}/versions/{commit|head|master}`, `/resolve` with
+  `#<commit>`) answers 404 `not-found` ("no commit <sha> in <repo> (is it pushed?)") when the
+  repo's host answers but has no such commit; 400 `bad-request` with the reason when the package
+  there can't be read (an invalid manifest, a thorn problem); and 502 `upstream` when the host
+  can't be reached or doesn't send the commit in time (try again later). An abbreviated commit
+  that matches nothing is also 404; one shorter than 7 hex digits is 400. Unreviewed code
+  (`head`, `master`, a commit no version froze) of a package that isn't trusted is 403
+  `forbidden` unless the site allows untrusted artifacts; when it is served, it carries
+  `x-cactarium-untrusted: true` (`false` on a trusted package's).
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.
@@ -78,7 +94,14 @@ say `x-cactarium-unreviewed: true`.
   submits it, a background job fetches it once to check the sha256 (keeping no copy; rows left
   fetching by a restart are fetched again at startup), and an admin decides it under Admin,
   Downloads once verified. A rejected download can be reopened or approved there; a tag that froze
-  invalid over it is read again with `reread`.
+  invalid over it is read again with `reread`. A submitter learns where verification stands from
+  the 409 for a known download (a failed one is tried again, and its 409 says why the last try
+  failed, such as "the file's sha256 is X, not Y"), and from the refusal of a sim that pins it.
+  Rows left being fetched past the fetch's time limit are fetched again by the hourly sweep. An
+  admin can approve a download without the server fetching it (too big, or on a host it can't
+  reach): Admin, Downloads, *Approve without fetching*, or `cactarium download approve <admin>
+  <url> <sha256> [--note ...]` (`just cli download approve ...`); its size is unknown and the
+  audit log records that it wasn't verified.
 - A package version (or stack release) whose dependency resolves to a version awaiting review, or
   to a package that isn't public, waits (left unread, retried) until it is reviewed; stack
   releases' dependencies are checked like packages', but for the CCL.
@@ -91,7 +114,7 @@ proxies to the app, which Docker Compose publishes on loopback only. Copy `deplo
 migrates and restarts.
 
 Server-side commands run in the app container with `just cli ...`:
-`admin grant|revoke|trust|untrust|list`, `org create <name> <owner>`, `org add <name> <user>
+`admin grant|revoke|trust|untrust|list`, `download approve <admin> <url> <sha256> [--note ...]`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>] [--only <name>]...`, `check <url> [--tag <tag>
 [--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`, or `<version> --moved`), `rescan-facts <admin> [<owner/name>] [--all]`, `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.

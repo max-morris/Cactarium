@@ -154,12 +154,13 @@ pub async fn lookup(
             review,
         });
     }
-    let downloads = crate::web::downloads::reviews_of(&state, &req.downloads).await?;
+    // A download being fetched, or whose fetch failed, awaits review: its review is `pending`.
+    let downloads = crate::web::downloads::statuses_of(&state, &req.downloads).await?;
     let downloads = req
         .downloads
         .iter()
         .zip(downloads)
-        .map(|(d, review)| DownloadInfo { url: d.url.clone(), sha256: d.sha256.clone(), review })
+        .map(|(d, st)| DownloadInfo { url: d.url.clone(), sha256: d.sha256.clone(), review: st.map(|s| s.review) })
         .collect();
     Ok((AppendHeaders(unreviewed_mark(unreviewed)), Json(LookedUp { pins, downloads })).into_response())
 }
