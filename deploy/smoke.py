@@ -2612,8 +2612,8 @@ def unstamped(v):
     """A reading's PackageVersion without its `published` time (a reading made now is stamped when
     answered)."""
     v = json.loads(json.dumps(v))
-    if v and v["version"]["version"] == v["version"].get("commit"):
-        v["version"].pop("published", None)
+    if v and v.get("version") == v.get("commit"):
+        v.pop("published", None)
     return v
 
 def answers_alike(one, item):
@@ -2658,15 +2658,15 @@ check("a batch read answers every pair, in request order",
 by = dict(zip(pairs, items)) if s == 200 else {}
 one = single("max/carpetx", unrel)
 check("an unfrozen commit is ok, read now: exactly the single read's answer (from the shared cache)",
-      by[("max/carpetx", unrel)]["status"] == "ok" and by[("max/carpetx", unrel)]["version"]["version"]["version"] == unrel
+      by[("max/carpetx", unrel)]["status"] == "ok" and by[("max/carpetx", unrel)]["version"]["version"] == unrel
       and by[("max/carpetx", unrel)]["untrusted"] is False and answers_alike(one, by[("max/carpetx", unrel)]), f"{by.get(('max/carpetx', unrel))} {one[:2]}")
 one = single("max/carpetx", v110)
 check("a version's commit answers as that version, as the single read does",
-      by[("max/carpetx", v110)]["version"]["version"]["version"] == "1.1.0" and answers_alike(one, by[("max/carpetx", v110)]), by.get(("max/carpetx", v110)))
+      by[("max/carpetx", v110)]["version"]["version"] == "1.1.0" and answers_alike(one, by[("max/carpetx", v110)]), by.get(("max/carpetx", v110)))
 one = single("et/fakelib", fold)
 check("an untrusted package's unfrozen commit is forbidden, saying what the single read says",
       by[("et/fakelib", fold)]["status"] == "forbidden" and one[0] == 403 and answers_alike(one, by[("et/fakelib", fold)]), by.get(("et/fakelib", fold)))
-check("an untrusted package's version commit is still that version", by[("et/fakelib", fv)]["version"]["version"]["version"] == "2026.5.0",
+check("an untrusted package's version commit is still that version", by[("et/fakelib", fv)]["version"]["version"] == "2026.5.0",
       by.get(("et/fakelib", fv)))
 one = single("max/carpetx", "ab" * 20)
 check("a commit the repo doesn't have is not-found, asking whether it is pushed",
@@ -2725,7 +2725,7 @@ for row in psql("SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e 
     pairs += [(slug, c) for c in commits]
 relaunch(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000)
 singles = {p: single(*p) for p in pairs}
-kinds = sorted({(o[0], o[1]["version"]["version"] == p[1] if o[0] == 200 else None) for p, o in singles.items()}, key=str)
+kinds = sorted({(o[0], o[1]["version"] == p[1] if o[0] == 200 else o[1]["error"]["code"]) for p, o in singles.items()}, key=str)
 print(f"     {len(pairs)} (package, commit) pairs; single reads answered {kinds}")
 
 def compare(what, knobs):
@@ -2743,6 +2743,11 @@ def compare(what, knobs):
     check(f"for all {len(pairs)} commits of the demo packages, the batch read is the single read's ({what})", pairs and not differ, differ[:3])
 
 compare("a cold mirror", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000))
+log = compose("logs", "app")
+fetched = len(re.findall(r"fetching \d+ of \d+ files of [0-9a-f]+ that the mirror", log))
+fallbacks = len(re.findall(r"not from the mirror", log))
+print(f"     cold: {fetched} commits fetched missing files into their mirrors, {fallbacks} were checked out instead")
+check("cold, the batch reads fetched the files their mirrors lacked", fetched > 0, log[-500:])
 compare("a warm mirror, with no item allowed the network", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=0))
 compare("the shared cache", None)
 relaunch()

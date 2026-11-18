@@ -1516,6 +1516,7 @@ pub async fn checkout_from_mirror(
             Ok(t) => t,
             Err(e) => return Ok(FromMirror::Elsewhere(format!("{e:#}"))),
         };
+        tracing::info!("fetching {} of {} files of {commit} that the mirror of {key} lacks", missing.len(), blobs.len());
         // One request for them all, as a partial clone's own fetch of missing objects asks: no
         // negotiation (the wants are blobs), and kept as a pack, to be added to the mirror whole.
         let mut c = git_to(policy, &home, &t);
