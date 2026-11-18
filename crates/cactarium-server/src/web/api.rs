@@ -504,7 +504,9 @@ async fn full_commit(state: &AppState, e: &Entry, ip: ClientIp, prefix: &str) ->
     })?;
     match found {
         git::PrefixMatch::One(c) => Ok(c),
-        git::PrefixMatch::None => Err(AppError::bad(format!("{} has no commit {prefix}", e.slug())).into()),
+        git::PrefixMatch::None => {
+            Err(AppError::Missing(format!("no commit {prefix} in {} (is it pushed?)", repo.url)).into())
+        }
         git::PrefixMatch::Many(all) => {
             let shown: Vec<String> = all.iter().take(5).map(|c| c[..12].to_owned()).collect();
             Err(AppError::bad(format!(
@@ -530,6 +532,13 @@ pub async fn package_tip(
     let at = tip.to_ascii_lowercase();
     let is_commit = cactup_ecosystem_common::slug::is_commit_prefix(&at);
     if !is_commit && at != "head" && at != "master" {
+        if !at.is_empty() && at.len() < cactup_ecosystem_common::slug::MIN_COMMIT_PREFIX && at.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::bad(format!(
+                "abbreviated commits need at least {} hex digits",
+                cactup_ecosystem_common::slug::MIN_COMMIT_PREFIX
+            ))
+            .into());
+        }
         return Err(AppError::NotFound.into());
     }
     let e = entry_for(&state, &owner, &name, Some("package"), &reviewer).await?;

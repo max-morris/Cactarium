@@ -2226,9 +2226,13 @@ check("versions/<abbreviated> reads the package there", s == 200 and f'"version"
 s, body, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{v110[:7]}")
 check("an abbreviated version commit is the version", s == 200 and '"version":"1.1.0"' in body, f"{s} {body[:200]}")
 s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote("max/carpetx#0000000"))
-check("a prefix no commit has is refused", s == 400 and "has no commit 0000000" in body, f"{s} {body[:200]}")
+check("a prefix no commit has is 404, asking whether it is pushed",
+      s == 404 and '"code":"not-found"' in body and "no commit 0000000" in body.lower() and "is it pushed?" in body, f"{s} {body[:200]}")
 s, body, _ = anon.get("/api/v1/resolve?req=" + urllib.parse.quote("max/carpetx#beef12"))
 check("'#' needs at least 7 hex digits", s == 400, f"{s} {body[:200]}")
+s, body, _ = anon.get("/api/v1/packages/max/carpetx/versions/beef12")
+check("versions/<6 hex digits> is 400, saying 7 are needed",
+      s == 400 and "need at least 7 hex digits" in body, f"{s} {body[:200]}")
 s, body, _ = anon.get("/api/v1/resolve?req=max/carpetx@1.0.0")
 check("@ prefers a version over everything else", s == 200 and json.loads(body)["slug"] == "max/carpetx@1.0.0", body[:200])
 

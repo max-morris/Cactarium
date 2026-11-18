@@ -76,7 +76,11 @@ say `x-cactarium-unreviewed: true`.
   `#<commit>`) answers 404 `not-found` ("no commit <sha> in <repo> (is it pushed?)") when the
   repo's host answers but has no such commit; 400 `bad-request` with the reason when the package
   there can't be read (an invalid manifest, a thorn problem); and 502 `upstream` when the host
-  can't be reached or doesn't send the commit in time (try again later).
+  can't be reached or doesn't send the commit in time (try again later). An abbreviated commit
+  that matches nothing is also 404; one shorter than 7 hex digits is 400. Unreviewed code
+  (`head`, `master`, a commit no version froze) of a package that isn't trusted is 403
+  `forbidden` unless the site allows untrusted artifacts; when it is served, it carries
+  `x-cactarium-untrusted: true` (`false` on a trusted package's).
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.
