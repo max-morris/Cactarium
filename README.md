@@ -72,6 +72,11 @@ say `x-cactarium-unreviewed: true`.
   is answered from the cache without counting against the per-minute limit on reads made now when
   that reading is cached already; `head`, `master`, abbreviated commits and readings not cached
   yet count.
+- A read at a commit (`/packages/{o}/{n}/versions/{commit|head|master}`, `/resolve` with
+  `#<commit>`) answers 404 `not-found` ("no commit <sha> in <repo> (is it pushed?)") when the
+  repo's host answers but has no such commit; 400 `bad-request` with the reason when the package
+  there can't be read (an invalid manifest, a thorn problem); and 502 `upstream` when the host
+  can't be reached or doesn't send the commit in time (try again later).
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.

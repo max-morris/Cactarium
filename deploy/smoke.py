@@ -2204,6 +2204,9 @@ check("another commit of a trusted package is the package at that commit (named 
       and hdrs.get("x-cactarium-untrusted") == "false" and "x-cactarium-unpinned" not in hdrs, f"{s} {body[:200]} {hdrs}")
 s, body, _ = anon.get(f"/api/v1/packages/max/carpetx/versions/{unrel}")
 check("versions/<commit> gives its thorns", s == 200 and '"thorn":"Arith"' in body and f'"version":"{unrel}"' in body, f"{s} {body[:200]}")
+s, body, _ = anon.get("/api/v1/packages/max/carpetx/versions/" + "ab" * 20)
+check("versions/<a commit the repo doesn't have> is 404, asking whether it is pushed",
+      s == 404 and '"code":"not-found"' in body and "is it pushed?" in body, f"{s} {body[:200]}")
 fv = git("fakelib-moved", "rev-parse", "XT_2026_05_v0^{commit}")
 fold = git("fakelib-moved", "rev-parse", "XT_2025_11_v0^{commit}")
 s, body, _ = anon.get(f"/api/v1/resolve?req=et/fakelib@{fv}")

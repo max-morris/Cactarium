@@ -3460,7 +3460,28 @@ pub async fn package_tip_commit(state: &AppState, entry: &Entry) -> AppResult<St
     let repo = repo_of(state, entry.id)
         .await?
         .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
-    git::resolve_ref(policy(state), &repo.url, None).await.map_err(AppError::bad)
+    git::resolve_ref(policy(state), &repo.url, None).await.map_err(|e| {
+        tracing::warn!("{}: reading the default branch of {}: {e:#}", entry.slug(), repo.url);
+        AppError::Upstream(format!("couldn't reach {} to read its default branch; try again later", repo.url))
+    })
+}
+
+/// Why a checkout of `commit` from `url` failed, as the answer to a read at that commit: the host
+/// didn't answer (in time), so try again later (502); or it answers but has no such commit, most
+/// likely one not pushed yet (404). Details are logged; the answers stay generic.
+async fn checkout_failure(state: &AppState, url: &str, commit: &str, e: anyhow::Error) -> AppError {
+    tracing::warn!("checking out {commit} from {url}: {e:#}");
+    if format!("{e:#}").contains("timed out") {
+        return AppError::Upstream(format!("{url} didn't send commit {commit} in time; try again later"));
+    }
+    // The fetch failed though the host may be fine: ask it for its default branch to tell which.
+    match git::resolve_ref(policy(state), url, None).await {
+        Ok(_) => AppError::Missing(format!("no commit {commit} in {url} (is it pushed?)")),
+        Err(e) => {
+            tracing::warn!("reaching {url}: {e:#}");
+            AppError::Upstream(format!("couldn't reach {url}; try again later"))
+        }
+    }
 }
 
 /// Reads a package at `commit` (its default branch's tip, or a commit someone named) the way a
@@ -3472,9 +3493,10 @@ pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str, reading:
     let repo = repo_of(state, entry.id)
         .await?
         .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
-    let co = git::checkout(policy(state), &repo.url, commit, None)
-        .await
-        .map_err(AppError::bad)?;
+    let co = match git::checkout(policy(state), &repo.url, commit, None).await {
+        Ok(co) => co,
+        Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await),
+    };
     let r = RemoteRef { name: "HEAD".into(), commit: commit.to_owned() };
     let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
     let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts { reading, ..PrepOpts::default() })

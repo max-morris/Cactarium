@@ -12,6 +12,9 @@ use crate::templates::{ErrorPage, PageCtx, render};
 pub enum AppError {
     #[error("not found")]
     NotFound,
+    /// Not found, with the reason shown (a commit the repo doesn't have).
+    #[error("{0}")]
+    Missing(String),
     #[error("sign in to do that")]
     Unauthorized,
     #[error("you are not allowed to do that")]
@@ -53,7 +56,7 @@ impl AppError {
 
     pub fn status(&self) -> StatusCode {
         match self {
-            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::NotFound | AppError::Missing(_) => StatusCode::NOT_FOUND,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden | AppError::Denied(_) => StatusCode::FORBIDDEN,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -149,7 +152,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.0.status();
         let code = match &self.0 {
-            AppError::NotFound => "not-found",
+            AppError::NotFound | AppError::Missing(_) => "not-found",
             AppError::Unauthorized => "unauthorized",
             AppError::Forbidden | AppError::Denied(_) => "forbidden",
             AppError::BadRequest(_) => "bad-request",
