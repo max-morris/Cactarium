@@ -360,13 +360,20 @@ if vid:
     run = subprocess.run(["just", "cli", "unyank", "max", "max/carpetx", "1.1.0"], capture_output=True, text=True)
     check("just cli unyank", run.returncode == 0 and "Unyanked max/carpetx@1.1.0" in run.stdout, run.stdout + run.stderr[-300:])
 
-# A snapshot release of a stack defined on the site.
+# A snapshot release of a stack defined on the site. What it builds must build together: leaving
+# out a thorn another one it builds requires is refused.
 maxv.get("/new/stack")
-definition = 'format = 1\n\n[stack]\nname = "smoke-stack"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CarpetX/Loop"]\n'
+broken = 'format = 1\n\n[stack]\nname = "smoke-broken"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CarpetX/Loop"]\n'
+s, text, _ = maxv.post("/new/stack", {"definition": broken, "thornlist": "", "version": "0.1.0"})
+check("a release leaving out a required thorn is refused",
+      s == 200 and "CarpetX/CarpetX requires the thorn Loop, which the release doesn&#39;t build" in text, f"{s} {text[text.find('alert'):][:300]}")
+page(anon, "/max/smoke-broken", expect=404)
+maxv.get("/new/stack")
+definition = 'format = 1\n\n[stack]\nname = "smoke-stack"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CactusBase/IOUtil"]\n'
 s, text, hdrs = maxv.post("/new/stack", {"definition": definition, "thornlist": "", "version": "0.1.0"})
 check("cut a snapshot release", s == 303, f"{s} {text[:300]}")
 s, body, _ = anon.get("/api/v1/stacks/max/smoke-stack/releases/0.1.0")
-check("the release disables CarpetX/Loop", s == 200 and "#DISABLED CarpetX/Loop" in json.loads(body)["thornlist"]["text"], body[:200])
+check("the release disables CactusBase/IOUtil", s == 200 and "#DISABLED CactusBase/IOUtil" in json.loads(body)["thornlist"]["text"], body[:200])
 s, text, _ = maxv.post("/new/stack", {"definition": definition, "thornlist": "", "version": "0.1.0"})
 check("a release never changes", s == 200 and "already exists" in text, s)
 
