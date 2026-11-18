@@ -15,6 +15,7 @@
     <tr><td><a href="#stack-releases"><code>GET /stacks/{owner}/{name}/releases</code></a></td><td><code>StackReleases</code></td></tr>
     <tr><td><a href="#stack-release"><code>GET /stacks/{owner}/{name}/releases/{version|head|master}</code></a></td><td><code>FrozenStack</code></td></tr>
     <tr><td><a href="#sim-download"><code>GET /sims/{owner}/{name}/{X.Y.Z}/download[?sim=&lt;sim&gt;]</code></a></td><td>the <code>.sim</code> bytes</td></tr>
+    <tr><td><a href="#packages-read"><code>POST /packages/read</code></a></td><td><code>ReadAnswer</code></td></tr>
     <tr><td><a href="#lookup"><code>POST /lookup</code></a></td><td><code>LookedUp</code></td></tr>
     <tr><td><a href="#providers"><code>GET /providers?implements=…</code></a> (or <code>capability=</code>, <code>function=</code>, <code>thorn=</code>, <code>include=</code>)</td><td><code>Providers</code></td></tr>
     <tr><td><a href="#sim-publish"><code>POST /sims/{owner}/{name}</code></a> (token)</td><td><code>Published</code></td></tr>
@@ -98,6 +99,23 @@
 <h3 id="package-tip"><code>GET /packages/{owner}/{name}/versions/{head|master|commit}</code></h3>
 <p>With a commit id (full, or abbreviated to at least 7 hex digits) in place of <code>head</code>/<code>master</code>: the version frozen at that commit if there is one (a normal <code>PackageVersion</code>; when several froze it, the newest on the default track, else the newest on any track, ties to the track name first), else the package read at that commit, its <code>version</code> the commit id, with <code>x-cactarium-untrusted</code> and the same trust rule as tips (see <a href="/docs/versions#commits">commits</a>). <code>/resolve?req=owner/pkg#&lt;commit&gt;</code> answers the same way, with the full id in its slug (<code>owner/pkg#&lt;full commit&gt;</code>); <code>owner/pkg@&lt;hex&gt;</code> is read as a commit only when it names no version, range or track. An ambiguous or unknown prefix is a 400. A reading at a full commit id that was read before is answered from the cache without counting against the limit below; tips, abbreviated ids and readings not cached yet count.</p>
 <p>The package at its default branch's tip, read now, in the shape of one <code>PackageVersion</code> whose <code>version</code> is <code>head</code> or <code>master</code> (the two mean the same for a package). Carries <code>x-cactarium-unpinned</code> and <code>x-cactarium-untrusted</code>. For an untrusted package it answers 403 unless the site allows untrusted branch tips. Limited to 12 requests a minute.</p>
+
+<h3 id="packages-read"><code>POST /packages/read</code></h3>
+<p>Many packages, each at a commit, in one request: each item is answered as <a href="#package-tip"><code>GET /packages/{owner}/{name}/versions/{commit}</code></a> answers it, so a client learns a whole base's claims, <code>fork-of</code> and dependencies at once. No token; <code>x-cactarium-include-unreviewed</code> counts as on every read. The body is a <code>ReadRequest</code>: at most 200 <code>items</code>, each a <code>package</code> (<code>owner/name</code>) and a full <code>commit</code> (40 or 64 lowercase hex digits), no pair twice; anything else is a 400 for the whole request. The request counts once, however many items it has, against the limit of 12 reads made now a minute; a 429 (with <code>Retry-After</code>) refuses it whole.</p>
+<pre class="code">{"items": [{"package": "et/carpet", "commit": "3f2c9e1a00112233445566778899aabbccddeeff"}]}</pre>
+<p>The answer, <code>ReadAnswer</code>, has one item per pair, in request order: the <code>package</code> and <code>commit</code> as asked, a <code>status</code>, and with <code>ok</code> the <code>version</code> the single read answers (the version that froze the commit, as this request may be served it, or the package read now, its <code>version</code> the commit id), with <code>untrusted</code> and <code>unreviewed</code> saying what the single read's <code>x-cactarium-untrusted</code> and <code>x-cactarium-unreviewed</code> would. Any other status comes with the single read's <code>error</code> message:</p>
+<div class="table-box"><table>
+  <thead><tr><th scope="col">Status</th><th scope="col">When</th></tr></thead>
+  <tbody>
+    <tr><td><code>ok</code></td><td>read (or the version that froze the commit)</td></tr>
+    <tr><td><code>forbidden</code></td><td>a commit no version froze, of a package that isn't trusted, on a site that doesn't serve untrusted code</td></tr>
+    <tr><td><code>not-found</code></td><td>no such package (or none this request may see), or no such commit in its repo (is it pushed?)</td></tr>
+    <tr><td><code>bad-request</code></td><td>the package at that commit can't be read: an invalid manifest, a thorn problem</td></tr>
+    <tr><td><code>upstream</code></td><td>the package's repo host couldn't be reached, or didn't send the commit in time; try again later</td></tr>
+    <tr><td><code>not-read</code></td><td>not read this time: the request's budget for fetching from repo hosts ran out, or the read would take too long. Ask again, or read that one alone. A client reads a status it doesn't know as <code>not-read</code></td></tr>
+  </tbody>
+</table></div>
+<p>What is read now comes from the Cactarium's own copy of the package's repo history, and shares the single reads' cache, so a commit read before costs nothing. Fetching from repo hosts is bounded: at most 8 items of a request may need it (an update of that history, the commit's files, or a fresh checkout of a commit the copy can't serve), none starting more than a minute into the request, and only a few at once across all requests; the others are <code>not-read</code>, as is anything unfinished after two and a half minutes. Items are read four at a time.</p>
 
 <h3 id="stack-releases"><code>GET /stacks/{owner}/{name}/releases</code></h3>
 <p>A stack's published releases. Response: <code>StackReleases</code>: the <code>slug</code> and a list of <code>VersionInfo</code>.</p>

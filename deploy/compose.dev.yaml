@@ -15,6 +15,10 @@ services:
       # Room for the smoke test's own registrations through the website, previews and confirms alike.
       CACTARIUM_PREVIEWS_PER_HOUR: "30"
       CACTARIUM_SUPERADMIN: ${CACTARIUM_SUPERADMIN:-dev:max}
+      # Unset (the defaults: 12 reads made now per minute, 8 items of a batch read using the
+      # network), except while the smoke test compares every demo commit's batch and single reads.
+      CACTARIUM_TIP_LIMIT: ${CACTARIUM_TIP_LIMIT:-}
+      CACTARIUM_READ_NETWORK_ITEMS: ${CACTARIUM_READ_NETWORK_ITEMS:-}
     volumes:
       # The demo repos sit at the same absolute path inside and outside the container, so their
       # file:// URLs work for the server and for a cactup on the host alike.

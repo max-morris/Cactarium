@@ -52,6 +52,7 @@ writes take a bearer token from the site's Settings page (or `just cli token <us
 | `GET /stacks/{owner}/{name}/releases/{version\|head\|master}` | `FrozenStack` |
 | `GET /sims/{owner}/{name}/{X.Y.Z}/download[?sim=<sim>]` | the `.sim` bytes, with `x-sha256` |
 | `POST /lookup` | `LookedUp`: which package and version each pinned commit is, each download's review |
+| `POST /packages/read` (`ReadRequest`) | `ReadAnswer`: many packages, each at a commit, each as `versions/{commit}` answers it |
 | `GET /providers?implements=…` (or `capability=`, `function=`, `thorn=`, `include=`) | `Providers` |
 | `POST /sims/{owner}/{name}` (bearer, `.sim` body) | `Published` |
 | `POST /stacks/{owner}/{name}/releases` (bearer, `ReleaseRequest`) | `Published` |
@@ -81,6 +82,19 @@ say `x-cactarium-unreviewed: true`.
   (`head`, `master`, a commit no version froze) of a package that isn't trusted is 403
   `forbidden` unless the site allows untrusted artifacts; when it is served, it carries
   `x-cactarium-untrusted: true` (`false` on a trusted package's).
+- `POST /packages/read`: at most 200 items (owner/name and a full commit id, no pair twice), else
+  400 for the whole request. Each item is what `versions/{commit}` answers: `status` `ok` with
+  that `PackageVersion` (a version that froze the commit, else the package read now) and its
+  `untrusted`/`unreviewed`, or the single read's code (`forbidden`, `not-found`, `bad-request`,
+  `upstream`) with its message, or `not-read` (ask again, or read it alone). The request counts
+  once against the per-minute limit on reads made now (a 429 refuses it whole). What is read now
+  comes from the repo's kept history mirror, which shares the single reads' cache: the commit's
+  tree checked out from it, the files it lacks (it starts blobless) fetched in one request per
+  package and kept; what the mirror can't serve is checked out as the single read does. At most 8
+  items of a request may use the network (a mirror update, missing files, a checkout), none
+  starting after 60 seconds, and at most 4 such items run at once across all requests; the rest are
+  `not-read`, as is anything unfinished after 150 seconds and an internal error. Items are read 4
+  at a time, in request order.
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.
