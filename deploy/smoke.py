@@ -2715,7 +2715,7 @@ check("asked again, they are read", s == 200 and again and all(i["status"] not i
 # read says (a fresh checkout), from a cold mirror, from a warm one (no network at all), and from
 # the shared cache. The limits are raised for it (dev-only knobs), and the app made anew between
 # the steps, which empties the cache.
-pairs = []
+pairs, paths = [], set()
 for row in psql("SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id WHERE e.kind = 'package' ORDER BY 1").splitlines():
     slug, url = row.split(" ", 1)
     path = url[len("file://"):] if url.startswith("file://") else ""
@@ -2723,6 +2723,7 @@ for row in psql("SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e 
         continue
     commits = subprocess.run(["git", "-C", path, "rev-list", "--all"], capture_output=True, text=True).stdout.split()
     pairs += [(slug, c) for c in commits]
+    paths.add(path)
 relaunch(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000)
 singles = {p: single(*p) for p in pairs}
 kinds = sorted({(o[0], o[1]["version"] == p[1] if o[0] == 200 else o[1]["error"]["code"]) for p, o in singles.items()}, key=str)
@@ -2742,6 +2743,13 @@ def compare(what, knobs):
                 differ.append((p, singles[p][0], str(singles[p][1])[:300], str(item)[:300]))
     check(f"for all {len(pairs)} commits of the demo packages, the batch read is the single read's ({what})", pairs and not differ, differ[:3])
 
+# Cold for real: the demo repos let clients filter (as forges do; without it a clone gets every
+# file), and the mirrors (a cache) are deleted, so the batch reads clone them blobless and fetch
+# the files each commit needs.
+for path in paths:
+    subprocess.run(["git", "-C", path, "config", "uploadpack.allowFilter", "true"], check=True)
+compose("stop", "app")
+compose("run", "--rm", "--no-deps", "--entrypoint", "sh", "app", "-c", "find /var/lib/cactarium/mirrors -mindepth 1 -delete")
 compare("a cold mirror", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000))
 log = compose("logs", "app")
 fetched = len(re.findall(r"fetching \d+ of \d+ files of [0-9a-f]+ that the mirror", log))
