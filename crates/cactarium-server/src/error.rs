@@ -68,7 +68,7 @@ impl AppError {
     }
 
     /// What the visitor may see. Internal errors are logged, never shown.
-    fn public_message(&self) -> String {
+    pub(crate) fn public_message(&self) -> String {
         match self {
             AppError::Internal(e) => {
                 tracing::error!("internal error: {e:#}");

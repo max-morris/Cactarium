@@ -3676,19 +3676,93 @@ async fn checkout_failure(state: &AppState, url: &str, commit: &str, e: anyhow::
 /// Reads a package at `commit` (its default branch's tip, or a commit someone named) the way a
 /// release is read: the manifest (the curated one, for a curated package) and the thorns there.
 pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str, reading: crate::deps::Reading) -> AppResult<PackageTip> {
-    if entry.kind != "package" {
-        return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
-    }
-    let repo = repo_of(state, entry.id)
-        .await?
-        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
+    let repo = tip_repo(state, entry).await?;
     let co = match git::checkout(policy(state), &repo.url, commit, None).await {
         Ok(co) => co,
         Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await),
     };
+    read_tip(state, entry, &repo, &co, commit, reading).await
+}
+
+/// Why a batch read of a package at a commit has no answer.
+pub enum TipFailure {
+    /// What the single read ([`package_tip`]) fails with.
+    Failed(AppError),
+    /// Not read this time: it needed the network, and the request's leave for it ran out (or a
+    /// slot was busy). Why, to show.
+    NotRead(String),
+}
+
+impl From<AppError> for TipFailure {
+    fn from(e: AppError) -> Self {
+        TipFailure::Failed(e)
+    }
+}
+
+/// [`package_tip`] for a batch read (`POST /packages/read`): the same reading of the same files,
+/// taken from the repo's kept history mirror ([`git::checkout_from_mirror`]) rather than fetched
+/// afresh. What the mirror can't serve is checked out as [`package_tip`] does it, so the answer
+/// (a reading, or the failure) is the single read's. Network use, of either kind, takes leave from
+/// `gate` first; without it the package isn't read.
+pub async fn package_tip_from_mirror(
+    state: &AppState,
+    entry: &Entry,
+    commit: &str,
+    reading: crate::deps::Reading,
+    gate: &git::NetGate,
+) -> Result<PackageTip, TipFailure> {
+    let repo = tip_repo(state, entry).await?;
+    let mut net = None;
+    let found = Box::pin(git::checkout_from_mirror(policy(state), &repo.url, commit, gate, &mut net))
+        .await
+        .map_err(|e| AppError::Internal(e.context(format!("reading {} at {commit} from its mirror", entry.slug()))))?;
+    let co = match found {
+        git::FromMirror::Read(co) => co,
+        git::FromMirror::NotRead(why) => return Err(TipFailure::NotRead(why.to_owned())),
+        git::FromMirror::Failed(e) => {
+            // Telling a missing commit from an unreachable host may ask the host.
+            let _net = match net {
+                Some(n) => n,
+                None => gate.take().map_err(|why| TipFailure::NotRead(why.to_owned()))?,
+            };
+            return Err(checkout_failure(state, &repo.url, commit, e).await.into());
+        }
+        git::FromMirror::Elsewhere(why) => {
+            tracing::info!("{} at {commit}: not from the mirror ({why}); checking it out", entry.slug());
+            match git::checkout(policy(state), &repo.url, commit, None).await {
+                Ok(co) => co,
+                Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await.into()),
+            }
+        }
+    };
+    // Reading the files needs no network: the slot is free for another item.
+    drop(net);
+    Ok(read_tip(state, entry, &repo, &co, commit, reading).await?)
+}
+
+/// The repo a package is read from at a commit.
+async fn tip_repo(state: &AppState, entry: &Entry) -> AppResult<RepoRow> {
+    if entry.kind != "package" {
+        return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
+    }
+    repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))
+}
+
+/// The package as `co` (its files at `commit`) has it: [`package_tip`]'s reading, however the
+/// files came.
+async fn read_tip(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    co: &git::Checkout,
+    commit: &str,
+    reading: crate::deps::Reading,
+) -> AppResult<PackageTip> {
     let r = RemoteRef { name: "HEAD".into(), commit: commit.to_owned() };
     let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
-    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts { reading, ..PrepOpts::default() })
+    let p = prepare(state, entry, repo, co, &r, &tv, &PrepOpts { reading, ..PrepOpts::default() })
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
     let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);

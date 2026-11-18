@@ -9,8 +9,9 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use cactup_ecosystem_common::api::{
     API_GENERATION, CONTACT_HEADER, EntryInfo, INCLUDE_UNREVIEWED_HEADER, PackageVersion, PackageVersions,
-    Published, Refreshed, ReleaseRequest, Resolved, SHA256_HEADER, StackReleases, ThornInfo,
-    UNPINNED_HEADER, UNREVIEWED_HEADER, UNTRUSTED_HEADER, VersionInfo, WhoAmI,
+    Published, ReadAnswer, ReadItem, ReadQuery, ReadRequest, ReadStatus, Refreshed, ReleaseRequest, Resolved,
+    SHA256_HEADER, StackReleases, ThornInfo, UNPINNED_HEADER, UNREVIEWED_HEADER, UNTRUSTED_HEADER, VersionInfo,
+    WhoAmI,
 };
 use cactup_ecosystem_common::api::{RegisterRequest, Registered, RegisteredEntry};
 use cactup_ecosystem_common::ccl::ThornFacts;
@@ -555,8 +556,19 @@ pub async fn package_tip(
     let kind = if commit.is_some() { Unreviewed::Commit } else { Unreviewed::Tip };
     let trusted = unreviewed_allowed(&state, &e, &label, kind).await?;
     let t = package_snapshot(&state, &e, ip, commit.as_deref(), exact, &reviewer).await?;
-    let body = PackageVersion {
-        version: tip_version_info(&e, &label, &t),
+    let body = tip_body(&e, &label, url, &t);
+    let marked = axum::response::AppendHeaders(unreviewed_header(&e, None));
+    Ok(match commit {
+        Some(_) => (marked, [untrusted_header(trusted)], Json(body)).into_response(),
+        None => (marked, tip_headers(trusted), Json(body)).into_response(),
+    })
+}
+
+/// A package read now, in the shape of one released version labeled `label` (`head`, `master`, or
+/// the full commit).
+fn tip_body(e: &Entry, label: &str, url: String, t: &tracker::PackageTip) -> PackageVersion {
+    PackageVersion {
+        version: tip_version_info(e, label, t),
         url,
         flesh: t.flesh,
         library: t.library,
@@ -571,12 +583,150 @@ pub async fn package_tip(
             })
             .collect(),
         claims: t.claims.iter().map(ClaimRec::info).collect(),
-    };
-    let marked = axum::response::AppendHeaders(unreviewed_header(&e, None));
-    Ok(match commit {
-        Some(_) => (marked, [untrusted_header(trusted)], Json(body)).into_response(),
-        None => (marked, tip_headers(trusted), Json(body)).into_response(),
-    })
+    }
+}
+
+/// How many items of a batch read are read at once.
+const READ_CONCURRENCY: usize = 4;
+/// A batch read starts nothing new on the network this long after it began (what is under way
+/// goes on)...
+const READ_NETWORK_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// ... and answers by this time, whatever is still under way being not read: well within the
+/// proxy's time limit (Apache's `ProxyTimeout`, 300 s).
+const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// `POST /packages/read`: many packages, each at a full commit, each answered as
+/// `GET /packages/{owner}/{name}/versions/{commit}` ([`package_tip`]) answers it, in request
+/// order. What is read now comes from the repos' kept history mirrors
+/// ([`tracker::package_tip_from_mirror`]) and shares the single reads' cache. The request counts
+/// once against the reads-made-now limit; within it, at most `read_network_items` items (8) may
+/// use the network (a mirror update, files the mirror lacks, a checkout), none starting after
+/// [`READ_NETWORK_WINDOW`]; the others are `not-read`, as is anything unfinished by
+/// [`READ_DEADLINE`] and any internal error (logged). [`READ_CONCURRENCY`] items at a time.
+pub async fn read_packages(
+    State(state): State<AppState>,
+    ip: ClientIp,
+    reviewer: Reviewer,
+    Json(req): Json<ReadRequest>,
+) -> ApiResult<Json<ReadAnswer>> {
+    req.validate().map_err(AppError::bad)?;
+    state.limiter.check("tip", ip.0, state.cfg.tip_limit)?;
+    let gate = std::sync::Arc::new(git::NetGate::new(state.cfg.read_network_items, READ_NETWORK_WINDOW));
+    let deadline = tokio::time::Instant::now() + READ_DEADLINE;
+    let running = std::sync::Arc::new(tokio::sync::Semaphore::new(READ_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut answers: Vec<Option<ReadItem>> = vec![None; req.items.len()];
+    // Started in request order; dropping the set (the deadline, the client going away) stops what
+    // is still running.
+    for (i, q) in req.items.iter().enumerate() {
+        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, running.clone().acquire_owned()).await else { break };
+        let (state, gate, q) = (state.clone(), gate.clone(), q.clone());
+        tasks.spawn(async move {
+            let _running = permit;
+            (i, read_item(&state, &reviewer, &q, &gate).await)
+        });
+    }
+    while let Ok(Some(done)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        match done {
+            Ok((i, item)) => answers[i] = Some(item),
+            Err(e) => tracing::error!("a batch read's item failed: {e}"),
+        }
+    }
+    tasks.abort_all();
+    let items = answers
+        .into_iter()
+        .zip(&req.items)
+        .map(|(a, q)| {
+            a.unwrap_or_else(|| not_read(q, "Not read this time: the request ran out of time; ask again, or read it alone".into()))
+        })
+        .collect();
+    Ok(Json(ReadAnswer { items }))
+}
+
+fn not_read(q: &ReadQuery, why: String) -> ReadItem {
+    ReadItem {
+        package: q.package.clone(),
+        commit: q.commit.clone(),
+        status: ReadStatus::NotRead,
+        version: None,
+        error: Some(why),
+        untrusted: false,
+        unreviewed: false,
+    }
+}
+
+impl From<ApiError> for tracker::TipFailure {
+    fn from(e: ApiError) -> Self {
+        tracker::TipFailure::Failed(e.0)
+    }
+}
+
+/// One item of a batch read: what the single read answers, as a status.
+async fn read_item(state: &AppState, reviewer: &Reviewer, q: &ReadQuery, gate: &git::NetGate) -> ReadItem {
+    match read_at_commit(state, reviewer, q, gate).await {
+        Ok((version, untrusted, unreviewed)) => ReadItem {
+            package: q.package.clone(),
+            commit: q.commit.clone(),
+            status: ReadStatus::Ok,
+            version: Some(version),
+            error: None,
+            untrusted,
+            unreviewed,
+        },
+        Err(tracker::TipFailure::NotRead(why)) => not_read(q, format!("Not read this time: {why}; ask again, or read it alone")),
+        Err(tracker::TipFailure::Failed(e)) => {
+            let status = read_status(&e);
+            let message = e.public_message();
+            if status == ReadStatus::NotRead {
+                return not_read(q, format!("{}; ask again, or read it alone", message.trim_end_matches('.')));
+            }
+            ReadItem {
+                status,
+                error: Some(message),
+                ..not_read(q, String::new())
+            }
+        }
+    }
+}
+
+/// The status of a batch read's item that the single read would answer with `e`: its error code.
+/// An internal error (logged with its message) is the item's alone: not read.
+fn read_status(e: &AppError) -> ReadStatus {
+    match e {
+        AppError::NotFound | AppError::Missing(_) => ReadStatus::NotFound,
+        AppError::BadRequest(_) => ReadStatus::BadRequest,
+        AppError::Forbidden | AppError::Denied(_) => ReadStatus::Forbidden,
+        AppError::Upstream(_) => ReadStatus::Upstream,
+        AppError::Internal(_) | AppError::Unauthorized | AppError::Conflict(_) | AppError::TooManyRequests(_) => ReadStatus::NotRead,
+    }
+}
+
+/// [`package_tip`]'s decisions for one full commit: the version that froze it, as this request may
+/// be served it; else the package read now, under the untrusted-code rule. With what the single
+/// read says in `x-cactarium-untrusted` and `x-cactarium-unreviewed`.
+async fn read_at_commit(
+    state: &AppState,
+    reviewer: &Reviewer,
+    q: &ReadQuery,
+    gate: &git::NetGate,
+) -> Result<(PackageVersion, bool, bool), tracker::TipFailure> {
+    let (owner, name) = q.package.split_once('/').ok_or(AppError::NotFound)?;
+    let e = entry_for(state, owner, name, Some("package"), reviewer).await?;
+    // As `full_commit` finds it: a package with no repo has no commits.
+    let url = tracker::repo_of(state, e.id).await?.ok_or(AppError::NotFound)?.url;
+    if let Some(v) = version_at_commit(state, &e, &q.commit, reviewer).await? {
+        return Ok((version_body(state, &v, &url).await?, false, unreviewed_header(&e, Some(&v)).is_some()));
+    }
+    let trusted = unreviewed_allowed(state, &e, &q.commit, Unreviewed::Commit).await?;
+    let fingerprint = snapshot_fingerprint(state, &e, reviewer).await?;
+    let t = state
+        .package_tips
+        .get_or_try_init((e.id, q.commit.clone(), fingerprint), || async {
+            let reading = crate::deps::Reading::Tip { releases: reviewer.releases, entries: reviewer.entries };
+            tracker::package_tip_from_mirror(state, &e, &q.commit, reading, gate).await.map(std::sync::Arc::new)
+        })
+        .await?;
+    Ok((tip_body(&e, &q.commit, url, &t), !trusted, unreviewed_header(&e, None).is_some()))
 }
 
 /// The `!REPO_PATH` a thornlist section cloning the package's repo writes for thorn `arr/name`
@@ -680,7 +830,7 @@ async fn package_snapshot(
     }
     // Reading a package outside its versions fetches the remote repo; keep anonymous callers from
     // turning that into a flood.
-    state.limiter.check("tip", ip.0, 12)?;
+    state.limiter.check("tip", ip.0, state.cfg.tip_limit)?;
     let commit = match commit {
         Some(c) => c.to_owned(),
         None => tracker::package_tip_commit(state, e).await?,
@@ -773,7 +923,7 @@ pub async fn stack_release(
     // served freely. Otherwise the site setting refuses it, or serves it marked untrusted.
     let trusted = unreviewed_allowed(&state, &e, &version, Unreviewed::Tip).await?;
     // Resolving a tip reads remote repos; keep anonymous callers from turning that into a flood.
-    state.limiter.check("tip", ip.0, 12)?;
+    state.limiter.check("tip", ip.0, state.cfg.tip_limit)?;
     // Resolving reads every component repo's branch; requests for the same tip share one
     // resolution, reused for a few seconds.
     let resolve = || async {
@@ -1318,6 +1468,32 @@ pub(crate) mod tests {
     }
 
     /// The fingerprint round-trips, and names the request it answered.
+    /// A batch read's item fails with the single read's error code, but an internal error is
+    /// only not read.
+    #[test]
+    fn read_statuses_are_the_single_reads_codes() {
+        use axum::response::IntoResponse;
+        for e in [
+            AppError::NotFound,
+            AppError::Missing("no commit".into()),
+            AppError::Denied("not served".into()),
+            AppError::bad("invalid"),
+            AppError::Upstream("unreachable".into()),
+        ] {
+            let status = read_status(&e);
+            let response = ApiError(e).into_response();
+            let code = match response.status().as_u16() {
+                400 => ReadStatus::BadRequest,
+                403 => ReadStatus::Forbidden,
+                404 => ReadStatus::NotFound,
+                502 => ReadStatus::Upstream,
+                other => panic!("{other}"),
+            };
+            assert_eq!(status, code);
+        }
+        assert_eq!(read_status(&AppError::Internal(anyhow::anyhow!("db"))), ReadStatus::NotRead);
+    }
+
     #[test]
     fn expect_round_trips() {
         let e = Expect {
