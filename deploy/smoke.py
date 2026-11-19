@@ -2285,6 +2285,13 @@ check("a commit a version froze is that version", pins[0].get("package") == "max
       and pins[0].get("commit-known") is True and "review" not in pins[0], pins[0])
 check("a respelled URL is the same repo; a commit no version froze has no version but is known",
       pins[1].get("package") == "max/carpetx" and pins[1].get("version") is None and pins[1].get("commit-known") is True, pins[1])
+# Within a minute of the mirror's last update (the refresh window) a miss can't tell, since the
+# commit may have been pushed since: null. After the window, the lookup updates and a miss is a no.
+if pins[2].get("commit-known") is None:
+    check("a commit the mirror lacks, within the refresh window, can't tell yet", pins[2].get("package") == "max/carpetx", pins[2])
+    time.sleep(61)
+    _, again, _ = api("POST", "/lookup", {"pins": [{"url": carpetx_url, "commit": "0" * 40}]})
+    pins[2] = (again.get("pins") or [{}])[0]
 check("a commit the repo doesn't have is not known", pins[2].get("package") == "max/carpetx" and pins[2].get("commit-known") is False, pins[2])
 check("a repo no package has: no package, nothing known", pins[3].get("package") is None and pins[3].get("commit-known") is None, pins[3])
 check("a download never submitted has no review", (r.get("downloads") or [{}])[0].get("review", "x") is None, r.get("downloads"))
@@ -2638,8 +2645,9 @@ s, r, _ = batch([("max/carpetx", unrel[:12])])
 check("a batch read with an abbreviated commit is 400", s == 400 and "full lowercase commit id" in r.get("error", {}).get("message", ""), r)
 s, r, _ = batch([("max/carpetx/CarpetX", unrel)])
 check("a batch read names packages by owner/name only", s == 400, r)
-# The request counts once against the per-minute limit on reads made now, however many items it
-# has: 12 pass, the 13th is refused whole (with Retry-After), and so is a single read made now.
+# A request that reads something now counts once against the per-minute limit on reads made now,
+# however many items it has (a commit the repo lacks is read, and fails, every time): 12 pass, the
+# 13th is refused whole (with Retry-After), and so is a single read made now.
 codes = [batch([("max/carpetx", v110), ("max/carpetx", unrel), ("max/carpetx", "ab" * 20)]) for _ in range(13)]
 retry = codes[-1][2].get("Retry-After") or codes[-1][2].get("retry-after")
 check("each batch read counts once against the limit on reads made now, and a 429 says when to retry",
@@ -2648,6 +2656,16 @@ check("each batch read counts once against the limit on reads made now, and a 42
 s, _, _ = anon.get("/api/v1/packages/max/carpetx/versions/head")
 check("the same limit as single reads made now", s == 429, s)
 
+relaunch()
+# One that reads nothing now (versions, cached readings, an empty one) doesn't count, as a single
+# read of a cached full commit doesn't.
+s, r, _ = batch([("max/carpetx", unrel)])
+codes = [batch(c)[0] for c in [[("max/carpetx", unrel), ("max/carpetx", v110), ("nobody/nothing", unrel)]] * 14 + [[]] * 2]
+s2, body, _ = anon.get("/api/v1/packages/max/carpetx/versions/head")
+check("batches that read nothing now don't count against the limit",
+      s == 200 and r["items"][0]["status"] == "ok" and codes == [200] * 16 and s2 == 200, f"{s} {codes} {s2}")
+s, r, _ = api("POST", "/packages/read", {})
+check("an empty batch answers no items", s == 200 and r == {"items": []}, f"{s} {r}")
 relaunch()
 pairs = [("max/carpetx", unrel), ("max/carpetx", v110), ("et/fakelib", fold), ("et/fakelib", fv),
          ("max/carpetx", "ab" * 20), ("nobody/nothing", unrel), ("max/carpetx-mp", unrel)]

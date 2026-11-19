@@ -310,7 +310,13 @@ async fn exec_raw(
             let mut buf = Vec::new();
             (&mut stdout).take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf).await?;
             if buf.len() > MAX_OUTPUT {
-                bail!("{what}: git printed more than {} MB", MAX_OUTPUT / (1024 * 1024));
+                // Only a huge repo makes git print this much (a tree of hundreds of thousands of
+                // files): a fact about the commit, as the size checks are.
+                return Err(TooLarge(format!(
+                    "the repo is too large to index ({what}: git printed more than {} MB)",
+                    MAX_OUTPUT / (1024 * 1024)
+                ))
+                .into());
             }
             anyhow::Ok(buf)
         };
@@ -739,8 +745,8 @@ async fn lacks_commits(policy: GitPolicy, dir: &Path, commits: &[String]) -> boo
 /// What a kept mirror says of some commits ([`mirror_has_commits`]).
 pub struct MirrorAnswer {
     /// For each commit asked: `Some(true)` when the mirror has it, `Some(false)` when it doesn't
-    /// after an update (or one within [`MIRROR_REFRESH`]), `None` when it can't tell just now (the
-    /// update failed, or none was allowed).
+    /// after an update this call waited for, `None` when it can't tell just now (the update failed,
+    /// none was allowed, or the last one was too recent for another).
     pub has: Vec<Option<bool>>,
     /// Whether an update was asked for (whether or not one ran: the window may have answered).
     pub updated: bool,
@@ -764,9 +770,16 @@ pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String]
         return Some(MirrorAnswer { has: first.into_iter().map(|b| b.then_some(true)).collect(), updated: false });
     }
     // Never queued: a lookup that finds the slot busy says "can't tell" for what the mirror lacks.
+    // So does one the refresh window answered without fetching: a commit pushed since the last
+    // update would be missing, though the repo has it.
+    let before = mirror_lock(&dir).lock().await.finished;
     let error = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &LOOKUP_UPDATES, Wait::Never).await;
+    let fetched = mirror_lock(&dir).lock().await.finished != before;
     let after = is_commit(object_types(policy, &dir, commits).await);
-    let has = after.into_iter().map(|b| if b { Some(true) } else if error.is_none() { Some(false) } else { None }).collect();
+    let has = after
+        .into_iter()
+        .map(|b| if b { Some(true) } else if error.is_none() && fetched { Some(false) } else { None })
+        .collect();
     Some(MirrorAnswer { has, updated: true })
 }
 
@@ -1558,6 +1571,9 @@ pub async fn checkout_from_mirror(
     }
     // From here, a git failure is the mirror's: flagged, and the commit left to a checkout.
     let broken = |e: anyhow::Error| {
+        if e.downcast_ref::<TooLarge>().is_some() {
+            return FromMirror::Failed(e);
+        }
         tracing::warn!("reading {commit} from the mirror of {key}: {e:#}; it will be cloned again");
         flag_broken(&dir);
         FromMirror::Elsewhere(format!("the mirror couldn't be read: {e:#}"))
@@ -2044,8 +2060,15 @@ mod tests {
         .unwrap();
         assert!(asked.get(), "asked, since the mirror lacked them");
         assert_eq!((a.has, a.updated), (vec![Some(true), Some(false)], true));
+        // Within the window the last update opened, a miss can't tell: a commit pushed since would
+        // be missing too. After it, an update runs and a miss is a no.
         let tree = sh(&up, &["rev-parse", "HEAD^{tree}"]);
-        assert_eq!(mirror_has_commits(policy, &url, &[tree], || true).await.unwrap().has, vec![Some(false)]);
+        assert_eq!(mirror_has_commits(policy, &url, std::slice::from_ref(&tree), || true).await.unwrap().has, vec![None]);
+        let pushed = commit_on(&up, "pushed", "pushed");
+        assert_eq!(mirror_has_commits(policy, &url, std::slice::from_ref(&pushed), || true).await.unwrap().has, vec![None], "pushed in the window");
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        let a = mirror_has_commits(policy, &url, &[tree, pushed], || true).await.unwrap();
+        assert_eq!(a.has, vec![Some(false), Some(true)], "a tree is no commit; the pushed one is fetched");
         // A mirror that has every commit asked never asks for an update.
         let a = mirror_has_commits(policy, &url, &[first], || panic!("no update needed")).await.unwrap();
         assert_eq!((a.has, a.updated), (vec![Some(true)], false));

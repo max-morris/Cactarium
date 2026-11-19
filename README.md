@@ -86,8 +86,10 @@ say `x-cactarium-unreviewed: true`.
   400 for the whole request. Each item is what `versions/{commit}` answers: `status` `ok` with
   that `PackageVersion` (a version that froze the commit, else the package read now) and its
   `untrusted`/`unreviewed`, or the single read's code (`forbidden`, `not-found`, `bad-request`,
-  `upstream`) with its message, or `not-read` (ask again, or read it alone). The request counts
-  once against the per-minute limit on reads made now (a 429 refuses it whole). What is read now
+  `upstream`) with its message, or `not-read` (ask again, or read it alone). A request that
+  reads anything now (an item that is no version, may be served and isn't cached) counts once
+  against the per-minute limit on reads made now (a 429 refuses it whole); one that reads nothing
+  now doesn't count, as a single read of a cached full commit doesn't. What is read now
   comes from the repo's kept history mirror, and shares the single reads' cache (4096 readings,
   the oldest dropped first): the commit's tree checked out from the mirror, the files it lacks
   fetched in one request per package and kept (packed anew from exactly those files); a commit no

@@ -613,7 +613,9 @@ pub async fn read_packages(
     Json(req): Json<ReadRequest>,
 ) -> ApiResult<Json<ReadAnswer>> {
     req.validate().map_err(AppError::bad)?;
-    state.limiter.check("tip", ip.0, state.cfg.tip_limit)?;
+    if batch_reads_now(&state, &reviewer, &req.items).await {
+        state.limiter.check("tip", ip.0, state.cfg.tip_limit)?;
+    }
     let outcomes = run_batch(req.items.clone(), READ_IN_FLIGHT, READ_REPLY_WITHIN, move |q: ReadQuery| {
         let state = state.clone();
         async move { read_item(&state, &reviewer, &q).await }
@@ -749,21 +751,53 @@ fn read_status(e: &AppError) -> ReadStatus {
 /// [`package_tip`]'s decisions for one full commit: the version that froze it, as this request may
 /// be served it; else the package read now, under the untrusted-code rule. With what the single
 /// read says in `x-cactarium-untrusted` and `x-cactarium-unreviewed`.
-async fn read_at_commit(state: &AppState, reviewer: &Reviewer, q: &ReadQuery) -> Result<(PackageVersion, bool, bool), tracker::TipFailure> {
+/// What one item of a batch read is, before anything is read: a version, or a commit to read now.
+enum ItemAt {
+    Version(Box<Version>, Entry, String),
+    Commit { e: Entry, url: String, trusted: bool, key: (i64, String, String) },
+}
+
+/// The single read's decisions for one item, up to the reading itself.
+async fn item_at(state: &AppState, reviewer: &Reviewer, q: &ReadQuery) -> ApiResult<ItemAt> {
     let (owner, name) = q.package.split_once('/').ok_or(AppError::NotFound)?;
     let e = entry_for(state, owner, name, Some("package"), reviewer).await?;
     // As `full_commit` finds it: a package with no repo has no commits.
     let url = tracker::repo_of(state, e.id).await?.ok_or(AppError::NotFound)?.url;
     if let Some(v) = version_at_commit(state, &e, &q.commit, reviewer).await? {
-        return Ok((version_body(state, &v, &url).await?, false, unreviewed_header(&e, Some(&v)).is_some()));
+        return Ok(ItemAt::Version(Box::new(v), e, url));
     }
     let trusted = unreviewed_allowed(state, &e, &q.commit, Unreviewed::Commit).await?;
     let fingerprint = snapshot_fingerprint(state, &e, reviewer).await?;
+    let key = (e.id, q.commit.clone(), fingerprint);
+    Ok(ItemAt::Commit { e, url, trusted, key })
+}
+
+/// Whether a batch makes the server read something now: an item that is no version, may be
+/// served, and isn't in the cache. Only such a batch counts against the limit on reads made now,
+/// as a single read of a cached full commit doesn't.
+async fn batch_reads_now(state: &AppState, reviewer: &Reviewer, items: &[ReadQuery]) -> bool {
+    for q in items {
+        if let Ok(ItemAt::Commit { key, .. }) = item_at(state, reviewer, q).await
+            && state.package_tips.peek(&key).is_none()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn read_at_commit(state: &AppState, reviewer: &Reviewer, q: &ReadQuery) -> Result<(PackageVersion, bool, bool), tracker::TipFailure> {
+    let (e, url, trusted, key) = match item_at(state, reviewer, q).await? {
+        ItemAt::Version(v, e, url) => {
+            return Ok((version_body(state, &v, &url).await?, false, unreviewed_header(&e, Some(&v)).is_some()));
+        }
+        ItemAt::Commit { e, url, trusted, key } => (e, url, trusted, key),
+    };
     // A reading made now, unless cached or under way. A single read of the same key meanwhile
     // waits for this one (and this one for it), even once this item's batch has answered.
     let t = state
         .package_tips
-        .get_or_try_init((e.id, q.commit.clone(), fingerprint), || async {
+        .get_or_try_init(key, || async {
             let _cold = COLD.try_acquire().map_err(|_| {
                 tracker::TipFailure::NotRead("too many packages are being read just now".into())
             })?;
