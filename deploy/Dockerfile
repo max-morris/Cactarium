@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
  && install -d -m 0700 -o cactarium -g cactarium /var/lib/cactarium/mirrors
 COPY --from=build /cactarium /usr/local/bin/cactarium
 COPY crates/cactarium-server/static /srv/cactarium/static
-# CACTARIUM_MIRRORS: history-only copies of authors' repos, for abbreviated commit ids (a volume).
+# CACTARIUM_MIRRORS: copies of authors' repos (a volume): their history, for abbreviated commit ids
+# and lookups, and the files batch reads need (kept at the packages' tips and what was read since).
 ENV CACTARIUM_STATIC_DIR=/srv/cactarium/static \
     CACTARIUM_MIRRORS=/var/lib/cactarium/mirrors \
     CACTARIUM_BIND=0.0.0.0:8000 \

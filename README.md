@@ -88,13 +88,18 @@ say `x-cactarium-unreviewed: true`.
   `untrusted`/`unreviewed`, or the single read's code (`forbidden`, `not-found`, `bad-request`,
   `upstream`) with its message, or `not-read` (ask again, or read it alone). The request counts
   once against the per-minute limit on reads made now (a 429 refuses it whole). What is read now
-  comes from the repo's kept history mirror, which shares the single reads' cache: the commit's
-  tree checked out from it, the files it lacks (it starts blobless) fetched in one request per
-  package and kept; what the mirror can't serve is checked out as the single read does. At most 8
-  items of a request may use the network (a mirror update, missing files, a checkout), none
-  starting after 60 seconds, and at most 4 such items run at once across all requests; the rest are
-  `not-read`, as is anything unfinished after 150 seconds and an internal error. Items are read 4
-  at a time, in request order.
+  comes from the repo's kept history mirror, and shares the single reads' cache (4096 readings,
+  the oldest dropped first): the commit's tree checked out from the mirror, the files it lacks
+  fetched in one request per package and kept (packed anew from exactly those files); a commit no
+  branch or tag of the mirror reaches, or one the mirror can't serve, is checked out as the single
+  read does. The answer comes within 20 seconds: items not done by then are `not-read` ("still
+  being read; ask again shortly") and go on in the background, filling the mirror and the cache.
+  Limits: 8 items of a request under way at once, in request order; 16 items using the network at
+  once across all requests and 32 readings under way in all (past either, an item is `not-read`
+  at once); 8 trees written out from mirrors at once (waited for).
+- Mirrors are kept warm at every package's default-branch tip: once cloned, after each sync of the
+  package, and in a pass over all packages at startup, one repo at a time on a slot of its own. So
+  a base at the packages' tips reads with no network at all.
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.
@@ -179,7 +184,11 @@ organization with `just cli org create et <your-username> --display-name "Einste
   preview of a repo with no entries uses a temporary mirror, deleted afterward, cloned on a slot of
   its own (never one of syncing's three), given up (its git killed) once the request goes away,
   and stopped past 1 GB; leftovers of a process that died are swept at startup and hourly. Kept
-  mirrors have no size limit. Previews and confirms together are limited to
+  mirrors have no size limit for their history; the file contents batch reads and warming keep
+  in them stop being added once a mirror's objects take 2 GB or the volume has under 10 GB free
+  (logged), so size the mirrors volume for the packages' trees at their tips plus what changed
+  since (a few GB for the Einstein Toolkit), with 10 GB to spare. The volume is a cache: deleting it
+  costs clones and fetches, nothing else. Previews and confirms together are limited to
   `CACTARIUM_PREVIEWS_PER_HOUR` per user (default 20); previews also to 60 a minute per address,
   confirms to 10.
 - Upgrading from master to this release, by design but worth knowing:

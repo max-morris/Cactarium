@@ -2585,10 +2585,10 @@ import os
 
 def relaunch(**knobs):
     """The app container made anew (an empty limiter and reading cache; the mirrors are a volume
-    and stay), with the dev-only knobs given (CACTARIUM_TIP_LIMIT, CACTARIUM_READ_NETWORK_ITEMS)
+    and stay), with the dev-only knobs given (CACTARIUM_TIP_LIMIT, CACTARIUM_READ_NETWORK_SLOTS)
     and the others unset."""
     here = os.path.dirname(os.path.abspath(__file__))
-    env = {k: v for k, v in os.environ.items() if k not in ("CACTARIUM_TIP_LIMIT", "CACTARIUM_READ_NETWORK_ITEMS")}
+    env = {k: v for k, v in os.environ.items() if k not in ("CACTARIUM_TIP_LIMIT", "CACTARIUM_READ_NETWORK_SLOTS")}
     env.update({k: str(v) for k, v in knobs.items()})
     subprocess.run(["docker", "compose", "--project-directory", here, "-f", here + "/compose.yaml", "-f", here + "/compose.dev.yaml",
                     "up", "-d", "--no-deps", "--force-recreate", "app"], env=env, check=True, capture_output=True)
@@ -2679,37 +2679,65 @@ one = single("max/carpetx-mp", unrel)
 check("a stack is no package: not-found, as for the single read", by[("max/carpetx-mp", unrel)]["status"] == "not-found"
       and answers_alike(one, by[("max/carpetx-mp", unrel)]), by.get(("max/carpetx-mp", unrel)))
 
-# At most 8 items of a request use the network: fresh commits (which the mirrors lack) of ten
-# trusted packages' repos, read in one request, leave two not read; asked again, they are read.
+def batch_until_read(pairs, tries=40, headers=None):
+    """A batch read asked again (as a client does) while items are still being read: the final
+    answer for each pair, in order."""
+    final, pending = {}, list(pairs)
+    for _ in range(tries):
+        if not pending:
+            break
+        s, r, _ = batch(pending, headers=headers)
+        if s != 200:
+            return s, r
+        later = []
+        for p, item in zip(pending, r["items"]):
+            busy = item["status"] == "not-read" and any(w in item.get("error", "") for w in ("Still being read", "ran out of time", "too many packages"))
+            if busy:
+                later.append(p)
+            else:
+                final[p] = item
+        pending = later
+        if pending:
+            time.sleep(1)
+    return 200, {"items": [final.get(p, {"status": "never answered"}) for p in pairs]}
+
+# Batch reads use the network only with a slot (16 across all requests): with none, a commit only
+# a checkout can read is not read this time, saying so; with slots, it is read. Fresh commits of
+# ten trusted packages' repos, under refs/pull/ (which mirrors never fetch, as for a forge's pull
+# requests), so only a checkout reads them.
 trusted = psql("""SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
                   WHERE e.kind = 'package' AND e.visibility = 'public' AND r.url LIKE 'file://%'
                     AND (e.trusted OR EXISTS (SELECT 1 FROM users u WHERE u.username = e.owner AND NOT u.banned AND (u.trusted OR u.role <> 'user'))
                          OR EXISTS (SELECT 1 FROM orgs o WHERE o.name = e.owner AND o.trusted))
                   ORDER BY 1""").splitlines()
-fresh, seen_repos = [], set()
+fresh, seen_repos = [], {}
 for row in trusted:
     slug, url = row.split(" ", 1)
     path = url[len("file://"):]
     if path in seen_repos or not os.path.isdir(path):
         continue
     made = subprocess.run(["git", "-C", path, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit-tree", "HEAD^{tree}", "-p", "HEAD",
-                           "-m", "batch read budget"], capture_output=True, text=True)
+                           "-m", "a pull request"], capture_output=True, text=True)
     if made.returncode != 0:
         continue
     c = made.stdout.strip()
-    subprocess.run(["git", "-C", path, "update-ref", "refs/heads/batch-budget", c], check=True)
-    seen_repos.add(path)
+    subprocess.run(["git", "-C", path, "update-ref", "refs/pull/1/head", c], check=True)
+    seen_repos[path] = c
     fresh.append((slug, c))
     if len(fresh) == 10:
         break
+relaunch(CACTARIUM_READ_NETWORK_SLOTS=0)
 s, r, _ = batch(fresh)
-statuses = [i["status"] for i in r.get("items", [])]
-check("a batch read lets 8 items use the network; the rest are not read this time, saying so",
-      len(fresh) == 10 and statuses.count("not-read") == 2
-      and all("ask again" in i["error"] for i in r["items"] if i["status"] == "not-read"), f"{len(fresh)} {statuses} {str(r)[:400]}")
-again = [p for p, i in zip(fresh, r.get("items", [])) if i["status"] == "not-read"]
-s, r, _ = batch(again)
-check("asked again, they are read", s == 200 and again and all(i["status"] not in ("not-read",) for i in r["items"]), str(r)[:300])
+check("with no network slot free, what needs the network is not read this time, saying so",
+      len(fresh) == 10 and s == 200 and all(i["status"] == "not-read" and "no slot was free" in i["error"] and "ask again" in i["error"] for i in r["items"]),
+      f"{len(fresh)} {str(r)[:400]}")
+relaunch()
+s, r = batch_until_read(fresh)
+one = single(*fresh[0])
+check("with slots, they are read (checked out: no branch of the mirrors has them), as the single read reads them",
+      s == 200 and all(i["status"] not in ("not-read", "never answered") for i in r["items"]) and answers_alike(one, r["items"][0]), str(r)[:400])
+for path in seen_repos:
+    subprocess.run(["git", "-C", path, "update-ref", "-d", "refs/pull/1/head"], check=True)
 
 # Every commit of every registered demo package repo: the batch read says exactly what the single
 # read says (a fresh checkout), from a cold mirror, from a warm one (no network at all), and from
@@ -2724,7 +2752,7 @@ for row in psql("SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e 
     commits = subprocess.run(["git", "-C", path, "rev-list", "--all"], capture_output=True, text=True).stdout.split()
     pairs += [(slug, c) for c in commits]
     paths.add(path)
-relaunch(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000)
+relaunch(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=16)
 singles = {p: single(*p) for p in pairs}
 def kind_of(p, one):
     """What a single read answered: a version (False), a reading made now (True), or an error code."""
@@ -2737,7 +2765,7 @@ def compare(what, knobs):
     differ = []
     for start in range(0, len(pairs), 200):
         chunk = pairs[start:start + 200]
-        s, r, _ = batch(chunk)
+        s, r = batch_until_read(chunk)
         if s != 200:
             differ.append((chunk[0], s, str(r)[:200]))
             continue
@@ -2761,13 +2789,13 @@ for path in paths:
     subprocess.run(["git", "-C", path, "config", "uploadpack.allowFilter", "true"], check=True)
 compose("stop", "app")
 compose("run", "--rm", "--no-deps", "--entrypoint", "sh", "app", "-c", "find /var/lib/cactarium/mirrors -mindepth 1 -delete")
-compare("a cold mirror", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=100000))
+compare("a cold mirror", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=16))
 log = compose("logs", "app")
-fetched = len(re.findall(r"fetching \d+ of \d+ files of [0-9a-f]+ that the mirror", log))
+fetched = len(re.findall(r"reading: fetching \d+ of \d+ files of [0-9a-f]+ that the mirror", log))
 fallbacks = len(re.findall(r"not from the mirror", log))
 print(f"     cold: {fetched} commits fetched missing files into their mirrors, {fallbacks} were checked out instead")
 check("cold, the batch reads fetched the files their mirrors lacked", fetched > 0, log[-500:])
-compare("a warm mirror, with no item allowed the network", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_ITEMS=0))
+compare("a warm mirror, with no item allowed the network", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=0))
 compare("the shared cache", None)
 relaunch()
 

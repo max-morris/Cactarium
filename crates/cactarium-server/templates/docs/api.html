@@ -115,7 +115,7 @@
     <tr><td><code>not-read</code></td><td>not read this time: the request's budget for fetching from repo hosts ran out, or the read would take too long. Ask again, or read that one alone. A client reads a status it doesn't know as <code>not-read</code></td></tr>
   </tbody>
 </table></div>
-<p>What is read now comes from the Cactarium's own copy of the package's repo history, and shares the single reads' cache, so a commit read before costs nothing. Fetching from repo hosts is bounded: at most 8 items of a request may need it (an update of that history, the commit's files, or a fresh checkout of a commit the copy can't serve), none starting more than a minute into the request, and only a few at once across all requests; the others are <code>not-read</code>, as is anything unfinished after two and a half minutes. Items are read four at a time.</p>
+<p>What is read now comes from the Cactarium's own copy of the package's repo history, kept current at every package's default-branch tip, and shares the single reads' cache, so a commit read before, or a base at the packages' tips, costs no fetch from a repo host. The answer comes within 20 seconds: an item not done by then is <code>not-read</code> (still being read; ask again shortly) and goes on in the background, so asking again a little later finds it. Items are read eight at a time, in request order. Fetching from repo hosts is bounded across all requests (16 items at once, 32 readings under way in all): an item that finds no room is <code>not-read</code> at once.</p>
 
 <h3 id="stack-releases"><code>GET /stacks/{owner}/{name}/releases</code></h3>
 <p>A stack's published releases. Response: <code>StackReleases</code>: the <code>slug</code> and a list of <code>VersionInfo</code>.</p>
