@@ -586,23 +586,26 @@ fn tip_body(e: &Entry, label: &str, url: String, t: &tracker::PackageTip) -> Pac
     }
 }
 
-/// How many items of a batch read are read at once.
-const READ_CONCURRENCY: usize = 4;
-/// A batch read starts nothing new on the network this long after it began (what is under way
-/// goes on)...
-const READ_NETWORK_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-/// ... and answers by this time, whatever is still under way being not read: well within the
-/// proxy's time limit (Apache's `ProxyTimeout`, 300 s).
-const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
+/// A batch read answers within this time. Items not finished by then aren't stopped: they go on in
+/// the background, filling the mirrors and the reading cache, and are answered `not-read` (still
+/// being read; ask again shortly).
+const READ_REPLY_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+/// Items of one batch read under way at once.
+const READ_IN_FLIGHT: usize = 8;
+/// Readings made now (not cached) under way at once, across all requests, those still running
+/// after their batch answered included. Past it, another is `not-read` at once.
+const COLD_READS: usize = 32;
+static COLD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(COLD_READS);
 
 /// `POST /packages/read`: many packages, each at a full commit, each answered as
 /// `GET /packages/{owner}/{name}/versions/{commit}` ([`package_tip`]) answers it, in request
 /// order. What is read now comes from the repos' kept history mirrors
 /// ([`tracker::package_tip_from_mirror`]) and shares the single reads' cache. The request counts
-/// once against the reads-made-now limit; within it, at most `read_network_items` items (8) may
-/// use the network (a mirror update, files the mirror lacks, a checkout), none starting after
-/// [`READ_NETWORK_WINDOW`]; the others are `not-read`, as is anything unfinished by
-/// [`READ_DEADLINE`] and any internal error (logged). [`READ_CONCURRENCY`] items at a time.
+/// once against the reads-made-now limit. [`READ_IN_FLIGHT`] items at a time, in request order;
+/// the answer comes within [`READ_REPLY_WITHIN`], what isn't done by then being `not-read` (and
+/// going on in the background, up to [`COLD_READS`] readings in all). An item that would need the
+/// network finds a slot or is `not-read` ([`git::READ_NETWORK_SLOTS`]); an internal error (logged)
+/// is `not-read` too.
 pub async fn read_packages(
     State(state): State<AppState>,
     ip: ClientIp,
@@ -611,36 +614,76 @@ pub async fn read_packages(
 ) -> ApiResult<Json<ReadAnswer>> {
     req.validate().map_err(AppError::bad)?;
     state.limiter.check("tip", ip.0, state.cfg.tip_limit)?;
-    let gate = std::sync::Arc::new(git::NetGate::new(state.cfg.read_network_items, READ_NETWORK_WINDOW));
-    let deadline = tokio::time::Instant::now() + READ_DEADLINE;
-    let running = std::sync::Arc::new(tokio::sync::Semaphore::new(READ_CONCURRENCY));
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut answers: Vec<Option<ReadItem>> = vec![None; req.items.len()];
-    // Started in request order; dropping the set (the deadline, the client going away) stops what
-    // is still running.
-    for (i, q) in req.items.iter().enumerate() {
-        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, running.clone().acquire_owned()).await else { break };
-        let (state, gate, q) = (state.clone(), gate.clone(), q.clone());
-        tasks.spawn(async move {
-            let _running = permit;
-            (i, read_item(&state, &reviewer, &q, &gate).await)
-        });
-    }
-    while let Ok(Some(done)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {
-        match done {
-            Ok((i, item)) => answers[i] = Some(item),
-            Err(e) => tracing::error!("a batch read's item failed: {e}"),
-        }
-    }
-    tasks.abort_all();
-    let items = answers
+    let outcomes = run_batch(req.items.clone(), READ_IN_FLIGHT, READ_REPLY_WITHIN, move |q: ReadQuery| {
+        let state = state.clone();
+        async move { read_item(&state, &reviewer, &q).await }
+    })
+    .await;
+    let items = outcomes
         .into_iter()
         .zip(&req.items)
-        .map(|(a, q)| {
-            a.unwrap_or_else(|| not_read(q, "Not read this time: the request ran out of time; ask again, or read it alone".into()))
+        .map(|(o, q)| match o {
+            Outcome::Done(item) => item,
+            Outcome::Running => not_read(q, "Still being read; ask again shortly".into()),
+            Outcome::NotStarted => not_read(q, "Not read this time: the request ran out of time; ask again".into()),
+            Outcome::Panicked => not_read(q, "Something went wrong on our side; ask again, or read it alone".into()),
         })
         .collect();
     Ok(Json(ReadAnswer { items }))
+}
+
+/// What became of one item of a batch by the time it answered.
+#[derive(Debug, PartialEq)]
+enum Outcome<T> {
+    Done(T),
+    /// Started and still running: it goes on in the background.
+    Running,
+    /// Never started: the time was up first.
+    NotStarted,
+    /// It panicked (logged).
+    Panicked,
+}
+
+/// Runs `read` on each item, `in_flight` at a time, started in order, each as a task of its own
+/// that nothing stops: when `within` is up, what has finished is answered and the rest goes on
+/// detached (its result, such as a reading in the shared cache, serving a later request).
+async fn run_batch<Q, T, F, Fut>(items: Vec<Q>, in_flight: usize, within: std::time::Duration, read: F) -> Vec<Outcome<T>>
+where
+    Q: Send + 'static,
+    T: Send + 'static,
+    F: Fn(Q) -> Fut,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + within;
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(in_flight));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut outcomes: Vec<Outcome<T>> = items.iter().map(|_| Outcome::NotStarted).collect();
+    let mut started = 0;
+    for (i, q) in items.into_iter().enumerate() {
+        let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slots.clone().acquire_owned()).await else { break };
+        outcomes[i] = Outcome::Running;
+        started += 1;
+        let (work, tx) = (tokio::spawn(read(q)), tx.clone());
+        tokio::spawn(async move {
+            let done = match work.await {
+                Ok(t) => Outcome::Done(t),
+                Err(e) => {
+                    tracing::error!("a batch read's item failed: {e}");
+                    Outcome::Panicked
+                }
+            };
+            drop(slot);
+            let _ = tx.send((i, done));
+        });
+    }
+    drop(tx);
+    for _ in 0..started {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((i, done))) => outcomes[i] = done,
+            _ => break,
+        }
+    }
+    outcomes
 }
 
 fn not_read(q: &ReadQuery, why: String) -> ReadItem {
@@ -662,8 +705,8 @@ impl From<ApiError> for tracker::TipFailure {
 }
 
 /// One item of a batch read: what the single read answers, as a status.
-async fn read_item(state: &AppState, reviewer: &Reviewer, q: &ReadQuery, gate: &git::NetGate) -> ReadItem {
-    match read_at_commit(state, reviewer, q, gate).await {
+async fn read_item(state: &AppState, reviewer: &Reviewer, q: &ReadQuery) -> ReadItem {
+    match read_at_commit(state, reviewer, q).await {
         Ok((version, untrusted, unreviewed)) => ReadItem {
             package: q.package.clone(),
             commit: q.commit.clone(),
@@ -704,12 +747,7 @@ fn read_status(e: &AppError) -> ReadStatus {
 /// [`package_tip`]'s decisions for one full commit: the version that froze it, as this request may
 /// be served it; else the package read now, under the untrusted-code rule. With what the single
 /// read says in `x-cactarium-untrusted` and `x-cactarium-unreviewed`.
-async fn read_at_commit(
-    state: &AppState,
-    reviewer: &Reviewer,
-    q: &ReadQuery,
-    gate: &git::NetGate,
-) -> Result<(PackageVersion, bool, bool), tracker::TipFailure> {
+async fn read_at_commit(state: &AppState, reviewer: &Reviewer, q: &ReadQuery) -> Result<(PackageVersion, bool, bool), tracker::TipFailure> {
     let (owner, name) = q.package.split_once('/').ok_or(AppError::NotFound)?;
     let e = entry_for(state, owner, name, Some("package"), reviewer).await?;
     // As `full_commit` finds it: a package with no repo has no commits.
@@ -719,11 +757,16 @@ async fn read_at_commit(
     }
     let trusted = unreviewed_allowed(state, &e, &q.commit, Unreviewed::Commit).await?;
     let fingerprint = snapshot_fingerprint(state, &e, reviewer).await?;
+    // A reading made now, unless cached or under way. A single read of the same key meanwhile
+    // waits for this one (and this one for it), even once this item's batch has answered.
     let t = state
         .package_tips
         .get_or_try_init((e.id, q.commit.clone(), fingerprint), || async {
+            let _cold = COLD.try_acquire().map_err(|_| {
+                tracker::TipFailure::NotRead("too many packages are being read just now".into())
+            })?;
             let reading = crate::deps::Reading::Tip { releases: reviewer.releases, entries: reviewer.entries };
-            tracker::package_tip_from_mirror(state, &e, &q.commit, reading, gate).await.map(std::sync::Arc::new)
+            tracker::package_tip_from_mirror(state, &e, &q.commit, reading).await.map(std::sync::Arc::new)
         })
         .await?;
     Ok((tip_body(&e, &q.commit, url, &t), !trusted, unreviewed_header(&e, None).is_some()))
@@ -1492,6 +1535,52 @@ pub(crate) mod tests {
             assert_eq!(status, code);
         }
         assert_eq!(read_status(&AppError::Internal(anyhow::anyhow!("db"))), ReadStatus::NotRead);
+    }
+
+    /// A batch answers when its time is up: what finished, what is still running (and goes on, its
+    /// reading landing in the shared cache for the next request), what never started, and what
+    /// panicked, each told apart.
+    #[tokio::test]
+    async fn batches_answer_in_time_and_slow_items_finish_detached() {
+        use std::time::Duration;
+        let cache: std::sync::Arc<crate::flights::Flights<u32, u32>> = std::sync::Arc::new(crate::flights::Flights::new(None, 16));
+        let c = cache.clone();
+        let outcomes = run_batch(vec![1u32, 2, 3, 4], 3, Duration::from_millis(200), move |k| {
+            let c = c.clone();
+            async move {
+                match k {
+                    1 => k * 10,
+                    2 => {
+                        c.get_or_try_init(k, || async move {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            Ok::<_, ()>(k * 10)
+                        })
+                        .await
+                        .unwrap()
+                    }
+                    3 => panic!("an item that panics"),
+                    _ => {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        k
+                    }
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcomes[0], Outcome::Done(10));
+        assert_eq!(outcomes[1], Outcome::Running);
+        assert_eq!(outcomes[2], Outcome::Panicked);
+        assert_eq!(outcomes[3], Outcome::Running, "started once item 1 freed its place");
+        assert_eq!(cache.peek(&2), None, "not yet");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(cache.peek(&2), Some(20), "finished after the batch answered");
+        // One place, held by a slow item: the next never starts.
+        let outcomes = run_batch(vec![5u32, 6], 1, Duration::from_millis(100), |k| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            k
+        })
+        .await;
+        assert_eq!(outcomes, vec![Outcome::Running, Outcome::NotStarted]);
     }
 
     #[test]

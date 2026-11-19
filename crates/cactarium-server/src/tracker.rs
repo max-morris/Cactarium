@@ -2247,6 +2247,10 @@ async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>, pace: Pa
         }
         other => other,
     };
+    // The mirror kept current at the default branch's tip, for batch reads (in the background).
+    if entry.kind == "package" {
+        git::warm_soon(policy(state), &repo.url);
+    }
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
         .bind(entry.id)
@@ -3706,41 +3710,36 @@ impl From<AppError> for TipFailure {
 /// [`package_tip`] for a batch read (`POST /packages/read`): the same reading of the same files,
 /// taken from the repo's kept history mirror ([`git::checkout_from_mirror`]) rather than fetched
 /// afresh. What the mirror can't serve is checked out as [`package_tip`] does it, so the answer
-/// (a reading, or the failure) is the single read's. Network use, of either kind, takes leave from
-/// `gate` first; without it the package isn't read.
+/// (a reading, or the failure) is the single read's. Network use, of either kind, takes one of the
+/// batch reads' network slots first (never waiting); without one the package isn't read.
 pub async fn package_tip_from_mirror(
     state: &AppState,
     entry: &Entry,
     commit: &str,
     reading: crate::deps::Reading,
-    gate: &git::NetGate,
 ) -> Result<PackageTip, TipFailure> {
     let repo = tip_repo(state, entry).await?;
-    let mut net = None;
-    let found = Box::pin(git::checkout_from_mirror(policy(state), &repo.url, commit, gate, &mut net))
+    let mut leave = git::Leave::new(git::Mode::Read);
+    let found = Box::pin(git::checkout_from_mirror(policy(state), &repo.url, commit, git::Mode::Read, &mut leave))
         .await
         .map_err(|e| AppError::Internal(e.context(format!("reading {} at {commit} from its mirror", entry.slug()))))?;
     let co = match found {
         git::FromMirror::Read(co) => co,
         git::FromMirror::NotRead(why) => return Err(TipFailure::NotRead(why.to_owned())),
-        git::FromMirror::Failed(e) => {
-            // Telling a missing commit from an unreachable host may ask the host.
-            let _net = match net {
-                Some(n) => n,
-                None => gate.take().map_err(|why| TipFailure::NotRead(why.to_owned()))?,
-            };
-            return Err(checkout_failure(state, &repo.url, commit, e).await.into());
-        }
+        // Too large, or not sent in time: answered without asking the host anything more.
+        git::FromMirror::Failed(e) => return Err(checkout_failure(state, &repo.url, commit, e).await.into()),
         git::FromMirror::Elsewhere(why) => {
+            leave.take().map_err(|why| TipFailure::NotRead(why.to_owned()))?;
             tracing::info!("{} at {commit}: not from the mirror ({why}); checking it out", entry.slug());
             match git::checkout(policy(state), &repo.url, commit, None).await {
                 Ok(co) => co,
                 Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await.into()),
             }
         }
+        git::FromMirror::Complete => return Err(AppError::Internal(anyhow::anyhow!("a read came back as a warming")).into()),
     };
     // Reading the files needs no network: the slot is free for another item.
-    drop(net);
+    drop(leave);
     Ok(read_tip(state, entry, &repo, &co, commit, reading).await?)
 }
 
@@ -4477,6 +4476,20 @@ pub async fn add_virtual_version(
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Warms the kept mirror of every package's repo, one after another in the background
+/// ([`git::warm_soon`]): at startup, so batch reads at the default branches' tips need no network.
+pub async fn warm_all(state: &AppState) -> AppResult<()> {
+    let urls: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT r.url FROM entry_repos r JOIN entries e ON e.id = r.entry_id WHERE e.kind = 'package' AND e.visibility <> 'hidden' ORDER BY 1",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for url in urls {
+        git::warm_soon(policy(state), &url);
+    }
     Ok(())
 }
 

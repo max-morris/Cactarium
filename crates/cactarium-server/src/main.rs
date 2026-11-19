@@ -735,7 +735,7 @@ fn make_state(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<AppState> {
             .build()?,
         limiter: Arc::new(security::RateLimiter::default()),
         definitions: Arc::new(flights::Flights::new(None, 512)),
-        package_tips: Arc::new(flights::Flights::new(None, 512)),
+        package_tips: Arc::new(flights::Flights::new(None, 4096)),
         // Branch tips move; a stack's resolved tips are reused only briefly.
         stack_tips: Arc::new(flights::Flights::new(Some(Duration::from_secs(30)), 256)),
         cfg: Arc::new(cfg),
@@ -763,6 +763,12 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
     let state = make_state(cfg, db)?;
     if let Err(e) = tracker::backfill_built_thorns(&state).await {
         tracing::warn!("backfilling the thorn index failed: {e}");
+    }
+    // Batch reads' network slots, and the warming of the mirrors at the packages' tips.
+    git::set_read_network_slots(state.cfg.read_network_slots);
+    git::enable_warming();
+    if let Err(e) = tracker::warm_all(&state).await {
+        tracing::warn!("warming the mirrors failed: {e}");
     }
     // The poller is restarted if it ever panics, rather than polling silently stopping.
     let poller = state.clone();

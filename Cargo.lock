@@ -311,6 +311,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "libc",
  "pulldown-cmark",
  "rand 0.9.5",
  "regex",
