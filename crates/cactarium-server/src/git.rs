@@ -1691,6 +1691,9 @@ async fn missing_objects(g: &impl Fn(&[&str]) -> Command, oids: &[String]) -> an
     Ok(out.lines().filter_map(|l| l.strip_suffix(" missing")).map(str::to_owned).collect())
 }
 
+/// How long keeping fetched files waits for the mirror's lock before giving up.
+const KEEP_LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// Keeps `oids` (files a scratch repo fetched, and wrote out) in the mirror in `dir`: packed anew
 /// from exactly those objects (never the pack the host sent, which could hold anything), then
 /// added under the mirror's lock, so never into one being cloned or replaced. Each file is written
@@ -1715,21 +1718,12 @@ async fn keep_blobs(g: &impl Fn(&[&str]) -> Command, out: &Path, dir: &Path, oid
             return;
         }
     };
-    // Never waiting on an update for long: a few tries over a second, then given up.
-    let lock = mirror_lock(dir);
-    let mut tries = 0;
-    let guard = loop {
-        match lock.clone().try_lock_owned() {
-            Ok(g) => break g,
-            Err(_) if tries < 10 => {
-                tries += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(_) => {
-                tracing::info!("not keeping {} files in the mirror {}: it is being updated", oids.len(), dir.display());
-                return;
-            }
-        }
+    // Only cold reads keep files, and they hold no network slot by now: waiting a while for an
+    // update (warming's, a sync's) to finish is cheaper than fetching the files again later. An
+    // item still waiting at the batch's deadline goes on detached.
+    let Ok(guard) = tokio::time::timeout(KEEP_LOCK_WAIT, mirror_lock(dir).lock_owned()).await else {
+        tracing::info!("not keeping {} files in the mirror {}: it is being updated", oids.len(), dir.display());
+        return;
     };
     if !mirror_complete(dir).await {
         return;

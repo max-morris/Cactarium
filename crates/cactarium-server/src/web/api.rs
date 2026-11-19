@@ -624,7 +624,7 @@ pub async fn read_packages(
         .zip(&req.items)
         .map(|(o, q)| match o {
             Outcome::Done(item) => item,
-            Outcome::Running => not_read(q, "Still being read; ask again shortly".into()),
+            Outcome::Running => ReadItem { in_progress: true, ..not_read(q, "Still being read; ask again shortly".into()) },
             Outcome::NotStarted => not_read(q, "Not read this time: the request ran out of time; ask again".into()),
             Outcome::Panicked => not_read(q, "Something went wrong on our side; ask again, or read it alone".into()),
         })
@@ -695,6 +695,7 @@ fn not_read(q: &ReadQuery, why: String) -> ReadItem {
         error: Some(why),
         untrusted: false,
         unreviewed: false,
+        in_progress: false,
     }
 }
 
@@ -715,6 +716,7 @@ async fn read_item(state: &AppState, reviewer: &Reviewer, q: &ReadQuery) -> Read
             error: None,
             untrusted,
             unreviewed,
+            in_progress: false,
         },
         Err(tracker::TipFailure::NotRead(why)) => not_read(q, format!("Not read this time: {why}; ask again, or read it alone")),
         Err(tracker::TipFailure::Failed(e)) => {

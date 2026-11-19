@@ -2679,6 +2679,8 @@ one = single("max/carpetx-mp", unrel)
 check("a stack is no package: not-found, as for the single read", by[("max/carpetx-mp", unrel)]["status"] == "not-found"
       and answers_alike(one, by[("max/carpetx-mp", unrel)]), by.get(("max/carpetx-mp", unrel)))
 
+in_progress_wrong = []  # not-read items whose in-progress disagrees with their message
+
 def batch_until_read(pairs, tries=40, headers=None):
     """A batch read asked again (as a client does) while items are still being read: the final
     answer for each pair, in order."""
@@ -2692,6 +2694,8 @@ def batch_until_read(pairs, tries=40, headers=None):
         later = []
         for p, item in zip(pending, r["items"]):
             busy = item["status"] == "not-read" and any(w in item.get("error", "") for w in ("Still being read", "ran out of time", "too many packages"))
+            if item["status"] == "not-read" and item["in-progress"] != ("Still being read" in item.get("error", "")):
+                in_progress_wrong.append(item)
             if busy:
                 later.append(p)
             else:
@@ -2729,7 +2733,7 @@ for row in trusted:
 relaunch(CACTARIUM_READ_NETWORK_SLOTS=0)
 s, r, _ = batch(fresh)
 check("with no network slot free, what needs the network is not read this time, saying so",
-      len(fresh) == 10 and s == 200 and all(i["status"] == "not-read" and "no slot was free" in i["error"] and "ask again" in i["error"] for i in r["items"]),
+      len(fresh) == 10 and s == 200 and all(i["status"] == "not-read" and "no slot was free" in i["error"] and "ask again" in i["error"] and i["in-progress"] is False for i in r["items"]),
       f"{len(fresh)} {str(r)[:400]}")
 relaunch()
 s, r = batch_until_read(fresh)
@@ -2798,6 +2802,7 @@ check("cold, the batch reads fetched the files their mirrors lacked", fetched > 
 compare("a warm mirror, with no item allowed the network", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=0))
 compare("the shared cache", None)
 relaunch()
+check("in-progress is true exactly on not-read items still being read", not in_progress_wrong, in_progress_wrong[:3])
 
 print()
 if FAILED:

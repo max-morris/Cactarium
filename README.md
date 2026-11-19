@@ -93,7 +93,8 @@ say `x-cactarium-unreviewed: true`.
   fetched in one request per package and kept (packed anew from exactly those files); a commit no
   branch or tag of the mirror reaches, or one the mirror can't serve, is checked out as the single
   read does. The answer comes within 20 seconds: items not done by then are `not-read` ("still
-  being read; ask again shortly") and go on in the background, filling the mirror and the cache.
+  being read; ask again shortly", with `in-progress: true`) and go on in the background, filling
+  the mirror and the cache; a `not-read` item that never started has `in-progress: false`.
   Limits: 8 items of a request under way at once, in request order; 16 items using the network at
   once across all requests and 32 readings under way in all (past either, an item is `not-read`
   at once); 8 trees written out from mirrors at once (waited for).
