@@ -264,6 +264,19 @@ const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 /// How much of stderr is kept: the end, where git puts the reason it failed.
 const STDERR_TAIL: usize = 64 * 1024;
 
+/// Why git failed, from its stderr: its last few lines, since the very last is often only a
+/// summary ("fatal: unpack-objects failed") of the line before it that says why.
+fn git_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = &lines[lines.len().saturating_sub(3)..];
+    let reason = tail.join("; ");
+    // A line can be anything a hostile server sent back: kept to a readable length.
+    match reason.char_indices().nth(1000) {
+        Some((i, _)) => format!("{}…", &reason[..i]),
+        None => reason,
+    }
+}
+
 /// Runs a git command within `limit`, with its output capped. With `watch`, the directory is
 /// checked every couple of seconds and the command stopped once it holds more than the given
 /// bytes: git has no size limit on what a fetch downloads. However the command ends early (a time
@@ -344,8 +357,7 @@ async fn exec_raw(
         let status = child.wait().await.with_context(|| format!("{what}: cannot run git"))?;
         if !status.success() {
             let err = String::from_utf8_lossy(&err);
-            let line = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("").trim();
-            bail!("{what} failed: {line}");
+            bail!("{what} failed: {}", git_reason(&err));
         }
         // A write error (a closed pipe) matters only if git otherwise succeeded.
         written.with_context(|| format!("{what}: cannot write to git"))?;
@@ -920,7 +932,7 @@ async fn read_blob(policy: GitPolicy, home: &Path, key: &str, dir: &Path, oid: &
             return FileAt::NeedsCheckout;
         }
         let mut c = git_to(policy, home, &t);
-        c.arg("-C").arg(&repo).args(["fetch", "--quiet", "--no-write-fetch-head", "--", &t.url, oid]);
+        c.arg("-C").arg(&repo).args(["fetch", "--quiet", "--no-write-fetch-head", "--filter=blob:none", "--", &t.url, oid]);
         let fetched = exec(c, None, "fetching a file", TIMEOUT, Some((repo.as_path(), MAX_FILE_AT + 1024 * 1024))).await;
         if let Err(e) = fetched {
             if e.to_string().contains("was stopped") || dir_size(&repo) > MAX_FILE_AT {
@@ -1135,12 +1147,16 @@ const SLOT_BUSY: &str = "no slot is free to update the repo's history just now";
 
 /// Fetches every branch and tag, by URL with explicit refspecs: a bare clone has no fetch refspec,
 /// and the stored remote isn't consulted, so the mirror's config can't redirect the fetch.
+/// Blobless, as the clone was: a fetch of files would come as deltas against older versions of
+/// them, which a blobless mirror lacks and (with lazy fetches off) can't resolve, so every update
+/// after a push that changed a file would fail. Files are fetched by [`read_blob`] and warming.
+/// The filter changes nothing for a mirror of a host that doesn't support filters (a full one).
 async fn fetch_mirror(policy: GitPolicy, home: &Path, t: &Target, dir: &Path) -> anyhow::Result<()> {
     clear_stale_locks(dir).await;
     let mut c = git_to(policy, home, t);
     c.arg("-C")
         .arg(dir)
-        .args(["fetch", "--quiet", "--prune", "--no-write-fetch-head", "--", &t.url]);
+        .args(["fetch", "--quiet", "--prune", "--no-write-fetch-head", "--filter=blob:none", "--", &t.url]);
     c.args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
     run(c, "updating the repo's history").await.map(drop)
 }
@@ -1937,6 +1953,46 @@ mod tests {
         for m in misses {
             assert!(matches!(m.await.unwrap().unwrap(), PrefixMatch::None));
         }
+    }
+
+    /// A mirror is blobless, so an update after a push that changed a file must not take the
+    /// file's new version as a delta against an old one it never fetched: that delta can't be
+    /// resolved without a lazy fetch, which is off, and the update failed ("unresolved deltas").
+    #[tokio::test]
+    async fn updates_after_a_changed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (up, url) = upstream(tmp.path());
+        let text: String = (0..20_000).map(|i| format!("line {i} of a file long enough to be sent as a delta\n")).collect();
+        std::fs::write(up.join("big.txt"), &text).unwrap();
+        sh(&up, &["add", "big.txt"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let policy = GitPolicy { allow_local: true };
+        let first = sh(&up, &["rev-parse", "HEAD"]);
+        assert!(matches!(resolve_commit_prefix(policy, &url, &first[..8]).await.unwrap(), PrefixMatch::One(_)));
+        std::fs::write(up.join("big.txt"), text.replacen("line 100 ", "changed ", 1)).unwrap();
+        sh(&up, &["commit", "-q", "-am", "second"]);
+        sh(&up, &["tag", "v1"]);
+        let second = sh(&up, &["rev-parse", "HEAD"]);
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        match resolve_commit_prefix(policy, &url, &second[..8]).await {
+            Ok(PrefixMatch::One(c)) => assert_eq!(c, second),
+            Ok(PrefixMatch::None) => panic!("not found"),
+            Ok(PrefixMatch::Many(m)) => panic!("many: {m:?}"),
+            Err(e) => panic!("{e:#}"),
+        }
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        assert_eq!(sh(&dir, &["rev-parse", "v1"]), second);
+    }
+
+    #[test]
+    fn git_reasons_keep_the_line_that_says_why() {
+        let err = "remote: Enumerating objects: 5\nfatal: unresolved deltas left after unpacking\nfatal: unpack-objects failed\n\n";
+        assert_eq!(
+            git_reason(err),
+            "remote: Enumerating objects: 5; fatal: unresolved deltas left after unpacking; fatal: unpack-objects failed"
+        );
+        assert_eq!(git_reason(""), "");
+        assert_eq!(git_reason(&"é".repeat(5000)).chars().count(), 1001);
     }
 
     /// A download is fetched once and hashed as it streams: redirects are followed (each checked
