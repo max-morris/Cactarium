@@ -16,6 +16,7 @@ mod git;
 mod markdown;
 mod model;
 mod publish;
+mod remotes;
 mod security;
 mod sims;
 mod site;
@@ -70,6 +71,10 @@ enum Command {
         #[arg(long = "only")]
         only: Vec<String>,
     },
+    /// List every stored URL the Cactarium would refuse now (credentials, ssh, local paths, other
+    /// schemes): repos, pins and thornlists of stack releases and sims, sims' inputs, downloads.
+    /// Read-only. Exits 1 when it lists any.
+    CheckUrls,
     /// A dry run: the preview registering URL (at TAG, if given) shows, and with a tag, how each
     /// entry already on the repo would read it. Writes nothing. With --commit, a tag that doesn't
     /// exist yet is read as if it named that commit (a branch or a full commit id).
@@ -319,6 +324,19 @@ async fn main() -> anyhow::Result<()> {
             }
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{said}");
+            Ok(())
+        }
+        Command::CheckUrls => {
+            let found = remotes::stored_problems(&db, cfg.allow_local_repos).await?;
+            for line in &found {
+                println!("{line}");
+            }
+            if found.is_empty() {
+                println!("every stored URL is publishable");
+            } else {
+                println!("{} stored URLs the Cactarium would refuse now", found.len());
+                std::process::exit(1);
+            }
             Ok(())
         }
         Command::RescanFacts { username, slug, all } => {
