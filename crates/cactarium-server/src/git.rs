@@ -310,7 +310,13 @@ async fn exec_raw(
             let mut buf = Vec::new();
             (&mut stdout).take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf).await?;
             if buf.len() > MAX_OUTPUT {
-                bail!("{what}: git printed more than {} MB", MAX_OUTPUT / (1024 * 1024));
+                // Only a huge repo makes git print this much (a tree of hundreds of thousands of
+                // files): a fact about the commit, as the size checks are.
+                return Err(TooLarge(format!(
+                    "the repo is too large to index ({what}: git printed more than {} MB)",
+                    MAX_OUTPUT / (1024 * 1024)
+                ))
+                .into());
             }
             anyhow::Ok(buf)
         };
@@ -622,6 +628,8 @@ struct MirrorState {
     finished: Option<std::time::Instant>,
     /// Why it failed, if it did: repeated to every request in the window.
     error: Option<String>,
+    /// Git couldn't read it ([`flag_broken`]): the next update moves it aside and clones it again.
+    broken: bool,
 }
 
 /// One entry per mirror this process has updated; bounded by the registered repos.
@@ -737,8 +745,8 @@ async fn lacks_commits(policy: GitPolicy, dir: &Path, commits: &[String]) -> boo
 /// What a kept mirror says of some commits ([`mirror_has_commits`]).
 pub struct MirrorAnswer {
     /// For each commit asked: `Some(true)` when the mirror has it, `Some(false)` when it doesn't
-    /// after an update (or one within [`MIRROR_REFRESH`]), `None` when it can't tell just now (the
-    /// update failed, or none was allowed).
+    /// after an update this call waited for, `None` when it can't tell just now (the update failed,
+    /// none was allowed, or the last one was too recent for another).
     pub has: Vec<Option<bool>>,
     /// Whether an update was asked for (whether or not one ran: the window may have answered).
     pub updated: bool,
@@ -762,9 +770,16 @@ pub async fn mirror_has_commits(policy: GitPolicy, url: &str, commits: &[String]
         return Some(MirrorAnswer { has: first.into_iter().map(|b| b.then_some(true)).collect(), updated: false });
     }
     // Never queued: a lookup that finds the slot busy says "can't tell" for what the mirror lacks.
+    // So does one the refresh window answered without fetching: a commit pushed since the last
+    // update would be missing, though the repo has it.
+    let before = mirror_lock(&dir).lock().await.finished;
     let error = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &LOOKUP_UPDATES, Wait::Never).await;
+    let fetched = mirror_lock(&dir).lock().await.finished != before;
     let after = is_commit(object_types(policy, &dir, commits).await);
-    let has = after.into_iter().map(|b| if b { Some(true) } else if error.is_none() { Some(false) } else { None }).collect();
+    let has = after
+        .into_iter()
+        .map(|b| if b { Some(true) } else if error.is_none() && fetched { Some(false) } else { None })
+        .collect();
     Some(MirrorAnswer { has, updated: true })
 }
 
@@ -1011,7 +1026,9 @@ async fn update_mirror_in(
     let held = mirrors.clone();
     let task = tokio::spawn(async move {
         // Up to date (or updated by another request within the window): answered without a slot.
-        let fresh = |state: &MirrorState, lacking: bool| !lacking && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH);
+        let fresh = |state: &MirrorState, lacking: bool| {
+            !lacking && !state.broken && state.finished.is_some_and(|at| at.elapsed() < MIRROR_REFRESH)
+        };
         let lacking = || async {
             match &needed {
                 Some(commits) => lacks_commits(policy, &dir, commits).await,
@@ -1041,7 +1058,7 @@ async fn update_mirror_in(
         // A slot first, and only then the repo's lock: nobody holds a repo's lock while waiting
         // for a slot, so syncs and lookups of a repo never wait behind a queue of other repos.
         let _permit = match wait {
-            Wait::Queue => tokio::select! {
+            Wait::Queue | Wait::Quietly => tokio::select! {
                 p = slots.acquire() => match p {
                     Ok(p) => p,
                     Err(e) => return Some(format!("updating the mirror failed: {e}")),
@@ -1061,28 +1078,40 @@ async fn update_mirror_in(
             Mirrors::Shared => None,
             Mirrors::Temp(_) => Some(MAX_PREVIEW_MIRROR_BYTES),
         };
+        let discard = broken || state.broken;
         let work = async {
             let t = check(policy, &url).await?;
             let home = tempfile::tempdir()?;
-            if broken {
+            if discard {
                 discard_mirror(&root, &dir).await?;
             }
             if mirror_complete(&dir).await {
-                fetch_mirror(policy, home.path(), &t, &dir).await
+                fetch_mirror(policy, home.path(), &t, &dir).await.map(|()| false)
             } else {
-                clone_mirror(policy, home.path(), &t, &root, &dir, limit).await
+                clone_mirror(policy, home.path(), &t, &root, &dir, limit).await.map(|()| true)
             }
         };
         let result = tokio::select! {
             r = work => r,
             () = abandoned() => Err(anyhow!("the preview this mirror was for went away")),
         };
-        state.finished = Some(std::time::Instant::now());
-        state.error = result.err().map(|e| {
+        // A kept mirror just cloned has no file contents: warmed at its default branch's tip.
+        if matches!(result, Ok(true)) && matches!(held, Mirrors::Shared) {
+            warm_soon(policy, &url);
+        }
+        if result.is_ok() {
+            state.broken = false;
+        }
+        let error = result.err().map(|e| {
             tracing::warn!("updating the mirror of {url} failed: {e:#}");
             format!("{e:#}")
         });
-        let error = state.error.clone();
+        // Warming's updates leave the window as it was: a commit pushed just after one is still
+        // fetched by the next request that misses it.
+        if wait != Wait::Quietly {
+            state.finished = Some(std::time::Instant::now());
+            state.error = error.clone();
+        }
         drop(state);
         drop(held);
         error
@@ -1096,6 +1125,9 @@ async fn update_mirror_in(
 enum Wait {
     Queue,
     Never,
+    /// As [`Wait::Queue`], for warming in the background: the update doesn't start a new
+    /// [`MIRROR_REFRESH`] window, so it never keeps a request from fetching what it misses.
+    Quietly,
 }
 
 /// What an update that gave up for want of a slot answers.
@@ -1377,6 +1409,466 @@ pub fn read_in(co: &Checkout, rel: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(std::fs::read_to_string(&real).with_context(|| format!("'{rel}' is not UTF-8 text"))?))
 }
 
+/// How many batch read items (`POST /packages/read`) may use the network at once, across all
+/// requests: each takes a slot when it first needs one (a mirror update, the commit's files, a
+/// checkout), never waiting; with none free it isn't read this time. [`set_read_network_slots`]
+/// changes it at startup (a development knob).
+pub const READ_NETWORK_SLOTS: usize = 16;
+static READ_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+/// Sets how many [`READ_NETWORK_SLOTS`] there are; only before the first read takes one.
+pub fn set_read_network_slots(n: usize) {
+    let _ = READ_SLOTS.set(tokio::sync::Semaphore::new(n));
+}
+
+fn read_slots() -> &'static tokio::sync::Semaphore {
+    READ_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(READ_NETWORK_SLOTS))
+}
+
+/// The mirror updates batch reads ask for wait on slots of their own, never syncing's, lookups' or
+/// warming's. As many as the reads' network slots, so an item holding one of those finds one.
+static READ_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(READ_NETWORK_SLOTS);
+
+/// Commits written out from mirrors at once (each a whole tree on disk), whoever asks: waited for.
+pub const MATERIALIZATIONS: usize = 8;
+static MATERIALIZING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MATERIALIZATIONS);
+
+/// Files fetched into a mirror are kept there only while its objects take less than this...
+const MAX_KEPT_MIRROR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// ... and the file system the mirrors are on has at least this much free.
+const MIN_FREE_FOR_KEEPING: u64 = 10 * 1024 * 1024 * 1024;
+/// A file being written into a mirror's packs is named so; one older than this is a leftover.
+const KEEP_PREFIX: &str = "tmp_keep_";
+const STALE_KEEP: Duration = Duration::from_secs(3600);
+
+/// Who reads a commit from a mirror: a batch read, or the warming of mirrors at their default
+/// branches' tips ([`warm_soon`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mode {
+    Read,
+    Warm,
+}
+
+/// An item's leave to use the network. A read takes one of the [`READ_NETWORK_SLOTS`] when it first
+/// needs it, never waiting; warming runs one at a time on its own slot and always may.
+pub struct Leave {
+    mode: Mode,
+    taken: bool,
+    slot: Option<tokio::sync::SemaphorePermit<'static>>,
+    /// How many times leave was taken (tests ask whether an item used the network).
+    uses: u32,
+    /// Tests: never any leave.
+    #[cfg(test)]
+    deny: bool,
+}
+
+impl Leave {
+    pub fn new(mode: Mode) -> Leave {
+        Leave {
+            mode,
+            taken: false,
+            slot: None,
+            uses: 0,
+            #[cfg(test)]
+            deny: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn denied() -> Leave {
+        Leave { deny: true, ..Leave::new(Mode::Read) }
+    }
+
+    /// Leave to use the network now (kept until [`Leave::release`]), or why not.
+    pub fn take(&mut self) -> Result<(), &'static str> {
+        if self.taken {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.deny {
+            return Err("denied");
+        }
+        if self.mode == Mode::Read {
+            self.slot = Some(read_slots().try_acquire().map_err(|_| "no slot was free to fetch from repo hosts just then")?);
+        }
+        self.taken = true;
+        self.uses += 1;
+        Ok(())
+    }
+
+    /// Done with the network: the slot is free for another item.
+    pub fn release(&mut self) {
+        self.slot = None;
+        self.taken = false;
+    }
+}
+
+/// What reading a commit from the repo's history mirror came to ([`checkout_from_mirror`]).
+pub enum FromMirror {
+    /// The commit's whole tree, written out by `git checkout` as [`checkout`] writes it.
+    Read(Checkout),
+    /// Warming only: the mirror already had every file of the commit; nothing was written out.
+    Complete,
+    /// The mirror can't serve it (it lacks the commit even after an update, or no branch or tag
+    /// reaches it anymore, or the update failed, or the host wouldn't send the files by id, or the
+    /// mirror couldn't be read): read it with [`checkout`], which decides, as the single read does.
+    Elsewhere(String),
+    /// Not read: it needed the network and got no [`Leave`].
+    NotRead(&'static str),
+    /// What a [`checkout`] failing so would have failed with: the commit's files are too large
+    /// ([`TooLarge`]), or the host didn't send them in time. Neither needs the network to answer.
+    Failed(anyhow::Error),
+}
+
+/// Reads `commit` of the repo at `url` from the repo's kept history mirror rather than fetching it
+/// afresh: the commit's whole tree, written out by `git checkout` (so files, modes, symbolic links
+/// and submodule folders are exactly what [`checkout`] makes) in a scratch repo that borrows the
+/// mirror's objects. The mirror is blobless: the files it lacks are fetched by id, all in one
+/// request, and once the tree is written out, exactly those files are packed anew and kept in the
+/// mirror ([`keep_blobs`]), so a later commit of the same repo fetches only what changed. Bounded
+/// as [`checkout`] is: the download is watched and stopped past [`MAX_TREE_BYTES`], and a tree
+/// larger than that is refused before it is written out; and at most [`MATERIALIZATIONS`] trees
+/// are written out at once.
+///
+/// The commit is read from the mirror only when one of the mirror's branches or tags reaches it: a
+/// commit force-pushed away is left to a checkout, so the answer is the repo's now, never the
+/// mirror's memory of it. The network is used only with `leave`: to update the mirror (on the
+/// batch reads' own slots without waiting, or warming's) and to fetch files. Nothing else fetches:
+/// every git call runs with `GIT_NO_LAZY_FETCH`, and the scratch repo isn't a partial clone.
+///
+/// Mirrors are never pruned or repacked (every git call disables gc and maintenance), so the
+/// objects read here stay put while an update fetches beside them. A mirror git can't read is
+/// flagged broken (the next update clones it again) and the commit left to a checkout.
+pub async fn checkout_from_mirror(
+    policy: GitPolicy,
+    url: &str,
+    commit: &str,
+    mode: Mode,
+    leave: &mut Leave,
+) -> anyhow::Result<FromMirror> {
+    let (root, key, dir) = mirror_of(url).await?;
+    let usable = || async {
+        object_types(policy, &dir, &[commit.to_owned()]).await[0].as_deref() == Some("commit")
+            && reachable(policy, &dir, commit).await
+    };
+    if !usable().await {
+        if let Err(why) = leave.take() {
+            return Ok(FromMirror::NotRead(why));
+        }
+        // Updated at most once per window (and cloned, for a repo with no mirror yet). A commit
+        // the update doesn't bring (not on a branch or tag) is for a checkout to find.
+        let (slots, wait) = match mode {
+            Mode::Read => (&READ_UPDATES, Wait::Never),
+            Mode::Warm => (&WARM_UPDATES, Wait::Quietly),
+        };
+        let error = update_mirror_in(policy, &Mirrors::Shared, key.clone(), root, dir.clone(), false, None, slots, wait).await;
+        match error {
+            Some(e) if e == SLOT_BUSY => return Ok(FromMirror::NotRead("no slot was free to update the repo's history just then")),
+            Some(e) => return Ok(FromMirror::Elsewhere(format!("the mirror couldn't be updated: {e}"))),
+            None if !usable().await => return Ok(FromMirror::Elsewhere("no branch or tag of the mirror reaches the commit".into())),
+            None => {}
+        }
+    }
+    // From here, a git failure is the mirror's: flagged, and the commit left to a checkout.
+    let broken = |e: anyhow::Error| {
+        if e.downcast_ref::<TooLarge>().is_some() {
+            return FromMirror::Failed(e);
+        }
+        tracing::warn!("reading {commit} from the mirror of {key}: {e:#}; it will be cloned again");
+        flag_broken(&dir);
+        FromMirror::Elsewhere(format!("the mirror couldn't be read: {e:#}"))
+    };
+    macro_rules! local {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => return Ok(broken(e)),
+            }
+        };
+    }
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().join("home");
+    let path = tmp.path().join("src");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&path)?;
+    // Deleted off the async threads however this ends.
+    let mut co = Checkout { dir: Some(tmp), path: path.clone(), tree: String::new() };
+    let g = |args: &[&str]| {
+        let mut c = git(policy, &home);
+        c.current_dir(&path).args(args);
+        c
+    };
+    // The scratch repo has the mirror's object format (SHA-1 or SHA-256), and borrows its objects
+    // by an absolute path.
+    let mut c = git(policy, &home);
+    c.arg("-C").arg(&dir).args(["rev-parse", "--show-object-format"]);
+    let format = local!(run(c, "reading the mirror's object format").await).trim().to_owned();
+    local!(run(g(&["init", "-q", &format!("--object-format={format}")]), "git init").await);
+    let objects = path.join(".git/objects");
+    let borrowed = std::path::absolute(dir.join("objects"))?;
+    std::fs::write(objects.join("info/alternates"), format!("{}\n", borrowed.display()))?;
+    // Every blob of the tree (files and symbolic links; a submodule is a commit id, not fetched).
+    let listed = local!(exec_raw(g(&["ls-tree", "-r", "-z", "--", commit]), None, "listing the tree", TIMEOUT, None).await);
+    let mut blobs: Vec<String> = listed
+        .split(|&b| b == 0)
+        .filter_map(|entry| {
+            let meta = std::str::from_utf8(entry.split(|&b| b == b'\t').next()?).ok()?;
+            let mut p = meta.split(' ');
+            let (_mode, kind, oid) = (p.next()?, p.next()?, p.next()?);
+            (kind == "blob").then(|| oid.to_owned())
+        })
+        .collect();
+    blobs.sort_unstable();
+    blobs.dedup();
+    let missing = local!(missing_objects(&g, &blobs).await);
+    if missing.is_empty() && mode == Mode::Warm {
+        return Ok(FromMirror::Complete);
+    }
+    if !missing.is_empty() {
+        if let Err(why) = leave.take() {
+            return Ok(FromMirror::NotRead(why));
+        }
+        let t = match check(policy, &key).await {
+            Ok(t) => t,
+            Err(e) => return Ok(FromMirror::Elsewhere(format!("{e:#}"))),
+        };
+        let who = if mode == Mode::Warm { "warming" } else { "reading" };
+        tracing::info!("{who}: fetching {} of {} files of {commit} that the mirror of {key} lacks", missing.len(), blobs.len());
+        // One request for them all, as a partial clone's own fetch of missing objects asks: no
+        // negotiation (the wants are blobs), kept as one pack in the scratch repo.
+        let mut c = git_to(policy, &home, &t);
+        c.current_dir(&path)
+            .args(["-c", "fetch.negotiationAlgorithm=noop", "-c", "fetch.unpackLimit=1", "-c", "transfer.unpackLimit=1"])
+            .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--stdin", "--", &t.url]);
+        let wants: String = missing.iter().map(|o| format!("{o}\n")).collect();
+        let watched = co.dir.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_else(|| path.clone());
+        if let Err(e) = exec(c, Some(wants), "fetching the commit's files", TIMEOUT, Some((&watched, MAX_TREE_BYTES))).await {
+            let said = format!("{e:#}");
+            if e.is::<TooLarge>() || said.contains("timed out") {
+                return Ok(FromMirror::Failed(e));
+            }
+            return Ok(FromMirror::Elsewhere(said));
+        }
+        if !local!(missing_objects(&g, &missing).await).is_empty() {
+            return Ok(FromMirror::Elsewhere("the host didn't send every file asked for".into()));
+        }
+        // The network part is over: the slot is free for another item.
+        leave.release();
+    }
+    // From here on as checkout does it, with every object local.
+    let listing = local!(run(g(&["ls-tree", "-r", "-l", "--", commit]), "listing the tree").await);
+    let total: u64 = listing.lines().filter_map(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok()).sum();
+    if total > MAX_TREE_BYTES {
+        return Ok(FromMirror::Failed(
+            TooLarge(format!("the repo is too large to index ({} MB at this commit)", total / (1024 * 1024))).into(),
+        ));
+    }
+    let writing = MATERIALIZING.acquire().await?;
+    local!(run(g(&["-c", "advice.detachedHead=false", "checkout", "-q", commit]), "checking out the commit").await);
+    co.tree = local!(run(g(&["rev-parse", &format!("{commit}^{{tree}}")]), "reading the tree").await).trim().to_owned();
+    let p = path.clone();
+    let size = tokio::task::spawn_blocking(move || dir_size(&p)).await?;
+    drop(writing);
+    if size > MAX_TREE_BYTES {
+        return Ok(FromMirror::Failed(TooLarge(format!("the repo is too large to index ({} MB)", size / (1024 * 1024))).into()));
+    }
+    if !missing.is_empty() {
+        keep_blobs(&g, &path.join(".git/keep"), &dir, &missing).await;
+    }
+    Ok(FromMirror::Read(co))
+}
+
+/// Whether one of the mirror's branches or tags reaches `commit`.
+async fn reachable(policy: GitPolicy, dir: &Path, commit: &str) -> bool {
+    let Ok(home) = tempfile::tempdir() else { return false };
+    let mut c = git(policy, home.path());
+    c.arg("-C").arg(dir).args(["for-each-ref", "--count=1", "--format=%(refname)", "--contains", commit, "refs/heads", "refs/tags"]);
+    run(c, "finding the branches that have the commit").await.is_ok_and(|out| !out.trim().is_empty())
+}
+
+/// Marks a mirror git couldn't read: its next update moves it aside and clones it again.
+fn flag_broken(dir: &Path) {
+    let lock = mirror_lock(dir);
+    tokio::spawn(async move {
+        let mut state = lock.lock().await;
+        state.broken = true;
+        state.finished = None;
+    });
+}
+
+/// The objects among `oids` the repo `g` runs git in lacks (it never fetches them).
+async fn missing_objects(g: &impl Fn(&[&str]) -> Command, oids: &[String]) -> anyhow::Result<Vec<String>> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input: String = oids.iter().map(|o| format!("{o}\n")).collect();
+    let out = run_with_input(g(&["cat-file", "--batch-check=%(objectname) %(objecttype)", "--buffer"]), input, "looking up the files").await?;
+    // "<id> <type>", or "<id> missing".
+    Ok(out.lines().filter_map(|l| l.strip_suffix(" missing")).map(str::to_owned).collect())
+}
+
+/// How long keeping fetched files waits for the mirror's lock before giving up.
+const KEEP_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Keeps `oids` (files a scratch repo fetched, and wrote out) in the mirror in `dir`: packed anew
+/// from exactly those objects (never the pack the host sent, which could hold anything), then
+/// added under the mirror's lock, so never into one being cloned or replaced. Each file is written
+/// under a temporary name, synced and renamed into place, the index last (git uses a pack only once
+/// its index is there), then the folder synced. Best effort, and skipped (logged) when the lock is
+/// busy, the mirror's objects already take [`MAX_KEPT_MIRROR_BYTES`], or the file system has less
+/// than [`MIN_FREE_FOR_KEEPING`] free: a file not kept is only fetched again.
+async fn keep_blobs(g: &impl Fn(&[&str]) -> Command, out: &Path, dir: &Path, oids: &[String]) {
+    let base = out.join("pack");
+    let packed = async {
+        std::fs::create_dir_all(out)?;
+        let input: String = oids.iter().map(|o| format!("{o}\n")).collect();
+        let mut c = g(&["pack-objects", "--quiet"]);
+        c.arg(&base);
+        anyhow::Ok(run_with_input(c, input, "packing the fetched files").await?.trim().to_owned())
+    };
+    let hash = match packed.await {
+        Ok(h) if !h.is_empty() => h,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!("packing files to keep in a mirror: {e:#}");
+            return;
+        }
+    };
+    // Only cold reads keep files, and they hold no network slot by now: waiting a while for an
+    // update (warming's, a sync's) to finish is cheaper than fetching the files again later. An
+    // item still waiting at the batch's deadline goes on detached.
+    let Ok(guard) = tokio::time::timeout(KEEP_LOCK_WAIT, mirror_lock(dir).lock_owned()).await else {
+        tracing::info!("not keeping {} files in the mirror {}: it is being updated", oids.len(), dir.display());
+        return;
+    };
+    if !mirror_complete(dir).await {
+        return;
+    }
+    let (dir, out) = (dir.to_path_buf(), out.to_path_buf());
+    let count = oids.len();
+    // The copy runs to its end even if the request goes away, holding the lock till then.
+    let kept = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = guard;
+        let to = dir.join("objects/pack");
+        sweep_stale_keeps(&to);
+        let used = dir_size(&dir.join("objects"));
+        if used > MAX_KEPT_MIRROR_BYTES {
+            tracing::info!("not keeping {count} files in {}: its objects take {} MB already", dir.display(), used / (1024 * 1024));
+            return Ok(false);
+        }
+        let free = free_bytes(&dir).unwrap_or(0);
+        if free < MIN_FREE_FOR_KEEPING {
+            tracing::warn!("not keeping {count} files in {}: only {} MB free", dir.display(), free / (1024 * 1024));
+            return Ok(false);
+        }
+        let stem = format!("pack-{hash}");
+        if to.join(format!("{stem}.idx")).exists() {
+            return Ok(true);
+        }
+        for ext in ["pack", "rev", "idx"] {
+            let src = out.join(format!("{stem}.{ext}"));
+            if !src.exists() {
+                continue;
+            }
+            let mut tmp = tempfile::Builder::new().prefix(KEEP_PREFIX).tempfile_in(&to)?;
+            std::io::copy(&mut std::fs::File::open(&src)?, tmp.as_file_mut())?;
+            tmp.as_file().sync_all()?;
+            tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o444))?;
+            tmp.persist(to.join(format!("{stem}.{ext}")))?;
+        }
+        std::fs::File::open(&to)?.sync_all()?;
+        Ok(true)
+    })
+    .await;
+    match kept {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("keeping fetched files in a mirror: {e:#}"),
+        Err(e) => tracing::warn!("keeping fetched files in a mirror: {e}"),
+    }
+}
+
+/// Removes files a keeping left half-written (a process that died mid-copy). Blocking work.
+fn sweep_stale_keeps(pack_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(pack_dir) else { return };
+    for e in rd.flatten() {
+        let stale = e.file_name().to_string_lossy().starts_with(KEEP_PREFIX)
+            && e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|m| m.elapsed().ok()).is_some_and(|age| age > STALE_KEEP);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The bytes free to this process on the file system holding `p`.
+fn free_bytes(p: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `s` a writable statvfs.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some(s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+/// Warming runs one repo at a time, and updates mirrors on a slot of its own: it never takes one
+/// of the slots syncing, lookups or reads use.
+static WARM_RUNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static WARM_UPDATES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// Repos with a warming queued or running.
+static WARMING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+/// Off until the server turns it on ([`enable_warming`]): a command-line run or a test has no
+/// business leaving background fetches behind.
+static WARMING_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lets [`warm_soon`] warm mirrors (the server, at startup).
+pub fn enable_warming() {
+    WARMING_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Warms the repo's kept mirror in the background, soon: updated (or cloned), then every file of
+/// its default branch's tip fetched and kept ([`warm`]), so batch reads at that commit, or at one
+/// near it, need no network. Asked again while one is queued or running, it adds nothing. Only
+/// once the server enabled it.
+pub fn warm_soon(policy: GitPolicy, url: &str) {
+    if !WARMING_ON.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let url = url.trim().trim_end_matches('/').to_owned();
+    if !WARMING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(url.clone()) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _one = WARM_RUNS.acquire().await;
+        if let Err(e) = warm(policy, &url).await {
+            tracing::info!("warming the mirror of {url}: {e:#}");
+        }
+        WARMING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&url);
+    });
+}
+
+/// [`warm_soon`]'s work, now: the mirror updated (within its window) or cloned, and the files of
+/// the commit its HEAD names (the default branch, as of the clone) fetched and kept.
+pub async fn warm(policy: GitPolicy, url: &str) -> anyhow::Result<()> {
+    let (root, key, dir) = mirror_of(url).await?;
+    if let Some(e) = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &WARM_UPDATES, Wait::Quietly).await {
+        bail!("{e}");
+    }
+    let home = tempfile::tempdir()?;
+    let mut c = git(policy, home.path());
+    c.arg("-C").arg(&dir).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+    let head = run(c, "reading the default branch").await?.trim().to_owned();
+    match Box::pin(checkout_from_mirror(policy, url, &head, Mode::Warm, &mut Leave::new(Mode::Warm))).await? {
+        FromMirror::Read(_) | FromMirror::Complete => Ok(()),
+        FromMirror::Elsewhere(why) => bail!("{why}"),
+        FromMirror::NotRead(why) => bail!("{why}"),
+        FromMirror::Failed(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1568,8 +2060,15 @@ mod tests {
         .unwrap();
         assert!(asked.get(), "asked, since the mirror lacked them");
         assert_eq!((a.has, a.updated), (vec![Some(true), Some(false)], true));
+        // Within the window the last update opened, a miss can't tell: a commit pushed since would
+        // be missing too. After it, an update runs and a miss is a no.
         let tree = sh(&up, &["rev-parse", "HEAD^{tree}"]);
-        assert_eq!(mirror_has_commits(policy, &url, &[tree], || true).await.unwrap().has, vec![Some(false)]);
+        assert_eq!(mirror_has_commits(policy, &url, std::slice::from_ref(&tree), || true).await.unwrap().has, vec![None]);
+        let pushed = commit_on(&up, "pushed", "pushed");
+        assert_eq!(mirror_has_commits(policy, &url, std::slice::from_ref(&pushed), || true).await.unwrap().has, vec![None], "pushed in the window");
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        let a = mirror_has_commits(policy, &url, &[tree, pushed], || true).await.unwrap();
+        assert_eq!(a.has, vec![Some(false), Some(true)], "a tree is no commit; the pushed one is fetched");
         // A mirror that has every commit asked never asks for an update.
         let a = mirror_has_commits(policy, &url, &[first], || panic!("no update needed")).await.unwrap();
         assert_eq!((a.has, a.updated), (vec![Some(true)], false));
@@ -1618,6 +2117,234 @@ mod tests {
         std::fs::remove_dir_all(&up).unwrap();
         let again = read_files_in(policy, &Mirrors::Shared, &url, &wants[..1]).await.unwrap();
         assert!(matches!(&again[0], FileAt::Content(b) if b.as_slice() == b"format = 1\n"), "{:?}", again[0]);
+    }
+
+    /// Everything a checkout wrote, but its `.git`: each path with what it is (a folder, a file
+    /// with its permissions and content, a symbolic link and where it points).
+    fn tree_of(root: &Path) -> Vec<(String, String)> {
+        use std::os::unix::fs::PermissionsExt;
+        fn walk(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
+            for e in std::fs::read_dir(at).unwrap().flatten() {
+                let p = e.path();
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                if rel == ".git" {
+                    continue;
+                }
+                let meta = std::fs::symlink_metadata(&p).unwrap();
+                let what = if meta.file_type().is_symlink() {
+                    format!("link -> {}", std::fs::read_link(&p).unwrap().display())
+                } else if meta.is_dir() {
+                    walk(root, &p, out);
+                    format!("dir {:o}", meta.permissions().mode() & 0o777)
+                } else {
+                    format!("file {:o} {}", meta.permissions().mode() & 0o777, String::from_utf8_lossy(&std::fs::read(&p).unwrap()))
+                };
+                out.push((rel, what));
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// An upstream with `uploadpack.allowFilter`, so mirrors of it are blobless as forges' are.
+    fn upstream(tmp: &Path) -> (PathBuf, String) {
+        let up = tmp.join("up");
+        std::fs::create_dir_all(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "master"]);
+        sh(&up, &["config", "uploadpack.allowFilter", "true"]);
+        let url = format!("file://{}", up.display());
+        (up, url)
+    }
+
+    /// Reads `commit` from the mirror with leave for the network or none: what came of it, and
+    /// whether it took leave.
+    async fn mirror_read(url: &str, commit: &str, allow: bool) -> (FromMirror, bool) {
+        let mut leave = if allow { Leave::new(Mode::Read) } else { Leave::denied() };
+        let policy = GitPolicy { allow_local: true };
+        let r = Box::pin(checkout_from_mirror(policy, url, commit, Mode::Read, &mut leave)).await.unwrap();
+        (r, leave.uses > 0)
+    }
+
+    /// The blob ids in each of the mirror's packs.
+    fn pack_blobs(dir: &Path) -> Vec<Vec<String>> {
+        let mut all: Vec<Vec<String>> = std::fs::read_dir(dir.join("objects/pack"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".idx"))
+            .map(|e| {
+                let out = std::process::Command::new("git").arg("verify-pack").arg("-v").arg(e.path()).output().unwrap();
+                let mut b: Vec<String> =
+                    String::from_utf8(out.stdout).unwrap().lines().filter(|l| l.contains(" blob ")).map(|l| l[..40].to_owned()).collect();
+                b.sort();
+                b
+            })
+            .collect();
+        all.sort();
+        all
+    }
+
+    /// Commits read from the blobless mirror come out exactly as a checkout writes them (modes,
+    /// symbolic links, a submodule's empty folder), fetching the files the mirror lacks in one go
+    /// and keeping exactly them: a later commit fetches only what changed, and one whose files are
+    /// all kept needs no network at all. A commit the mirror lacks brings an update; one the repo
+    /// doesn't have is left to a checkout; no leave for the network, no read.
+    #[tokio::test]
+    async fn commits_are_read_from_mirrors_as_checked_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (up, url) = upstream(tmp.path());
+        std::fs::create_dir_all(up.join("Arr/Thorn/src")).unwrap();
+        std::fs::write(up.join("cactarium.toml"), "format = 1\n").unwrap();
+        std::fs::write(up.join("Arr/Thorn/interface.ccl"), "implements: thorn\n").unwrap();
+        std::fs::write(up.join("Arr/Thorn/src/a.c"), "#include \"b.h\"\n").unwrap();
+        std::fs::write(up.join("Arr/Thorn/src/same.c"), "#include \"b.h\"\n").unwrap();
+        std::fs::write(up.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(up.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(up.join("with space.txt"), "x\n").unwrap();
+        std::os::unix::fs::symlink("Arr/Thorn/src/a.c", up.join("link.c")).unwrap();
+        std::os::unix::fs::symlink("../nowhere", up.join("dangling")).unwrap();
+        sh(&up, &["add", "-A"]);
+        // A submodule: a commit id in the tree, which a checkout leaves as an empty folder.
+        sh(&up, &["update-index", "--add", "--cacheinfo", &format!("160000,{},ExternalLibs/sub", "1".repeat(40))]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let first = sh(&up, &["rev-parse", "HEAD"]);
+        std::fs::write(up.join("Arr/Thorn/src/a.c"), "int a;\n").unwrap();
+        sh(&up, &["commit", "-q", "-am", "second"]);
+        let second = sh(&up, &["rev-parse", "HEAD"]);
+        let policy = GitPolicy { allow_local: true };
+        resolve_commit_prefix(policy, &url, &first[..7]).await.unwrap();
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        let before = pack_blobs(&dir);
+        assert!(before.iter().all(Vec::is_empty), "blobless: {before:?}");
+
+        let classic = checkout(policy, &url, &first, None).await.unwrap();
+        let (FromMirror::Read(got), used) = mirror_read(&url, &first, true).await else { panic!("not read") };
+        assert!(used, "the files were fetched");
+        assert_eq!(tree_of(&got.path), tree_of(&classic.path));
+        assert_eq!(got.tree, classic.tree);
+        assert!(tree_of(&got.path).iter().any(|(p, w)| p == "ExternalLibs/sub" && w.starts_with("dir")), "{:?}", tree_of(&got.path));
+        let blobs_of = |c: &str| {
+            let mut b: Vec<String> = sh(&up, &["ls-tree", "-r", c]).lines().filter(|l| l.contains(" blob ")).map(|l| l.split_whitespace().nth(2).unwrap().to_owned()).collect();
+            b.sort();
+            b.dedup();
+            b
+        };
+        let kept: Vec<Vec<String>> = pack_blobs(&dir).into_iter().filter(|b| !b.is_empty()).collect();
+        assert_eq!(kept, vec![blobs_of(&first)], "kept as one pack of exactly its files");
+
+        // Kept: read again with no leave for the network at all.
+        let (r, used) = mirror_read(&url, &first, false).await;
+        assert!(matches!(r, FromMirror::Read(ref co) if tree_of(&co.path) == tree_of(&classic.path)) && !used);
+
+        // A later commit the blobless clone had: only the changed file is fetched and kept.
+        let (FromMirror::Read(got), _) = mirror_read(&url, &second, true).await else { panic!("not read") };
+        let classic2 = checkout(policy, &url, &second, None).await.unwrap();
+        assert_eq!(tree_of(&got.path), tree_of(&classic2.path));
+        let changed = sh(&up, &["rev-parse", &format!("{second}:Arr/Thorn/src/a.c")]);
+        let kept: Vec<Vec<String>> = pack_blobs(&dir).into_iter().filter(|b| !b.is_empty()).collect();
+        assert!(kept.len() == 2 && kept.contains(&vec![changed]), "{kept:?}");
+
+        // A commit pushed since, on another branch: the mirror is updated (an update by URL brings
+        // the new commits' files too), with leave for the network only.
+        std::fs::write(up.join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        sh(&up, &["commit", "-q", "-am", "third"]);
+        let third = sh(&up, &["rev-parse", "HEAD"]);
+        sh(&up, &["branch", "-f", "other", &third]);
+        sh(&up, &["reset", "-q", "--hard", &second]);
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        let (r, _) = mirror_read(&url, &third, false).await;
+        assert!(matches!(r, FromMirror::NotRead(_)), "no leave, no update");
+        let (r, used) = mirror_read(&url, &third, true).await;
+        let FromMirror::Read(got) = r else { panic!("not read") };
+        let classic3 = checkout(policy, &url, &third, None).await.unwrap();
+        assert!(used);
+        assert_eq!(tree_of(&got.path), tree_of(&classic3.path));
+
+        // A commit the repo doesn't have: left to a checkout, which says so.
+        let (r, _) = mirror_read(&url, &"ab".repeat(20), true).await;
+        assert!(matches!(r, FromMirror::Elsewhere(_)));
+    }
+
+    /// A commit the mirror still has but no branch or tag reaches anymore (force-pushed away) is
+    /// never read from the mirror: it is left to a checkout, which answers as the repo does now.
+    #[tokio::test]
+    async fn commits_no_branch_reaches_are_left_to_a_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (up, url) = upstream(tmp.path());
+        std::fs::write(up.join("f"), "x").unwrap();
+        sh(&up, &["add", "f"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let gone = commit_on(&up, "gone", "pushed, then force-pushed away");
+        let policy = GitPolicy { allow_local: true };
+        resolve_commit_prefix(policy, &url, &gone[..7]).await.unwrap();
+        let (FromMirror::Read(_), _) = mirror_read(&url, &gone, true).await else { panic!("read while a branch has it") };
+        sh(&up, &["branch", "-D", "gone"]);
+        tokio::time::sleep(MIRROR_REFRESH + Duration::from_millis(100)).await;
+        resolve_commit_prefix(policy, &url, "0000000").await.unwrap();
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        assert_eq!(object_types(policy, &dir, std::slice::from_ref(&gone)).await, vec![Some("commit".to_owned())], "the mirror still has it");
+        let (r, _) = mirror_read(&url, &gone, false).await;
+        assert!(matches!(r, FromMirror::NotRead(_)), "it would need the network");
+        let (r, used) = mirror_read(&url, &gone, true).await;
+        assert!(matches!(r, FromMirror::Elsewhere(ref why) if why.contains("no branch or tag")) && used);
+    }
+
+    /// Keeping packs exactly the files asked anew: whatever else the scratch repo holds (a host
+    /// padding its pack with more) never reaches the mirror.
+    #[tokio::test]
+    async fn kept_packs_hold_exactly_the_wanted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (up, url) = upstream(tmp.path());
+        std::fs::write(up.join("f"), "x").unwrap();
+        sh(&up, &["add", "f"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let policy = GitPolicy { allow_local: true };
+        resolve_commit_prefix(policy, &url, &sh(&up, &["rev-parse", "HEAD"])[..7]).await.unwrap();
+        let (_, _, dir) = mirror_of(&url).await.unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        sh(&scratch, &["init", "-q"]);
+        let mut ids: Vec<String> = ["wanted one", "wanted two", "padding", "more padding"]
+            .iter()
+            .map(|t| {
+                std::fs::write(scratch.join("b"), t).unwrap();
+                sh(&scratch, &["hash-object", "-w", "b"])
+            })
+            .collect();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let g = |args: &[&str]| {
+            let mut c = git(policy, &home);
+            c.current_dir(&scratch).args(args);
+            c
+        };
+        ids.truncate(2);
+        ids.sort();
+        keep_blobs(&g, &scratch.join(".git/keep"), &dir, &ids).await;
+        let kept: Vec<Vec<String>> = pack_blobs(&dir).into_iter().filter(|b| !b.is_empty()).collect();
+        assert_eq!(kept, vec![ids]);
+        assert!(!std::fs::read_dir(dir.join("objects/pack")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(KEEP_PREFIX)));
+    }
+
+    /// Warming a mirror (as a clone, a sync and startup do) keeps the files of its default branch's
+    /// tip: a read there then needs no network.
+    #[tokio::test]
+    async fn warmed_mirrors_read_their_tips_without_the_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (up, url) = upstream(tmp.path());
+        std::fs::create_dir_all(up.join("Arr/T")).unwrap();
+        std::fs::write(up.join("Arr/T/interface.ccl"), "implements: t\n").unwrap();
+        sh(&up, &["add", "-A"]);
+        sh(&up, &["commit", "-q", "-m", "first"]);
+        let head = sh(&up, &["rev-parse", "HEAD"]);
+        let policy = GitPolicy { allow_local: true };
+        warm(policy, &url).await.unwrap();
+        let (r, used) = mirror_read(&url, &head, false).await;
+        assert!(matches!(r, FromMirror::Read(_)) && !used);
+        // Warm already: warming again fetches nothing.
+        warm(policy, &url).await.unwrap();
     }
 
     /// A preview's temporary mirror is read like a shared one, and gone once dropped.

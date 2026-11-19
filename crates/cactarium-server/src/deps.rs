@@ -1,11 +1,15 @@
 //! The dependency check every package version passes, and what reviewers should look at.
 //!
 //! A thorn's CCL says what it needs (implementations it inherits or befriends, capabilities and
-//! thorns it requires, functions it requires); a `[[dependency]]` says which thorns of which
-//! package supply that (`needs`). The Cactarium hosts only what works as delivered, so a version is
-//! refused unless the two agree: every hard CCL requirement of every published thorn is met by the
-//! package itself, or by the `needs` thorns of a dependency that applies to that thorn (for an
-//! `any-of`, by every alternative). Smells are what a reviewer should look at but that don't block:
+//! thorns it requires, functions it requires), and its sources which `USES INCLUDE` headers it
+//! can't compile without (included outside any conditional); a `[[dependency]]` says which thorns
+//! of which package supply that (`needs`). The Cactarium hosts only what works as delivered, so a
+//! version is refused unless the two agree: every hard CCL requirement of every published thorn is
+//! met by the package itself, or by the `needs` thorns of a dependency that applies to that thorn
+//! (for an `any-of`, by every alternative). A header counts only where some thorn the Cactarium
+//! knows of provides it, and none that does is optional to the thorn (`ccl::counts`, through
+//! `closure::counts`): one nothing provides is a hook, and compiles empty.
+//! Smells are what a reviewer should look at but that don't block:
 //! needs the CCL doesn't explain, includes that reach another thorn's sources by path, and so on.
 //!
 //! What a requirement is and what meets it is the crate's (`ccl::needs_of`, `meets`, `unmet`),
@@ -352,10 +356,22 @@ pub async fn check(
     // dependency has a version in range not read yet waits for it.
     let mut ccl_waiting: Vec<String> = Vec::new();
     let mut explained: Vec<(String, String)> = Vec::new(); // (target, needs thorn) some requirement used
+    // The thorns a header counts by (`ccl::counts`): the package's own, every dependency target's
+    // version read here, and every published thorn (`closure::counts`). One that nothing provides
+    // compiles empty (a hook), so it never refuses.
+    let known: Vec<&ThornFacts> = own
+        .iter()
+        .map(|(_, _, _, f)| f)
+        .chain(deps.iter().flat_map(|(_, opts)| opts.iter().flat_map(|(_, tv)| tv.thorns.iter().map(|(_, f)| f))))
+        .collect();
+    let mut headers = std::collections::HashMap::new();
     for (arr, name, _, facts) in own {
         // What CactUp reads a thorn's requirements as, and meets them by (the crate's `ccl`): the
         // needs the package's own thorns leave unmet.
         for need in unmet(facts, own.iter().map(|(_, n, _, f)| (n.as_str(), f))) {
+            if !crate::closure::counts(state, facts, &need, &known, &mut headers).await? {
+                continue;
+            }
             let applicable: Vec<&(&ClaimRec, Vec<(Alt, TargetVersion)>)> = deps
                 .iter()
                 .filter(|(c, opts)| (c.needed_by.is_empty() || c.needed_by.contains(name)) && !opts.is_empty())
@@ -384,6 +400,15 @@ pub async fn check(
                         .map(|(t, _)| format!(": add \"{t}\" to the needs of the dependency on {}", if c.alternatives.is_empty() { alt.target() } else { format!("{} (in its any-of)", alt.target()) }))
                 })
             });
+            // A header counts only where a published thorn provides it: name that one.
+            let hint = match (hint, &need) {
+                (Some(h), _) => Some(h),
+                (None, Need::Include(_)) => crate::closure::providers(state, &need).await?.into_iter().next().map(|(thorn, package)| {
+                    let short = thorn.rsplit('/').next().unwrap_or(&thorn).to_owned();
+                    format!(": add a [[dependency]] on {package} with \"{short}\" in its needs ({thorn} provides it), or exclude-thorns this thorn if it can't build")
+                }),
+                (None, _) => None,
+            };
             let said = format!(
                 "{arr}/{name} {}, which neither this package nor a dependency's needs supplies{}",
                 need,
@@ -607,6 +632,79 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(refuse(vec![], vec!["w".into()]), Err(AppError::Upstream(m)) if m == "w"));
+    }
+
+    /// The headers curated packages' thorns can't compile without are supplied by the package
+    /// itself or by its dependencies' needs, as the check now requires: the curated manifests
+    /// (CACTARIUM_TEST_CURATE, a curate.toml) read against a tree of their repos at the curated
+    /// versions (CACTARIUM_TEST_REPOS, one directory per repo, named as the URL's last part), with
+    /// every thorn there standing for the registry's. Prints what each package leaves unmet.
+    #[test]
+    fn curated_manifests_supply_their_headers() {
+        use cactup_ecosystem_common::ccl;
+        let (Some(curate), Some(repos)) = (std::env::var_os("CACTARIUM_TEST_CURATE"), std::env::var_os("CACTARIUM_TEST_REPOS")) else {
+            return;
+        };
+        let curate = std::path::PathBuf::from(curate);
+        let repos = std::path::PathBuf::from(repos);
+        let file: toml::Value = toml::from_str(&std::fs::read_to_string(&curate).unwrap()).unwrap();
+        let dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&repos).unwrap().flatten().map(|e| e.path()).collect();
+        // (slug, manifest, thorns as (name, facts)).
+        let mut packages: Vec<(String, Manifest, Vec<(String, ThornFacts)>)> = Vec::new();
+        for p in file["package"].as_array().unwrap() {
+            let url = p["url"].as_str().unwrap();
+            let base = url.trim_end_matches('/').trim_end_matches(".git").rsplit('/').next().unwrap().to_ascii_lowercase();
+            let text = std::fs::read_to_string(curate.parent().unwrap().join(p["manifest"].as_str().unwrap())).unwrap();
+            let m = Manifest::from_repo_file(cactup_ecosystem_common::manifest::PACKAGE_FILE, &text).unwrap();
+            let pkg = m.package.clone().unwrap();
+            let slug = format!("{}/{}", p["owner"].as_str().unwrap(), pkg.name);
+            let Some(dir) = dirs.iter().find(|d| d.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase() == base)) else {
+                eprintln!("{slug}: no repo {base} in the tree");
+                continue;
+            };
+            let root = dir.join(pkg.root.clone().unwrap_or_default());
+            let mut thorns = Vec::new();
+            for t in ccl::scan_tree(&root) {
+                let name = match (&t.name, pkg.thorns.as_deref()) {
+                    (Some(n), _) => n.clone(),
+                    (None, Some([one])) => one.clone(),
+                    _ => continue,
+                };
+                if pkg.thorns.as_ref().is_some_and(|a| !a.contains(&name)) || pkg.exclude_thorns.contains(&name) {
+                    continue;
+                }
+                thorns.push((name, t.facts));
+            }
+            packages.push((slug, m, thorns));
+        }
+        let registry: Vec<&ThornFacts> = packages.iter().flat_map(|(_, _, t)| t.iter().map(|(_, f)| f)).collect();
+        let mut left: Vec<String> = Vec::new();
+        for (slug, m, own) in &packages {
+            let claims = ClaimRec::of_manifest(m);
+            for (name, facts) in own {
+                for need in unmet(facts, own.iter().map(|(n, f)| (n.as_str(), f))) {
+                    // Only headers: the other needs were checked when these versions were frozen.
+                    if !matches!(need, Need::Include(_)) || !ccl::counts(facts, &need, registry.iter().copied()) {
+                        continue;
+                    }
+                    let met = claims.iter().filter(|c| c.kind == "dependency" && (c.needed_by.is_empty() || c.needed_by.contains(name))).any(|c| {
+                        c.options().iter().all(|alt| {
+                            let target = packages.iter().find(|(s, _, _)| *s == alt.target());
+                            target.is_some_and(|(_, _, thorns)| supplier(&alt.needs, thorns, &need).is_some())
+                        })
+                    });
+                    if !met {
+                        let by: Vec<String> = packages
+                            .iter()
+                            .flat_map(|(s, _, t)| t.iter().filter(|(n, f)| meets(n, f, &need)).map(move |(n, _)| format!("{s} {n}")))
+                            .collect();
+                        left.push(format!("{slug}: {name} {need} (provided by {})", by.join(", ")));
+                    }
+                }
+            }
+        }
+        eprintln!("{} packages read; unmet headers:\n{}", packages.len(), left.join("\n"));
+        assert!(left.is_empty(), "{} unmet", left.len());
     }
 
     /// A tip read counts only what its requester could be served; freezing counts every target

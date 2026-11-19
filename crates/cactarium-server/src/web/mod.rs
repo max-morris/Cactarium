@@ -30,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/entries/{owner}/{name}", get(api::entry))
         .route("/packages/{owner}/{name}/versions", get(api::package_versions))
         .route("/packages/{owner}/{name}/versions/{tip}", get(api::package_tip))
+        .route("/packages/read", post(api::read_packages))
         .route("/packages/{owner}/{name}/refresh", post(api::package_refresh))
         .route("/resolve", get(api::resolve))
         .route("/stacks/{owner}/{name}/releases", get(api::stack_releases).post(api::stack_publish))

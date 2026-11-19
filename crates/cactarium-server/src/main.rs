@@ -6,6 +6,7 @@
 mod audit;
 mod auth;
 mod claims;
+mod closure;
 mod config;
 mod curate;
 mod deps;
@@ -86,12 +87,30 @@ enum Command {
     /// it becomes valid if it reads cleanly now (also from another tag of that version), or is
     /// removed if its tag isn't a version of the entry at all. With `--tag` instead of a version: a
     /// tag recorded as not a version of the entry is examined again under the rules as they are now.
+    /// With `--moved`: a version of a sim or stack whose tag moved is read at the tag's new commit,
+    /// and takes it (with everything stored from it) only if it reads cleanly there.
     Reread {
         username: String,
         slug: String,
         version: Option<String>,
         #[arg(long, conflicts_with = "version")]
         tag: Option<String>,
+        /// Read the version's moved tag at the commit it names now, replacing the frozen commit.
+        #[arg(long, requires = "version")]
+        moved: bool,
+    },
+    /// Read the thorn facts of package versions again at their frozen commits, as an admin, and
+    /// store them in place of the old ones: facts stored before the scanner read included headers
+    /// (`INCLUDE ... IN`, and the sources' unconditional `#include`s) say a thorn provides and
+    /// needs none. Only versions with a thorn an older scanner read, unless `--all`; only
+    /// OWNER/NAME if given.
+    /// Prints one line per version; running it again does only what is left.
+    RescanFacts {
+        username: String,
+        slug: Option<String>,
+        /// Every valid version, not only those with facts an older scanner read.
+        #[arg(long)]
+        all: bool,
     },
     /// Create or update curated packages from a curate.toml (see `curate.rs` for the format),
     /// as the given admin.
@@ -284,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(clean, "{} would not be read cleanly", tag.as_deref().unwrap_or("the repo"));
             Ok(())
         }
-        Command::Reread { username, slug, version, tag } => {
+        Command::Reread { username, slug, version, tag, moved } => {
             let state = make_state(cfg, db)?;
             let user = cli_user(&state, &username).await?;
             let (owner, name) = slug.split_once('/').context("give owner/name")?;
@@ -293,12 +312,51 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .context("no such entry")?;
             let said = match (version, tag) {
+                (Some(version), None) if moved => tracker::reread_moved(&state, &user, &e, &version).await,
                 (Some(version), None) => tracker::reread_invalid(&state, &user, &e, &version).await,
                 (None, Some(tag)) => tracker::reexamine_tag(&state, &user, &e, &tag).await,
                 _ => anyhow::bail!("give an invalid version, or --tag <tag>"),
             }
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{said}");
+            Ok(())
+        }
+        Command::RescanFacts { username, slug, all } => {
+            let state = make_state(cfg, db)?;
+            let user = cli_user(&state, &username).await?;
+            let entry = match slug {
+                Some(s) => {
+                    let (owner, name) = s.split_once('/').context("give owner/name")?;
+                    Some(
+                        model::find_entry(&state, owner, name)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                            .context("no such entry")?,
+                    )
+                }
+                None => None,
+            };
+            let (mut done, mut changed, mut failed) = (0, 0, 0);
+            tracker::rescan_facts(&state, &user, entry.as_ref(), all, |r| match r {
+                Ok(r) => {
+                    done += 1;
+                    changed += r.changed;
+                    let missing = if r.missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; not found at the commit, left as they were: {}", r.missing.join(", "))
+                    };
+                    println!("{}: {} thorns, {} with new facts{missing}", r.label, r.thorns, r.changed);
+                }
+                Err(why) => {
+                    failed += 1;
+                    println!("{why}");
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{done} versions rescanned, {changed} thorns with new facts, {failed} left as they were");
+            anyhow::ensure!(failed == 0, "{failed} versions could not be rescanned; run it again to retry them");
             Ok(())
         }
         Command::PublishSim { username, file, name, version } => {
@@ -677,7 +735,7 @@ fn make_state(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<AppState> {
             .build()?,
         limiter: Arc::new(security::RateLimiter::default()),
         definitions: Arc::new(flights::Flights::new(None, 512)),
-        package_tips: Arc::new(flights::Flights::new(None, 512)),
+        package_tips: Arc::new(flights::Flights::new(None, 4096)),
         // Branch tips move; a stack's resolved tips are reused only briefly.
         stack_tips: Arc::new(flights::Flights::new(Some(Duration::from_secs(30)), 256)),
         cfg: Arc::new(cfg),
@@ -705,6 +763,12 @@ async fn serve(cfg: Config, db: sqlx::PgPool) -> anyhow::Result<()> {
     let state = make_state(cfg, db)?;
     if let Err(e) = tracker::backfill_built_thorns(&state).await {
         tracing::warn!("backfilling the thorn index failed: {e}");
+    }
+    // Batch reads' network slots, and the warming of the mirrors at the packages' tips.
+    git::set_read_network_slots(state.cfg.read_network_slots);
+    git::enable_warming();
+    if let Err(e) = tracker::warm_all(&state).await {
+        tracing::warn!("warming the mirrors failed: {e}");
     }
     // The poller is restarted if it ever panics, rather than polling silently stopping.
     let poller = state.clone();

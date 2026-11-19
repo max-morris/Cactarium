@@ -337,6 +337,7 @@ pub async fn cut_release(
     crate::deps::check_stack(state, &ClaimRec::of_manifest(&m)).await.map_err(stacks::for_a_person)?;
     let slug = format!("{owner}/{name}@{label}").parse().map_err(AppError::bad)?;
     let frozen = stacks::freeze(slug, &format!("{name}.th"), resolution, Some(definition.to_owned()))?;
+    stacks::check_closure(state, &frozen).await?;
     let entry = match existing {
         Some(e) => e,
         None => {

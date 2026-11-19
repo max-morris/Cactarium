@@ -1697,6 +1697,12 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     let v = model::any_version_by_label(state, entry.id, label.trim())
         .await?
         .ok_or_else(|| AppError::bad(format!("{} has no version {label}", entry.slug())))?;
+    if v.state == "tag-moved" {
+        return Err(AppError::bad(format!(
+            "{}@{label} isn't invalid: its tag moved, and the frozen commit is still served (to read the tag at its new commit instead, re-read the moved tag)",
+            entry.slug()
+        )));
+    }
     if v.state != "invalid" {
         return Err(AppError::bad(format!("{}@{label} isn't invalid", entry.slug())));
     }
@@ -1814,6 +1820,189 @@ pub async fn reread_invalid(state: &AppState, admin: &User, entry: &Entry, label
     publish::touch(state, entry.id).await?;
     let from = if r.name == tag { String::new() } else { format!(", from {} (instead of {tag})", r.name) };
     Ok(format!("{}@{label} reads cleanly now{from}{}", entry.slug(), if review == "pending" { "; it awaits review" } else { "" }))
+}
+
+/// Admin-only: a version of a sim or stack entry whose tag moved (`tag-moved`: the tag names
+/// another commit now, and the frozen one is still served) read again at the tag's current commit.
+/// A moved tag is never followed on its own; this is the admin's deliberate exception, for a
+/// release found broken and fixed under the same tag before anyone relied on it. The tag at its new
+/// commit must be the same version of the entry and pass every check a new tag passes (the closure
+/// check included); then the version takes the new commit and tree, and everything stored from the
+/// old one is replaced in one transaction: manifest, readme, smells, claims, a stack's frozen
+/// release (thornlist, pins, diff, the thorn index), every sim of a sim entry (the stamped stored
+/// copies, their pins and the thorn index). The mark goes, the tag's open alerts are acknowledged,
+/// and it is reviewed as a pushed tag is (the admin re-reading it doesn't vouch for it). Audited
+/// (`version.reread-moved`). Anything less and nothing changes: the reasons are the error.
+/// Packages are refused: sims and stacks pin a package version's commit, which must never change
+/// under them.
+pub async fn reread_moved(state: &AppState, admin: &User, entry: &Entry, label: &str) -> AppResult<String> {
+    if !admin.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    if entry.kind == "package" {
+        return Err(AppError::bad(format!(
+            "{} is a package: sims and stacks pin its versions' commits, so a version's commit never changes; tag a new version instead",
+            entry.slug()
+        )));
+    }
+    let repo = repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} isn't released from a repo", entry.slug())))?;
+    let label = label.trim();
+    let v = model::any_version_by_label(state, entry.id, label)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no version {label}", entry.slug())))?;
+    if v.state != "tag-moved" {
+        return Err(AppError::bad(format!(
+            "{}@{label} isn't marked as having a moved tag ({}){}",
+            entry.slug(),
+            v.state,
+            if v.state == "invalid" { ": re-read it as an invalid version" } else { "" }
+        )));
+    }
+    let (Some(tag), Some(was)) = (v.tag.clone(), v.commit.clone()) else {
+        return Err(AppError::bad(format!("{}@{label} has no tag and commit to read", entry.slug())));
+    };
+    let tv: TrackedVersion = v.label().parse().map_err(AppError::bad)?;
+    let remote = git::ls_tags(policy(state), &repo.url)
+        .await
+        .map_err(|e| AppError::Upstream(format!("cannot list the repo's tags: {e:#}")))?;
+    let Some(now) = remote.into_iter().find(|r| r.name == tag).map(|r| r.commit) else {
+        return Err(AppError::bad(format!("{tag} is no longer in the repo: there is nothing to read")));
+    };
+    if now == was {
+        // Moved back where it was frozen: nothing to read, only the mark to clear.
+        let mut tx = state.db.begin().await?;
+        sqlx::query("UPDATE versions SET state = 'ok' WHERE id = $1 AND state = 'tag-moved'").bind(v.id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE tag_events SET acknowledged_by = $2, acknowledged_at = now() WHERE version_id = $1 AND acknowledged_at IS NULL")
+            .bind(v.id)
+            .bind(admin.id)
+            .execute(&mut *tx)
+            .await?;
+        crate::audit::audit_with(&mut tx, Some(admin.id), "version.reread-moved", Some(&entry.slug()), json!({ "version": label, "tag": tag, "was": was, "now": now, "back": true }), None).await?;
+        tx.commit().await?;
+        return Ok(format!("{tag} is back at the frozen commit {}: {}@{label} is no longer marked as moved", short(&was), entry.slug()));
+    }
+    let r = RemoteRef { name: tag.clone(), commit: now.clone() };
+    let mut unlimited = usize::MAX;
+    let exam = examine(state, entry, &repo, std::slice::from_ref(&r), &mut unlimited).await?.into_iter().next();
+    moved_tag_reads_as(exam, &tv, &tag, &now)?;
+    let co = git::checkout(policy(state), &repo.url, &now, Some(&tag))
+        .await
+        .map_err(|e| AppError::Upstream(format!("cannot fetch {}: {e:#}", short(&now))))?;
+    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts::default()).await.map_err(|e| match e {
+        AppError::BadRequest(m) => AppError::BadRequest(format!("{tag} at {} doesn't read cleanly, so {}@{label} stays at {}: {m}", short(&now), entry.slug(), short(&was))),
+        other => other,
+    })?;
+    // Reviewed as the tag would be if pushed now: the admin re-reading it doesn't vouch for it.
+    let review = publish::release_review(state, entry, None).await?;
+    let lock = entry_sync_lock(entry.id);
+    let _one_at_a_time = lock.lock().await;
+    let mut tx = state.db.begin().await?;
+    let n = sqlx::query(
+        "UPDATE versions SET state = 'ok', commit = $3, tree = $4, manifest = $5, readme_html = $6, review = $7
+         WHERE id = $1 AND state = 'tag-moved' AND commit = $2",
+    )
+    .bind(v.id)
+    .bind(&was)
+    .bind(&now)
+    .bind(&co.tree)
+    .bind(&p.manifest_json)
+    .bind(&p.readme_html)
+    .bind(review)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(AppError::Conflict(format!("{}@{label} changed while this ran; reload and try again", entry.slug())));
+    }
+    // Everything stored from the old commit goes, and is stored again from the new one.
+    for table in ["thorns", "claims", "stack_releases", "sim_files", "source_pins", "release_thorns"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE version_id = $1")).bind(v.id).execute(&mut *tx).await?;
+    }
+    store_prepared(&mut tx, entry, v.id, &v.track, p).await?;
+    if entry.kind == "stack" {
+        refresh_next_diff(&mut tx, entry, v.id, &v.track).await?;
+    }
+    let open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM submissions WHERE version_id = $1 AND status IN ('open', 'changes-requested'))")
+        .bind(v.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !open {
+        publish::submit_release(&mut tx, entry, v.id, review, None).await?;
+    }
+    sqlx::query("UPDATE tag_events SET acknowledged_by = $2, acknowledged_at = now() WHERE version_id = $1 AND acknowledged_at IS NULL")
+        .bind(v.id)
+        .bind(admin.id)
+        .execute(&mut *tx)
+        .await?;
+    for table in ["foreign_tags", "tag_reads", "waiting_tags"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE entry_id = $1 AND tag = $2")).bind(entry.id).bind(&tag).execute(&mut *tx).await?;
+    }
+    crate::audit::audit_with(
+        &mut tx,
+        Some(admin.id),
+        "version.reread-moved",
+        Some(&entry.slug()),
+        json!({ "version": label, "tag": tag, "was": was, "now": now, "review": review }),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    publish::touch(state, entry.id).await?;
+    Ok(format!(
+        "{}@{label} now reads {tag} at {} (it was frozen at {}){}",
+        entry.slug(),
+        short(&now),
+        short(&was),
+        if review == "pending" { "; it awaits review" } else { "" }
+    ))
+}
+
+/// Whether a moved tag, examined at its new commit (`exam`), is still exactly version `tv` of the
+/// entry, readable: else why not, as [`reread_moved`] refuses.
+fn moved_tag_reads_as(exam: Option<Exam>, tv: &TrackedVersion, tag: &str, now: &str) -> AppResult<()> {
+    let at = short(now);
+    match exam {
+        Some(Exam::Version { tv: read, error: None, .. }) if read == *tv => Ok(()),
+        Some(Exam::Version { error: Some(why), .. }) => Err(AppError::bad(format!("{tag} at {at} can't be read: {why}"))),
+        Some(Exam::Version { tv: read, .. }) => {
+            Err(AppError::bad(format!("{tag} at {at} reads as version {read}, not {tv}: the version can't change its number")))
+        }
+        Some(Exam::Not { why, .. } | Exam::Claimed { why, .. }) => {
+            Err(AppError::bad(format!("{tag} at {at} isn't a version of this entry any more: {why}")))
+        }
+        Some(Exam::Wait(why) | Exam::Unexamined(why)) => Err(AppError::Upstream(format!("{tag} at {at} can't be examined right now: {why}"))),
+        None => Err(AppError::Upstream(format!("{tag} at {at} wasn't examined"))),
+    }
+}
+
+/// The stored diff of the release after `vid` on its track (the next approved one), against the
+/// release `vid` is now: what [`store_release`] would have stored had `vid` read this way first.
+async fn refresh_next_diff(db: &mut sqlx::PgConnection, entry: &Entry, vid: i64, track: &str) -> AppResult<()> {
+    let next: Option<(i64, String)> = sqlx::query_as(
+        "SELECT s.version_id, s.frozen FROM stack_releases s JOIN versions v ON v.id = s.version_id
+         WHERE v.entry_id = $1 AND v.track = $2 AND v.id <> $3 AND v.review = 'approved'
+           AND v.sort_key > (SELECT sort_key FROM versions WHERE id = $3)
+         ORDER BY v.sort_key LIMIT 1",
+    )
+    .bind(entry.id)
+    .bind(track)
+    .bind(vid)
+    .fetch_optional(&mut *db)
+    .await?;
+    let Some((next_id, next_frozen)) = next else { return Ok(()) };
+    let this: Option<String> = sqlx::query_scalar("SELECT frozen FROM stack_releases WHERE version_id = $1").bind(vid).fetch_optional(&mut *db).await?;
+    let (Some(Ok(this)), Ok(next)) = (this.map(|t| toml::from_str::<FrozenStack>(&t)), toml::from_str::<FrozenStack>(&next_frozen)) else {
+        return Ok(());
+    };
+    let diff = stacks::diff(Some(&this), &next);
+    sqlx::query("UPDATE stack_releases SET diff = $2 WHERE version_id = $1")
+        .bind(next_id)
+        .bind(serde_json::to_value(&diff).map_err(anyhow::Error::from)?)
+        .execute(&mut *db)
+        .await?;
+    Ok(())
 }
 
 /// Checks that `url` holds the history the entry's published versions froze: every tagged version
@@ -2058,6 +2247,10 @@ async fn sync_as(state: &AppState, entry: &Entry, actor: Option<&User>, pace: Pa
         }
         other => other,
     };
+    // The mirror kept current at the default branch's tip, for batch reads (in the background).
+    if entry.kind == "package" {
+        git::warm_soon(policy(state), &repo.url);
+    }
     let err = result.as_ref().err().map(|e| e.to_string());
     sqlx::query("UPDATE entry_repos SET last_polled_at = now(), poll_error = $2 WHERE entry_id = $1")
         .bind(entry.id)
@@ -3471,6 +3664,10 @@ pub async fn package_tip_commit(state: &AppState, entry: &Entry) -> AppResult<St
 /// likely one not pushed yet (404). Details are logged; the answers stay generic.
 async fn checkout_failure(state: &AppState, url: &str, commit: &str, e: anyhow::Error) -> AppError {
     tracing::warn!("checking out {commit} from {url}: {e:#}");
+    // A fact about the commit, not about the host.
+    if let Some(big) = e.downcast_ref::<git::TooLarge>() {
+        return AppError::bad(format!("{url} at {commit}: {big}"));
+    }
     if format!("{e:#}").contains("timed out") {
         return AppError::Upstream(format!("{url} didn't send commit {commit} in time; try again later"));
     }
@@ -3487,19 +3684,88 @@ async fn checkout_failure(state: &AppState, url: &str, commit: &str, e: anyhow::
 /// Reads a package at `commit` (its default branch's tip, or a commit someone named) the way a
 /// release is read: the manifest (the curated one, for a curated package) and the thorns there.
 pub async fn package_tip(state: &AppState, entry: &Entry, commit: &str, reading: crate::deps::Reading) -> AppResult<PackageTip> {
-    if entry.kind != "package" {
-        return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
-    }
-    let repo = repo_of(state, entry.id)
-        .await?
-        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))?;
+    let repo = tip_repo(state, entry).await?;
     let co = match git::checkout(policy(state), &repo.url, commit, None).await {
         Ok(co) => co,
         Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await),
     };
+    read_tip(state, entry, &repo, &co, commit, reading).await
+}
+
+/// Why a batch read of a package at a commit has no answer.
+pub enum TipFailure {
+    /// What the single read ([`package_tip`]) fails with.
+    Failed(AppError),
+    /// Not read this time: it needed the network, and the request's leave for it ran out (or a
+    /// slot was busy). Why, to show.
+    NotRead(String),
+}
+
+impl From<AppError> for TipFailure {
+    fn from(e: AppError) -> Self {
+        TipFailure::Failed(e)
+    }
+}
+
+/// [`package_tip`] for a batch read (`POST /packages/read`): the same reading of the same files,
+/// taken from the repo's kept history mirror ([`git::checkout_from_mirror`]) rather than fetched
+/// afresh. What the mirror can't serve is checked out as [`package_tip`] does it, so the answer
+/// (a reading, or the failure) is the single read's. Network use, of either kind, takes one of the
+/// batch reads' network slots first (never waiting); without one the package isn't read.
+pub async fn package_tip_from_mirror(
+    state: &AppState,
+    entry: &Entry,
+    commit: &str,
+    reading: crate::deps::Reading,
+) -> Result<PackageTip, TipFailure> {
+    let repo = tip_repo(state, entry).await?;
+    let mut leave = git::Leave::new(git::Mode::Read);
+    let found = Box::pin(git::checkout_from_mirror(policy(state), &repo.url, commit, git::Mode::Read, &mut leave))
+        .await
+        .map_err(|e| AppError::Internal(e.context(format!("reading {} at {commit} from its mirror", entry.slug()))))?;
+    let co = match found {
+        git::FromMirror::Read(co) => co,
+        git::FromMirror::NotRead(why) => return Err(TipFailure::NotRead(why.to_owned())),
+        // Too large, or not sent in time: answered without asking the host anything more.
+        git::FromMirror::Failed(e) => return Err(checkout_failure(state, &repo.url, commit, e).await.into()),
+        git::FromMirror::Elsewhere(why) => {
+            leave.take().map_err(|why| TipFailure::NotRead(why.to_owned()))?;
+            tracing::info!("{} at {commit}: not from the mirror ({why}); checking it out", entry.slug());
+            match git::checkout(policy(state), &repo.url, commit, None).await {
+                Ok(co) => co,
+                Err(e) => return Err(checkout_failure(state, &repo.url, commit, e).await.into()),
+            }
+        }
+        git::FromMirror::Complete => return Err(AppError::Internal(anyhow::anyhow!("a read came back as a warming")).into()),
+    };
+    // Reading the files needs no network: the slot is free for another item.
+    drop(leave);
+    Ok(read_tip(state, entry, &repo, &co, commit, reading).await?)
+}
+
+/// The repo a package is read from at a commit.
+async fn tip_repo(state: &AppState, entry: &Entry) -> AppResult<RepoRow> {
+    if entry.kind != "package" {
+        return Err(AppError::bad(format!("{} is a {}, not a package", entry.slug(), entry.kind)));
+    }
+    repo_of(state, entry.id)
+        .await?
+        .ok_or_else(|| AppError::bad(format!("{} has no repo", entry.slug())))
+}
+
+/// The package as `co` (its files at `commit`) has it: [`package_tip`]'s reading, however the
+/// files came.
+async fn read_tip(
+    state: &AppState,
+    entry: &Entry,
+    repo: &RepoRow,
+    co: &git::Checkout,
+    commit: &str,
+    reading: crate::deps::Reading,
+) -> AppResult<PackageTip> {
     let r = RemoteRef { name: "HEAD".into(), commit: commit.to_owned() };
     let tv = TrackedVersion { track: None, version: semver::Version::new(0, 0, 0) };
-    let p = prepare(state, entry, &repo, &co, &r, &tv, &PrepOpts { reading, ..PrepOpts::default() })
+    let p = prepare(state, entry, repo, co, &r, &tv, &PrepOpts { reading, ..PrepOpts::default() })
         .await
         .map_err(|e| AppError::bad(format!("{} at commit {}: {e}", entry.slug(), &commit[..12.min(commit.len())])))?;
     let flesh = p.manifest_json["package"]["flesh"].as_bool().unwrap_or(false);
@@ -3719,6 +3985,7 @@ async fn prepare(
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{}.th", entry.name));
         let frozen = stacks::freeze(slug, &filename, resolution, Some(text.clone()))?;
+        stacks::check_closure(state, &frozen).await?;
         let toml = toml::to_string(&frozen).map_err(anyhow::Error::from)?;
         p.frozen = Some((frozen, toml, own));
     }
@@ -3831,6 +4098,11 @@ async fn prepare_one_sim(
         ));
     }
     let pins = crate::sims::pin_problems(state, &checked.sim, &opts.registering).await?;
+    // Once every pin is a package's commit (before that, the pins say what is wrong), what the
+    // sim builds must build together: a fact about the commit, so the version is invalid.
+    if pins.facts.is_empty() && pins.passing.is_empty() {
+        crate::sims::check_closure(state, &checked.sim).await?;
+    }
     Ok((checked, pins))
 }
 
@@ -3847,13 +4119,14 @@ async fn store_prepared(
         .execute(&mut *db)
         .await?;
     for (arr, name, dir, facts) in &p.thorns {
-        sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO thorns (version_id, arrangement, name, dir, implements, facts, scanned_by) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(vid)
             .bind(arr)
             .bind(name)
             .bind(dir)
             .bind(&facts.implements)
             .bind(serde_json::to_value(facts).map_err(anyhow::Error::from)?)
+            .bind(FACTS_SCANNER)
             .execute(&mut *db)
             .await?;
     }
@@ -3981,6 +4254,123 @@ pub async fn backfill_built_thorns(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+/// The scanner that reads thorn facts (`ccl::scan_tree`: the CCL and the sources), recorded with
+/// every thorn stored (`thorns.scanned_by`). Change it whenever the shared crate's bump changes what
+/// the scanner reads, so `rescan-facts` reads every version's thorns again: ae11cce reads
+/// `OPTIONAL_IFACTIVE` into `optional` and leaves guard-tested headers out of `needs-includes`,
+/// which b3772d3 (the first to read headers) didn't.
+pub const FACTS_SCANNER: &str = "cactup-ecosystem-common ae11cce";
+
+/// What one version's rescan found ([`rescan_facts`]).
+pub struct Rescanned {
+    /// `owner/name@version`.
+    pub label: String,
+    /// The thorns rescanned, and how many of them have new facts.
+    pub thorns: usize,
+    pub changed: usize,
+    /// Thorns the commit no longer has where the version recorded them (left as they were).
+    pub missing: Vec<String>,
+}
+
+/// Admin-only: reads the facts of every package version's thorns again from its repo at its frozen
+/// commit, as a new version's are read now (the CCL, and the sources for the headers each thorn
+/// includes outside any conditional), and stores them in place of the old ones, marked as read by
+/// [`FACTS_SCANNER`]. Facts an older scanner read lack what it didn't read (before b3772d3, every
+/// header: they read as providing and needing none; before ae11cce, `OPTIONAL_IFACTIVE`). Only
+/// `entry` (a package) if given; valid versions only (an invalid one is read afresh when it is
+/// re-read); without `all`, only versions with a thorn another scanner (or none recorded) read, so
+/// running it again does only what is left. Nothing
+/// else about a version changes: its commit, thorns, claims and review stay. Each version is
+/// written in one transaction with its audit record (`version.rescan-facts`), so a run that stops
+/// keeps what it did. `each` hears every version as it is done (`Ok`) or left as it was (`Err`,
+/// with why: its commit couldn't be fetched, say).
+pub async fn rescan_facts(
+    state: &AppState,
+    admin: &User,
+    entry: Option<&Entry>,
+    all: bool,
+    mut each: impl FnMut(Result<Rescanned, String>),
+) -> AppResult<()> {
+    if !admin.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    if let Some(e) = entry
+        && e.kind != "package"
+    {
+        return Err(AppError::bad(format!("{} is a {}: only packages have thorn facts", e.slug(), e.kind)));
+    }
+    let versions: Vec<(i64, String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT v.id, e.owner || '/' || e.name || '@' || CASE WHEN v.track = '' THEN v.version ELSE v.track || ':' || v.version END,
+                v.commit, v.tag, r.url, e.owner || '/' || e.name
+         FROM versions v JOIN entries e ON e.id = v.entry_id JOIN entry_repos r ON r.entry_id = e.id
+         WHERE e.kind = 'package' AND v.commit IS NOT NULL AND v.state <> 'invalid' AND v.invalid_reason IS NULL
+           AND ($1::BIGINT IS NULL OR e.id = $1)
+           AND EXISTS (SELECT 1 FROM thorns t WHERE t.version_id = v.id
+                       AND ($2 OR t.scanned_by IS DISTINCT FROM $3))
+         ORDER BY e.owner, e.name, v.track, v.sort_key",
+    )
+    .bind(entry.map(|e| e.id))
+    .bind(all)
+    .bind(FACTS_SCANNER)
+    .fetch_all(&state.db)
+    .await?;
+    for (vid, label, commit, tag, url, slug) in versions {
+        let co = match git::checkout(policy(state), &url, &commit, tag.as_deref()).await {
+            Ok(co) => co,
+            Err(e) => {
+                each(Err(format!("{label}: cannot fetch {}: {e:#}", short(&commit))));
+                continue;
+            }
+        };
+        let thorns: Vec<(i64, String, String, String, serde_json::Value)> =
+            sqlx::query_as("SELECT id, arrangement, name, dir, facts FROM thorns WHERE version_id = $1 ORDER BY id")
+                .bind(vid)
+                .fetch_all(&state.db)
+                .await?;
+        let dirs: Vec<std::path::PathBuf> = thorns.iter().map(|(_, _, _, dir, _)| co.path.join(dir)).collect();
+        // Each thorn's directory, scanned as the root of a tree: the thorn itself is the one found
+        // there, read from the CCL and from its sources.
+        let scanned: Vec<Option<ccl::ThornFacts>> = tokio::task::spawn_blocking(move || {
+            dirs.iter()
+                .map(|d| ccl::scan_tree(d).into_iter().find(|t| t.dir.as_os_str().is_empty()).map(|t| t.facts))
+                .collect()
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+        let mut done = Rescanned { label: label.clone(), thorns: thorns.len(), changed: 0, missing: Vec::new() };
+        let mut tx = state.db.begin().await?;
+        for ((id, arrangement, name, dir, old), new) in thorns.iter().zip(scanned) {
+            let Some(new) = new else {
+                done.missing.push(format!("{arrangement}/{name} ({dir})"));
+                continue;
+            };
+            let new_json = serde_json::to_value(&new).map_err(anyhow::Error::from)?;
+            sqlx::query("UPDATE thorns SET facts = $2, implements = $3, scanned_by = $4 WHERE id = $1")
+                .bind(id)
+                .bind(&new_json)
+                .bind(&new.implements)
+                .bind(FACTS_SCANNER)
+                .execute(&mut *tx)
+                .await?;
+            if new_json != *old {
+                done.changed += 1;
+            }
+        }
+        crate::audit::audit_with(
+            &mut tx,
+            Some(admin.id),
+            "version.rescan-facts",
+            Some(&slug),
+            json!({ "version": label, "commit": commit, "thorns": done.thorns, "changed": done.changed, "missing": done.missing }),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        each(Ok(done));
+    }
+    Ok(())
+}
+
 /// Records the repos a stack release or a sim pins; `sim` names the sim of a multi-sim version
 /// ("" otherwise), whose sims may pin the same repo at different commits.
 pub async fn store_pins(
@@ -4086,6 +4476,20 @@ pub async fn add_virtual_version(
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Warms the kept mirror of every package's repo, one after another in the background
+/// ([`git::warm_soon`]): at startup, so batch reads at the default branches' tips need no network.
+pub async fn warm_all(state: &AppState) -> AppResult<()> {
+    let urls: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT r.url FROM entry_repos r JOIN entries e ON e.id = r.entry_id WHERE e.kind = 'package' AND e.visibility <> 'hidden' ORDER BY 1",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for url in urls {
+        git::warm_soon(policy(state), &url);
+    }
     Ok(())
 }
 
@@ -4289,6 +4693,25 @@ mod tests {
         // Against a manifest here that can't be read either, it takes what its rule reads at all.
         assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &shared, None), Exam::Claimed { by: 2, .. }));
         assert!(matches!(judge(&e, SIM_FILE, None, "v2.0.0", &broken, &simv, None), Exam::Version { error: Some(_), .. }));
+    }
+
+    /// A moved tag is re-read only when, at its new commit, it is still exactly that version and
+    /// readable; anything else says why, and what can't be judged now is Upstream.
+    #[test]
+    fn a_moved_tag_must_still_be_its_version() {
+        let tv = |s: &str| s.parse::<TrackedVersion>().unwrap();
+        let version = |v: &str, error: Option<&str>| Exam::Version { tv: tv(v), rank: 1, error: error.map(Into::into), note: None, pattern: None };
+        let now = "0123456789abcdef0123456789abcdef01234567";
+        let at = |exam| moved_tag_reads_as(Some(exam), &tv("2026.5.0"), "v2026.5.0", now);
+        assert!(at(version("2026.5.0", None)).is_ok());
+        let e = at(version("2026.5.1", None)).unwrap_err().to_string();
+        assert!(e.contains("reads as version 2026.5.1, not 2026.5.0") && e.contains("0123456789"), "{e}");
+        assert!(at(version("2026.5.0", Some("bad toml"))).unwrap_err().to_string().contains("can't be read: bad toml"));
+        let e = at(Exam::Not { kind: "absent", why: "no manifest".into() }).unwrap_err().to_string();
+        assert!(e.contains("isn't a version of this entry any more: no manifest"), "{e}");
+        assert!(matches!(at(Exam::Wait("newer format".into())), Err(AppError::Upstream(_))));
+        assert!(matches!(at(Exam::Unexamined("offline".into())), Err(AppError::Upstream(_))));
+        assert!(matches!(moved_tag_reads_as(None, &tv("2026.5.0"), "v2026.5.0", now), Err(AppError::Upstream(_))));
     }
 
     /// Among tags read as one version, the spelling the manifest's pattern writes wins, then the

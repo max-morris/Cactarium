@@ -7,6 +7,8 @@
 //! `!REPO_COMMIT` in the text, the definition's `pin-tag` (when the repo has that tag), the base
 //! release's pin (when the repo still points where the base had it), or the branch's current head.
 //!
+//! A release is refused unless the thorns its thornlist builds build together ([`check_closure`]).
+//!
 //! A flat stack with nothing to merge keeps its thornlist verbatim; anything else is emitted fresh
 //! with `!REPO_COMMIT` lines, so the downloaded `.th` is pinned on its own.
 //!
@@ -518,6 +520,15 @@ pub fn freeze(
     };
     f.validate().map_err(AppError::bad)?;
     Ok(f)
+}
+
+/// The thorns a release builds must build together (`closure::problems`, the check a sim passes):
+/// refuses with every hard CCL requirement of a built thorn that no built thorn meets, and the
+/// published thorn that would meet it. Every source counts, `extends` bases included, since the
+/// frozen thornlist is what gets built.
+pub async fn check_closure(state: &AppState, frozen: &FrozenStack) -> AppResult<()> {
+    let p = crate::closure::problems(state, "the release", &frozen.thornlist.text, &frozen.repos).await?;
+    if p.is_empty() { Ok(()) } else { Err(AppError::bad(format!("the release's thornlist doesn't build: {}", p.join("; ")))) }
 }
 
 /// What moved between the previous release on the same track and this one.

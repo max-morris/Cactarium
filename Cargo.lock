@@ -311,6 +311,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "libc",
  "pulldown-cmark",
  "rand 0.9.5",
  "regex",
@@ -336,7 +337,7 @@ dependencies = [
 [[package]]
 name = "cactup-ecosystem-common"
 version = "0.1.0"
-source = "git+https://github.com/max-morris/cactup-ecosystem-common?rev=909c194bcd657b009750424a7a13dec817a8db3d#909c194bcd657b009750424a7a13dec817a8db3d"
+source = "git+https://github.com/max-morris/cactup-ecosystem-common?rev=b98ba474fbe17cd1b4117c17783bab527cb1aa8f#b98ba474fbe17cd1b4117c17783bab527cb1aa8f"
 dependencies = [
  "anyhow",
  "indexmap",

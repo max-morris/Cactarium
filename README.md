@@ -52,7 +52,8 @@ writes take a bearer token from the site's Settings page (or `just cli token <us
 | `GET /stacks/{owner}/{name}/releases/{version\|head\|master}` | `FrozenStack` |
 | `GET /sims/{owner}/{name}/{X.Y.Z}/download[?sim=<sim>]` | the `.sim` bytes, with `x-sha256` |
 | `POST /lookup` | `LookedUp`: which package and version each pinned commit is, each download's review |
-| `GET /providers?implements=…` (or `capability=`, `function=`, `thorn=`) | `Providers` |
+| `POST /packages/read` (`ReadRequest`) | `ReadAnswer`: many packages, each at a commit, each as `versions/{commit}` answers it |
+| `GET /providers?implements=…` (or `capability=`, `function=`, `thorn=`, `include=`) | `Providers` |
 | `POST /sims/{owner}/{name}` (bearer, `.sim` body) | `Published` |
 | `POST /stacks/{owner}/{name}/releases` (bearer, `ReleaseRequest`) | `Published` |
 | `POST /packages/{owner}/{name}/refresh` (bearer) | `Refreshed` |
@@ -81,6 +82,27 @@ say `x-cactarium-unreviewed: true`.
   (`head`, `master`, a commit no version froze) of a package that isn't trusted is 403
   `forbidden` unless the site allows untrusted artifacts; when it is served, it carries
   `x-cactarium-untrusted: true` (`false` on a trusted package's).
+- `POST /packages/read`: at most 200 items (owner/name and a full commit id, no pair twice), else
+  400 for the whole request. Each item is what `versions/{commit}` answers: `status` `ok` with
+  that `PackageVersion` (a version that froze the commit, else the package read now) and its
+  `untrusted`/`unreviewed`, or the single read's code (`forbidden`, `not-found`, `bad-request`,
+  `upstream`) with its message, or `not-read` (ask again, or read it alone). A request that
+  reads anything now (an item that is no version, may be served and isn't cached) counts once
+  against the per-minute limit on reads made now (a 429 refuses it whole); one that reads nothing
+  now doesn't count, as a single read of a cached full commit doesn't. What is read now
+  comes from the repo's kept history mirror, and shares the single reads' cache (4096 readings,
+  the oldest dropped first): the commit's tree checked out from the mirror, the files it lacks
+  fetched in one request per package and kept (packed anew from exactly those files); a commit no
+  branch or tag of the mirror reaches, or one the mirror can't serve, is checked out as the single
+  read does. The answer comes within 20 seconds: items not done by then are `not-read` ("still
+  being read; ask again shortly", with `in-progress: true`) and go on in the background, filling
+  the mirror and the cache; a `not-read` item that never started has `in-progress: false`.
+  Limits: 8 items of a request under way at once, in request order; 16 items using the network at
+  once across all requests and 32 readings under way in all (past either, an item is `not-read`
+  at once); 8 trees written out from mirrors at once (waited for).
+- Mirrors are kept warm at every package's default-branch tip: once cloned, after each sync of the
+  package, and in a pass over all packages at startup, one repo at a time on a slot of its own. So
+  a base at the packages' tips reads with no network at all.
 - `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.
@@ -116,7 +138,7 @@ migrates and restarts.
 Server-side commands run in the app container with `just cli ...`:
 `admin grant|revoke|trust|untrust|list`, `download approve <admin> <url> <sha256> [--note ...]`, `org create <name> <owner>`, `org add <name> <user>
 [--owner]`, `org list`, `register [--owner <ns>] [--tag <tag>] [--only <name>]...`, `check <url> [--tag <tag>
-[--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`), `move-repo`, `reapply`, `token`. Create the `et`
+[--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`, or `<version> --moved`), `rescan-facts <admin> [<owner/name>] [--all]`, `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
 - `register` finds each manifest file's newest release among the repo's tags (the newest tag its
@@ -134,7 +156,24 @@ organization with `just cli org create et <your-username> --display-name "Einste
   admin step. `reread` reads an invalid version of a non-curated repo entry again (valid if it
   reads cleanly now, or from another tag naming that version; removed if the tag isn't a version
   of the entry at all); with `--tag`, it examines a tag recorded as not a version again under the
-  current rules.
+  current rules. With `--moved`, `reread` reads a version of a sim or stack whose tag moved (marked
+  `tag-moved`, the frozen commit still served) at the tag's current commit: if the tag there is still
+  that version and passes every check a new tag passes, the version takes the new commit and
+  everything stored from the old one is replaced (a stack's frozen thornlist and pins, every stored
+  `.sim` of a sim entry, the thorn and pin indexes; the next release's diff), the mark goes, the
+  tag's alerts are acknowledged, and it is reviewed as a pushed tag is (`version.reread-moved` in the
+  audit log); otherwise nothing changes and the reasons are printed. Admin, Entries has the same as
+  *Re-read moved tag*. Package versions are refused: sims and stacks pin their commits.
+- A package version, a sim (upload or tag) and a stack release (tag or upload) are checked against
+  what their thorns need: a package's against its own thorns and its dependencies' `needs`, a sim's
+  and a release's against the thorns their thornlist builds (each thorn's facts are those of the
+  package version that froze its pinned commit). Besides the CCL requirements, a thorn needs every
+  `USES INCLUDE` header its sources include outside any `#if`/`#ifdef`, where a published thorn
+  provides it (`INCLUDE ... IN`) and the thorn doesn't declare such a provider `OPTIONAL` or
+  `OPTIONAL_IFACTIVE`, and the sources don't test the header's own guard macro. A built thorn
+  the Cactarium has no facts for (a download, a commit no version froze) is not checked and is
+  taken to meet whatever a known thorn of its name meets, or anything when none is known. `rescan-facts` reads the stored facts of package versions again at their frozen
+  commits: facts stored before the scanner read headers say a thorn needs and provides none.
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
   uses 25): after deploying, the first polls examine the existing tags of big repos over a few
   checks; a version is frozen once no unexamined or waiting tag could also be it. Each tag's
@@ -148,7 +187,11 @@ organization with `just cli org create et <your-username> --display-name "Einste
   preview of a repo with no entries uses a temporary mirror, deleted afterward, cloned on a slot of
   its own (never one of syncing's three), given up (its git killed) once the request goes away,
   and stopped past 1 GB; leftovers of a process that died are swept at startup and hourly. Kept
-  mirrors have no size limit. Previews and confirms together are limited to
+  mirrors have no size limit for their history; the file contents batch reads and warming keep
+  in them stop being added once a mirror's objects take 2 GB or the volume has under 10 GB free
+  (logged), so size the mirrors volume for the packages' trees at their tips plus what changed
+  since (a few GB for the Einstein Toolkit), with 10 GB to spare. The volume is a cache: deleting it
+  costs clones and fetches, nothing else. Previews and confirms together are limited to
   `CACTARIUM_PREVIEWS_PER_HOUR` per user (default 20); previews also to 60 a minute per address,
   confirms to 10.
 - Upgrading from master to this release, by design but worth knowing:
@@ -165,6 +208,15 @@ organization with `just cli org create et <your-username> --display-name "Einste
   - the stored tag pattern is now only a display hint for repo entries; after a rollback to the
     retry-not-freeze release it would be taken as the real rule again.
 - `move-repo` moves every entry on the repo together.
+- Upgrading to the include-closure release (migration 0019 adds `thorns.scanned_by`, which scanner
+  read a thorn's facts; older binaries ignore it): every stored thorn's facts predate the header
+  fields, so until they are rescanned no header is needed or provided anywhere. After `just
+  update`, run `just cli rescan-facts <admin>` once (it fetches each package version's commit; one
+  line per version; run it again to retry what failed, it skips what is done). From then on new
+  package versions, sims and stack releases are refused when a thorn includes a header only a thorn
+  they don't build provides. Versions already frozen stay as they are. Tags read after the deploy
+  (or `reapply`) of curated packages whose manifests leave such a header to a dependency without
+  naming its thorn in `needs` are refused with the line that fixes it; so are tip reads of them.
 - Upgrading to the dependency-plan release (migrations 0017 and 0018): the first `migrate` (which
   `just update` runs) recomputes every stored repo key (`source_pins.url_norm`) with the crate's
   `url::normalize_repo_url`, once, in Rust (queued in the new `data_migrations` table; `serve` runs

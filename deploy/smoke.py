@@ -360,13 +360,20 @@ if vid:
     run = subprocess.run(["just", "cli", "unyank", "max", "max/carpetx", "1.1.0"], capture_output=True, text=True)
     check("just cli unyank", run.returncode == 0 and "Unyanked max/carpetx@1.1.0" in run.stdout, run.stdout + run.stderr[-300:])
 
-# A snapshot release of a stack defined on the site.
+# A snapshot release of a stack defined on the site. What it builds must build together: leaving
+# out a thorn another one it builds requires is refused.
 maxv.get("/new/stack")
-definition = 'format = 1\n\n[stack]\nname = "smoke-stack"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CarpetX/Loop"]\n'
+broken = 'format = 1\n\n[stack]\nname = "smoke-broken"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CarpetX/Loop"]\n'
+s, text, _ = maxv.post("/new/stack", {"definition": broken, "thornlist": "", "version": "0.1.0"})
+check("a release leaving out a required thorn is refused",
+      s == 200 and "CarpetX/CarpetX requires the thorn Loop, which the release doesn&#39;t build" in text, f"{s} {text[text.find('alert'):][:300]}")
+page(anon, "/max/smoke-broken", expect=404)
+maxv.get("/new/stack")
+definition = 'format = 1\n\n[stack]\nname = "smoke-stack"\nextends = ["et/et-stack@2026.5.0"]\ndisable = ["CactusBase/IOUtil"]\n'
 s, text, hdrs = maxv.post("/new/stack", {"definition": definition, "thornlist": "", "version": "0.1.0"})
 check("cut a snapshot release", s == 303, f"{s} {text[:300]}")
 s, body, _ = anon.get("/api/v1/stacks/max/smoke-stack/releases/0.1.0")
-check("the release disables CarpetX/Loop", s == 200 and "#DISABLED CarpetX/Loop" in json.loads(body)["thornlist"]["text"], body[:200])
+check("the release disables CactusBase/IOUtil", s == 200 and "#DISABLED CactusBase/IOUtil" in json.loads(body)["thornlist"]["text"], body[:200])
 s, text, _ = maxv.post("/new/stack", {"definition": definition, "thornlist": "", "version": "0.1.0"})
 check("a release never changes", s == 200 and "already exists" in text, s)
 
@@ -2278,6 +2285,13 @@ check("a commit a version froze is that version", pins[0].get("package") == "max
       and pins[0].get("commit-known") is True and "review" not in pins[0], pins[0])
 check("a respelled URL is the same repo; a commit no version froze has no version but is known",
       pins[1].get("package") == "max/carpetx" and pins[1].get("version") is None and pins[1].get("commit-known") is True, pins[1])
+# Within a minute of the mirror's last update (the refresh window) a miss can't tell, since the
+# commit may have been pushed since: null. After the window, the lookup updates and a miss is a no.
+if pins[2].get("commit-known") is None:
+    check("a commit the mirror lacks, within the refresh window, can't tell yet", pins[2].get("package") == "max/carpetx", pins[2])
+    time.sleep(61)
+    _, again, _ = api("POST", "/lookup", {"pins": [{"url": carpetx_url, "commit": "0" * 40}]})
+    pins[2] = (again.get("pins") or [{}])[0]
 check("a commit the repo doesn't have is not known", pins[2].get("package") == "max/carpetx" and pins[2].get("commit-known") is False, pins[2])
 check("a repo no package has: no package, nothing known", pins[3].get("package") is None and pins[3].get("commit-known") is None, pins[3])
 check("a download never submitted has no review", (r.get("downloads") or [{}])[0].get("review", "x") is None, r.get("downloads"))
@@ -2569,6 +2583,244 @@ answers = [anon.get("/api/v1/packages/max/carpetx/versions/head") for _ in range
 codes = [a[0] for a in answers]
 retry = answers[-1][2].get("Retry-After") or answers[-1][2].get("retry-after")
 check("tips still count, and a 429 says when to try again", codes[0] == 200 and codes[-1] == 429 and retry and 1 <= int(retry) <= 60, f"{codes} {retry}")
+
+
+# ---------------------------------------------------------------------------------------------
+# POST /packages/read: many packages, each at a full commit, each answered as
+# versions/{commit} answers it, read from the repos' kept mirrors.
+import os
+
+def relaunch(**knobs):
+    """The app container made anew (an empty limiter and reading cache; the mirrors are a volume
+    and stay), with the dev-only knobs given (CACTARIUM_TIP_LIMIT, CACTARIUM_READ_NETWORK_SLOTS)
+    and the others unset."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    env = {k: v for k, v in os.environ.items() if k not in ("CACTARIUM_TIP_LIMIT", "CACTARIUM_READ_NETWORK_SLOTS")}
+    env.update({k: str(v) for k, v in knobs.items()})
+    subprocess.run(["docker", "compose", "--project-directory", here, "-f", here + "/compose.yaml", "-f", here + "/compose.dev.yaml",
+                    "up", "-d", "--no-deps", "--force-recreate", "app"], env=env, check=True, capture_output=True)
+    for _ in range(240):
+        try:
+            if urllib.request.urlopen(BASE + "/").status == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+    sys.exit("the app didn't come back")
+
+def batch(pairs, headers=None):
+    return api("POST", "/packages/read", {"items": [{"package": p, "commit": c} for p, c in pairs]}, headers=headers)
+
+def single(slug, commit, headers=None):
+    s, body, hdrs = anon.get(f"/api/v1/packages/{slug}/versions/{commit}", headers=headers)
+    return s, json.loads(body), hdrs
+
+def unstamped(v):
+    """A reading's PackageVersion without its `published` time (a reading made now is stamped when
+    answered)."""
+    v = json.loads(json.dumps(v))
+    if v and v.get("version") == v.get("commit"):
+        v.pop("published", None)
+    return v
+
+def answers_alike(one, item):
+    """Whether a batch item says exactly what the single read said: the same PackageVersion (and
+    headers), or the same error code and message."""
+    s, body, hdrs = one
+    if s == 200:
+        return (item.get("status") == "ok" and unstamped(item.get("version")) == unstamped(body)
+                and item.get("untrusted") == (hdrs.get("x-cactarium-untrusted") == "true")
+                and item.get("unreviewed") == (hdrs.get("x-cactarium-unreviewed") == "true"))
+    err = body.get("error", {})
+    return (item.get("status") == err.get("code") and item.get("error") == err.get("message")
+            and "version" not in item and not item.get("untrusted") and not item.get("unreviewed"))
+
+relaunch()
+# The whole request is refused when it asks wrongly; such a refusal doesn't count.
+s, r, _ = batch([("max/carpetx", f"{i:040x}") for i in range(201)])
+check("a batch read of 201 items is 400", s == 400 and r.get("error", {}).get("code") == "bad-request" and "at most 200" in r["error"]["message"], r)
+s, r, _ = batch([("max/carpetx", unrel), ("max/carpetx", unrel)])
+check("a batch read asking a pair twice is 400", s == 400 and "asked twice" in r.get("error", {}).get("message", ""), r)
+s, r, _ = batch([("max/carpetx", unrel[:12])])
+check("a batch read with an abbreviated commit is 400", s == 400 and "full lowercase commit id" in r.get("error", {}).get("message", ""), r)
+s, r, _ = batch([("max/carpetx/CarpetX", unrel)])
+check("a batch read names packages by owner/name only", s == 400, r)
+# A request that reads something now counts once against the per-minute limit on reads made now,
+# however many items it has (a commit the repo lacks is read, and fails, every time): 12 pass, the
+# 13th is refused whole (with Retry-After), and so is a single read made now.
+codes = [batch([("max/carpetx", v110), ("max/carpetx", unrel), ("max/carpetx", "ab" * 20)]) for _ in range(13)]
+retry = codes[-1][2].get("Retry-After") or codes[-1][2].get("retry-after")
+check("each batch read counts once against the limit on reads made now, and a 429 says when to retry",
+      [c[0] for c in codes] == [200] * 12 + [429] and codes[-1][1].get("error", {}).get("code") == "rate-limited"
+      and retry and 1 <= int(retry) <= 60, [(c[0], c[1].get("error")) for c in codes])
+s, _, _ = anon.get("/api/v1/packages/max/carpetx/versions/head")
+check("the same limit as single reads made now", s == 429, s)
+
+relaunch()
+# One that reads nothing now (versions, cached readings, an empty one) doesn't count, as a single
+# read of a cached full commit doesn't.
+s, r, _ = batch([("max/carpetx", unrel)])
+codes = [batch(c)[0] for c in [[("max/carpetx", unrel), ("max/carpetx", v110), ("nobody/nothing", unrel)]] * 14 + [[]] * 2]
+s2, body, _ = anon.get("/api/v1/packages/max/carpetx/versions/head")
+check("batches that read nothing now don't count against the limit",
+      s == 200 and r["items"][0]["status"] == "ok" and codes == [200] * 16 and s2 == 200, f"{s} {codes} {s2}")
+s, r, _ = api("POST", "/packages/read", {})
+check("an empty batch answers no items", s == 200 and r == {"items": []}, f"{s} {r}")
+relaunch()
+pairs = [("max/carpetx", unrel), ("max/carpetx", v110), ("et/fakelib", fold), ("et/fakelib", fv),
+         ("max/carpetx", "ab" * 20), ("nobody/nothing", unrel), ("max/carpetx-mp", unrel)]
+s, r, _ = batch(pairs)
+items = r.get("items", [])
+check("a batch read answers every pair, in request order",
+      s == 200 and [(i["package"], i["commit"]) for i in items] == pairs, f"{s} {str(r)[:300]}")
+by = dict(zip(pairs, items)) if s == 200 else {}
+one = single("max/carpetx", unrel)
+check("an unfrozen commit is ok, read now: exactly the single read's answer (from the shared cache)",
+      by[("max/carpetx", unrel)]["status"] == "ok" and by[("max/carpetx", unrel)]["version"]["version"] == unrel
+      and by[("max/carpetx", unrel)]["untrusted"] is False and answers_alike(one, by[("max/carpetx", unrel)]), f"{by.get(('max/carpetx', unrel))} {one[:2]}")
+one = single("max/carpetx", v110)
+check("a version's commit answers as that version, as the single read does",
+      by[("max/carpetx", v110)]["version"]["version"] == "1.1.0" and answers_alike(one, by[("max/carpetx", v110)]), by.get(("max/carpetx", v110)))
+one = single("et/fakelib", fold)
+check("an untrusted package's unfrozen commit is forbidden, saying what the single read says",
+      by[("et/fakelib", fold)]["status"] == "forbidden" and one[0] == 403 and answers_alike(one, by[("et/fakelib", fold)]), by.get(("et/fakelib", fold)))
+check("an untrusted package's version commit is still that version", by[("et/fakelib", fv)]["version"]["version"] == "2026.5.0",
+      by.get(("et/fakelib", fv)))
+one = single("max/carpetx", "ab" * 20)
+check("a commit the repo doesn't have is not-found, asking whether it is pushed",
+      by[("max/carpetx", "ab" * 20)]["status"] == "not-found" and "is it pushed?" in by[("max/carpetx", "ab" * 20)]["error"]
+      and answers_alike(one, by[("max/carpetx", "ab" * 20)]), f"{by.get(('max/carpetx', 'ab' * 20))} {one[:2]}")
+one = single("nobody/nothing", unrel)
+check("an unknown package is not-found", by[("nobody/nothing", unrel)]["status"] == "not-found" and answers_alike(one, by[("nobody/nothing", unrel)]),
+      by.get(("nobody/nothing", unrel)))
+one = single("max/carpetx-mp", unrel)
+check("a stack is no package: not-found, as for the single read", by[("max/carpetx-mp", unrel)]["status"] == "not-found"
+      and answers_alike(one, by[("max/carpetx-mp", unrel)]), by.get(("max/carpetx-mp", unrel)))
+
+in_progress_wrong = []  # not-read items whose in-progress disagrees with their message
+
+def batch_until_read(pairs, tries=40, headers=None):
+    """A batch read asked again (as a client does) while items are still being read: the final
+    answer for each pair, in order."""
+    final, pending = {}, list(pairs)
+    for _ in range(tries):
+        if not pending:
+            break
+        s, r, _ = batch(pending, headers=headers)
+        if s != 200:
+            return s, r
+        later = []
+        for p, item in zip(pending, r["items"]):
+            busy = item["status"] == "not-read" and any(w in item.get("error", "") for w in ("Still being read", "ran out of time", "too many packages"))
+            if item["status"] == "not-read" and item["in-progress"] != ("Still being read" in item.get("error", "")):
+                in_progress_wrong.append(item)
+            if busy:
+                later.append(p)
+            else:
+                final[p] = item
+        pending = later
+        if pending:
+            time.sleep(1)
+    return 200, {"items": [final.get(p, {"status": "never answered"}) for p in pairs]}
+
+# Batch reads use the network only with a slot (16 across all requests): with none, a commit only
+# a checkout can read is not read this time, saying so; with slots, it is read. Fresh commits of
+# ten trusted packages' repos, under refs/pull/ (which mirrors never fetch, as for a forge's pull
+# requests), so only a checkout reads them.
+trusted = psql("""SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id
+                  WHERE e.kind = 'package' AND e.visibility = 'public' AND r.url LIKE 'file://%'
+                    AND (e.trusted OR EXISTS (SELECT 1 FROM users u WHERE u.username = e.owner AND NOT u.banned AND (u.trusted OR u.role <> 'user'))
+                         OR EXISTS (SELECT 1 FROM orgs o WHERE o.name = e.owner AND o.trusted))
+                  ORDER BY 1""").splitlines()
+fresh, seen_repos = [], {}
+for row in trusted:
+    slug, url = row.split(" ", 1)
+    path = url[len("file://"):]
+    if path in seen_repos or not os.path.isdir(path):
+        continue
+    made = subprocess.run(["git", "-C", path, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit-tree", "HEAD^{tree}", "-p", "HEAD",
+                           "-m", "a pull request"], capture_output=True, text=True)
+    if made.returncode != 0:
+        continue
+    c = made.stdout.strip()
+    subprocess.run(["git", "-C", path, "update-ref", "refs/pull/1/head", c], check=True)
+    seen_repos[path] = c
+    fresh.append((slug, c))
+    if len(fresh) == 10:
+        break
+relaunch(CACTARIUM_READ_NETWORK_SLOTS=0)
+s, r, _ = batch(fresh)
+check("with no network slot free, what needs the network is not read this time, saying so",
+      len(fresh) == 10 and s == 200 and all(i["status"] == "not-read" and "no slot was free" in i["error"] and "ask again" in i["error"] and i["in-progress"] is False for i in r["items"]),
+      f"{len(fresh)} {str(r)[:400]}")
+relaunch()
+s, r = batch_until_read(fresh)
+one = single(*fresh[0])
+check("with slots, they are read (checked out: no branch of the mirrors has them), as the single read reads them",
+      s == 200 and all(i["status"] not in ("not-read", "never answered") for i in r["items"]) and answers_alike(one, r["items"][0]), str(r)[:400])
+for path in seen_repos:
+    subprocess.run(["git", "-C", path, "update-ref", "-d", "refs/pull/1/head"], check=True)
+
+# Every commit of every registered demo package repo: the batch read says exactly what the single
+# read says (a fresh checkout), from a cold mirror, from a warm one (no network at all), and from
+# the shared cache. The limits are raised for it (dev-only knobs), and the app made anew between
+# the steps, which empties the cache.
+pairs, paths = [], set()
+for row in psql("SELECT e.owner || '/' || e.name || ' ' || r.url FROM entries e JOIN entry_repos r ON r.entry_id = e.id WHERE e.kind = 'package' ORDER BY 1").splitlines():
+    slug, url = row.split(" ", 1)
+    path = url[len("file://"):] if url.startswith("file://") else ""
+    if not os.path.isdir(path):
+        continue
+    commits = subprocess.run(["git", "-C", path, "rev-list", "--all"], capture_output=True, text=True).stdout.split()
+    pairs += [(slug, c) for c in commits]
+    paths.add(path)
+relaunch(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=16)
+singles = {p: single(*p) for p in pairs}
+def kind_of(p, one):
+    """What a single read answered: a version (False), a reading made now (True), or an error code."""
+    return (one[0], one[1]["version"] == p[1] if one[0] == 200 else one[1]["error"]["code"])
+kinds = sorted({kind_of(p, o) for p, o in singles.items()}, key=str)
+print(f"     {len(pairs)} (package, commit) pairs; single reads answered {kinds}")
+
+def compare(what, knobs):
+    relaunch(**knobs) if knobs is not None else None
+    differ = []
+    for start in range(0, len(pairs), 200):
+        chunk = pairs[start:start + 200]
+        s, r = batch_until_read(chunk)
+        if s != 200:
+            differ.append((chunk[0], s, str(r)[:200]))
+            continue
+        for p, item in zip(chunk, r["items"]):
+            if answers_alike(singles[p], item):
+                continue
+            # The background sync may have frozen a version at the commit since the single read
+            # (or the other way round): then the single read says something else now too.
+            now = single(*p)
+            if kind_of(p, now) != kind_of(p, singles[p]) and answers_alike(now, item):
+                print(f"     {p[0]} at {p[1][:12]} changed since: {kind_of(p, singles[p])} -> {kind_of(p, now)}")
+                singles[p] = now
+                continue
+            differ.append((p, singles[p][0], str(singles[p][1])[:300], str(item)[:300]))
+    check(f"for all {len(pairs)} commits of the demo packages, the batch read is the single read's ({what})", pairs and not differ, differ[:3])
+
+# Cold for real: the demo repos let clients filter (as forges do; without it a clone gets every
+# file), and the mirrors (a cache) are deleted, so the batch reads clone them blobless and fetch
+# the files each commit needs.
+for path in paths:
+    subprocess.run(["git", "-C", path, "config", "uploadpack.allowFilter", "true"], check=True)
+compose("stop", "app")
+compose("run", "--rm", "--no-deps", "--entrypoint", "sh", "app", "-c", "find /var/lib/cactarium/mirrors -mindepth 1 -delete")
+compare("a cold mirror", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=16))
+log = compose("logs", "app")
+fetched = len(re.findall(r"reading: fetching \d+ of \d+ files of [0-9a-f]+ that the mirror", log))
+fallbacks = len(re.findall(r"not from the mirror", log))
+print(f"     cold: {fetched} commits fetched missing files into their mirrors, {fallbacks} were checked out instead")
+check("cold, the batch reads fetched the files their mirrors lacked", fetched > 0, log[-500:])
+compare("a warm mirror, with no item allowed the network", dict(CACTARIUM_TIP_LIMIT=100000, CACTARIUM_READ_NETWORK_SLOTS=0))
+compare("the shared cache", None)
+relaunch()
+check("in-progress is true exactly on not-read items still being read", not in_progress_wrong, in_progress_wrong[:3])
 
 print()
 if FAILED:

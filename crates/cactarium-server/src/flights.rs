@@ -13,7 +13,8 @@ pub struct Flights<K, V> {
     cells: Mutex<HashMap<K, (Instant, Arc<OnceCell<V>>)>>,
     /// How long a value is kept; None keeps it until the map is full.
     ttl: Option<Duration>,
-    /// Past this many keys the map is cleared (the values are cheap to recompute, just not free).
+    /// Past this many keys the oldest is dropped (the values are cheap to recompute, just not
+    /// free): a burst of new keys displaces only the oldest values, never everyone's.
     cap: usize,
 }
 
@@ -47,8 +48,11 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
             if let Some(ttl) = self.ttl {
                 cells.retain(|_, (made, _)| now.duration_since(*made) < ttl);
             }
-            if cells.len() >= self.cap && !cells.contains_key(&key) {
-                cells.clear();
+            if cells.len() >= self.cap.max(1) && !cells.contains_key(&key) {
+                let oldest = cells.iter().min_by_key(|(_, (made, _))| *made).map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    cells.remove(&k);
+                }
             }
             cells.entry(key).or_insert_with(|| (now, Arc::new(OnceCell::new()))).1.clone()
         };
@@ -91,6 +95,18 @@ mod tests {
         assert_eq!(f.get_or_try_init(1, || async { Ok::<_, &str>(3) }).await, Ok(2), "kept");
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(f.get_or_try_init(1, || async { Ok::<_, &str>(4) }).await, Ok(4), "expired");
+    }
+
+    /// Past the cap, the oldest key goes, and only it.
+    #[tokio::test]
+    async fn the_oldest_goes_first() {
+        let f: Flights<u32, u32> = Flights::new(None, 3);
+        for k in 1..=3 {
+            f.get_or_try_init(k, || async move { Ok::<_, ()>(k) }).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        f.get_or_try_init(4, || async { Ok::<_, ()>(4) }).await.unwrap();
+        assert_eq!((f.peek(&1), f.peek(&2), f.peek(&3), f.peek(&4)), (None, Some(2), Some(3), Some(4)));
     }
 
     /// A peek answers only what is known, and computes nothing.

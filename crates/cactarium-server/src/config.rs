@@ -44,6 +44,15 @@ pub struct Config {
     pub preview_checkouts: usize,
     /// Registration previews per user per hour (`CACTARIUM_PREVIEWS_PER_HOUR`, default 20).
     pub previews_per_hour: u32,
+    /// Reads made now (a package's or stack's `head`, a commit no version froze, a batch read) per
+    /// client per minute. Local development only: `CACTARIUM_TIP_LIMIT` (default 12), so a test
+    /// can compare many reads.
+    pub tip_limit: u32,
+    /// How many batch read items (`POST /packages/read`) may use the network at once, across all
+    /// requests (`git::READ_NETWORK_SLOTS`). Local development only:
+    /// `CACTARIUM_READ_NETWORK_SLOTS` (default 16; 0 makes every item that needs the network
+    /// `not-read`).
+    pub read_network_slots: usize,
     /// Where the static files are.
     pub static_dir: String,
     /// The base URL of CactUp's own documentation (its CLI and the `.sim` format), which the
@@ -113,6 +122,11 @@ impl Config {
             preview_tags: var("CACTARIUM_PREVIEW_TAGS").map(|s| s.parse()).transpose()?.unwrap_or(100).max(1),
             preview_checkouts: var("CACTARIUM_PREVIEW_CHECKOUTS").map(|s| s.parse()).transpose()?.unwrap_or(5),
             previews_per_hour: var("CACTARIUM_PREVIEWS_PER_HOUR").map(|s| s.parse()).transpose()?.unwrap_or(20).max(1),
+            tip_limit: var("CACTARIUM_TIP_LIMIT").map(|s| s.parse()).transpose()?.unwrap_or(12).max(1),
+            read_network_slots: var("CACTARIUM_READ_NETWORK_SLOTS")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(crate::git::READ_NETWORK_SLOTS),
             static_dir: var("CACTARIUM_STATIC_DIR").unwrap_or_else(|| "static".into()),
             cactup_docs_url: var("CACTUP_DOCS_URL")
                 .unwrap_or_else(|| DEFAULT_CACTUP_DOCS_URL.into())
@@ -129,6 +143,11 @@ impl Config {
                  but CACTARIUM_BASE_URL is {}",
                 cfg.base_url
             );
+        }
+        for knob in ["CACTARIUM_TIP_LIMIT", "CACTARIUM_READ_NETWORK_SLOTS"] {
+            if var(knob).is_some() && !cfg.is_local() {
+                bail!("{knob} is for local development only, but CACTARIUM_BASE_URL is {}", cfg.base_url);
+            }
         }
         Ok(cfg)
     }
