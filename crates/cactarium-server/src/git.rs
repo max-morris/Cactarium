@@ -1045,7 +1045,7 @@ async fn update_mirror_in(
         // A slot first, and only then the repo's lock: nobody holds a repo's lock while waiting
         // for a slot, so syncs and lookups of a repo never wait behind a queue of other repos.
         let _permit = match wait {
-            Wait::Queue => tokio::select! {
+            Wait::Queue | Wait::Quietly => tokio::select! {
                 p = slots.acquire() => match p {
                     Ok(p) => p,
                     Err(e) => return Some(format!("updating the mirror failed: {e}")),
@@ -1089,12 +1089,16 @@ async fn update_mirror_in(
         if result.is_ok() {
             state.broken = false;
         }
-        state.finished = Some(std::time::Instant::now());
-        state.error = result.err().map(|e| {
+        let error = result.err().map(|e| {
             tracing::warn!("updating the mirror of {url} failed: {e:#}");
             format!("{e:#}")
         });
-        let error = state.error.clone();
+        // Warming's updates leave the window as it was: a commit pushed just after one is still
+        // fetched by the next request that misses it.
+        if wait != Wait::Quietly {
+            state.finished = Some(std::time::Instant::now());
+            state.error = error.clone();
+        }
         drop(state);
         drop(held);
         error
@@ -1108,6 +1112,9 @@ async fn update_mirror_in(
 enum Wait {
     Queue,
     Never,
+    /// As [`Wait::Queue`], for warming in the background: the update doesn't start a new
+    /// [`MIRROR_REFRESH`] window, so it never keeps a request from fetching what it misses.
+    Quietly,
 }
 
 /// What an update that gave up for want of a slot answers.
@@ -1539,7 +1546,7 @@ pub async fn checkout_from_mirror(
         // the update doesn't bring (not on a branch or tag) is for a checkout to find.
         let (slots, wait) = match mode {
             Mode::Read => (&READ_UPDATES, Wait::Never),
-            Mode::Warm => (&WARM_UPDATES, Wait::Queue),
+            Mode::Warm => (&WARM_UPDATES, Wait::Quietly),
         };
         let error = update_mirror_in(policy, &Mirrors::Shared, key.clone(), root, dir.clone(), false, None, slots, wait).await;
         match error {
@@ -1708,9 +1715,21 @@ async fn keep_blobs(g: &impl Fn(&[&str]) -> Command, out: &Path, dir: &Path, oid
             return;
         }
     };
-    let Ok(guard) = mirror_lock(dir).try_lock_owned() else {
-        tracing::info!("not keeping {} files in the mirror {}: it is being updated", oids.len(), dir.display());
-        return;
+    // Never waiting on an update for long: a few tries over a second, then given up.
+    let lock = mirror_lock(dir);
+    let mut tries = 0;
+    let guard = loop {
+        match lock.clone().try_lock_owned() {
+            Ok(g) => break g,
+            Err(_) if tries < 10 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => {
+                tracing::info!("not keeping {} files in the mirror {}: it is being updated", oids.len(), dir.display());
+                return;
+            }
+        }
     };
     if !mirror_complete(dir).await {
         return;
@@ -1825,7 +1844,7 @@ pub fn warm_soon(policy: GitPolicy, url: &str) {
 /// the commit its HEAD names (the default branch, as of the clone) fetched and kept.
 pub async fn warm(policy: GitPolicy, url: &str) -> anyhow::Result<()> {
     let (root, key, dir) = mirror_of(url).await?;
-    if let Some(e) = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &WARM_UPDATES, Wait::Queue).await {
+    if let Some(e) = update_mirror_in(policy, &Mirrors::Shared, key, root, dir.clone(), false, None, &WARM_UPDATES, Wait::Quietly).await {
         bail!("{e}");
     }
     let home = tempfile::tempdir()?;
