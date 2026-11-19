@@ -2822,6 +2822,31 @@ compare("the shared cache", None)
 relaunch()
 check("in-progress is true exactly on not-read items still being read", not in_progress_wrong, in_progress_wrong[:3])
 
+# ---------------------------------------------------------------------------------------------
+# Shareable remotes: nothing published carries credentials or points where others can't fetch
+# (the shared rule `cactup sim export` applies too). Messages say why, and never show the token.
+for url, says in [("https://s3cret@github.com/x/y", "remove them"),
+                  ("https://github.com/x/y?private_token=s3cret", "remove them"),
+                  ("git@localhost:x/y.git", "doesn't answer without credentials"),
+                  ("s3://bucket/x", "not a URL others can fetch")]:
+    s, r, _ = api("POST", "/repos", {"url": url, "dry-run": True}, BOB)
+    msg = json.dumps(r)
+    check(f"registering {url.replace('s3cret', '…')} is refused, saying why", s == 400 and says in msg and "s3cret" not in msg, f"{s} {msg[:300]}")
+_, sim_text, _ = anon.get("/api/v1/sims/max/qc0-demo/1.0.0/download")
+leaky = re.sub(r'(\[\[repo\]\][^\[]*?url = )"[^"]*"', r'\1"https://s3cret@github.com/max/qc0.git"', sim_text, count=1)
+s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=9.9.9", raw=leaky.encode(), headers=MAXAUTH)
+check("a sim pinning a repo by a URL with a token is refused, the token not shown",
+      leaky != sim_text and s == 400 and "remove them" in body and "s3cret" not in body, f"{s} {body[:300]}")
+s, r, _ = api("POST", "/downloads", {"url": "https://u:s3cret@example.org/x.tgz", "sha256": "0" * 64}, BOB)
+check("a download with a password in its URL is refused", s == 400 and "s3cret" not in json.dumps(r), r)
+ok, out = cli("check-urls")
+check("check-urls finds every stored URL publishable", ok and "every stored URL is publishable" in out, out[-500:])
+psql("INSERT INTO downloads (url, sha256) VALUES ('https://u:s3cret@example.org/leak.tgz', '" + "1" * 64 + "')")
+ok, out = cli("check-urls")
+check("check-urls lists a stored URL it would refuse, without its password",
+      not ok and "download (pending)" in out and "s3cret" not in out, out[-500:])
+psql("DELETE FROM downloads WHERE url = 'https://u:s3cret@example.org/leak.tgz'")
+
 print()
 if FAILED:
     print(f"{len(FAILED)} failed")

@@ -59,9 +59,92 @@ pub struct Target {
     resolve: Option<String>,
 }
 
-/// Checks a repo URL against the policy. Returns it normalized (no trailing slash, no userinfo).
+/// Checks a repo URL someone gives the Cactarium to register (or move, or curate) against the
+/// policy. Returns it normalized (no trailing slash). First the shared rule for what may be
+/// published ([`shareability`](cactup_ecosystem_common::url::shareability), the same one `cactup
+/// sim export` applies): credentials, local paths (outside development) and other schemes are
+/// refused saying why; an ssh URL is replaced by its https equivalent when that answers with no
+/// credentials ([`probe_anonymous`]), and refused when it doesn't.
 pub async fn check_url(policy: GitPolicy, raw: &str) -> anyhow::Result<String> {
-    Ok(check(policy, raw).await?.url)
+    use cactup_ecosystem_common::url::{Shareability, moved_refusal, shareability};
+    let url = match shareability(raw) {
+        Shareability::Shareable => raw.trim().to_owned(),
+        Shareability::Local if policy.allow_local => raw.trim().to_owned(),
+        Shareability::Ssh { https: Some(https) } => match probe_anonymous(policy, &https).await {
+            Probe::Answers => https,
+            Probe::Moved(to) => bail!("{}", moved_refusal(raw, &https, to.as_deref())),
+            Probe::Silent(why) => {
+                let refusal = Shareability::Ssh { https: Some(https) }.refusal(raw).unwrap_or_default();
+                bail!("{refusal} ({why})")
+            }
+        },
+        s => bail!("{}", s.refusal(raw).unwrap_or_default()),
+    };
+    Ok(check(policy, &url).await?.url)
+}
+
+/// What asking a repo's https URL anonymously found ([`probe_anonymous`]).
+#[derive(Debug)]
+pub enum Probe {
+    /// It served git's ref advertisement to nobody in particular.
+    Answers,
+    /// It redirected (a renamed or transferred repo), to the URL given when there was one.
+    Moved(Option<String>),
+    /// Anything else: an authentication challenge, not found, not a git server, no connection.
+    Silent(String),
+}
+
+/// Asks `https` for git's smart-HTTP ref advertisement (`/info/refs?service=git-upload-pack`, what
+/// `git ls-remote` asks first) the way a stranger would: under the outbound-fetch policy, with no
+/// credentials of any kind (no helper, `.netrc`, cookie or extra header: a bare request), and
+/// following no redirect. A redirect is [`Probe::Moved`], with its location less the
+/// smart-HTTP suffix.
+pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> Probe {
+    match probe_inner(policy, https).await {
+        Ok(p) => p,
+        Err(e) => Probe::Silent(format!("{e:#}")),
+    }
+}
+
+async fn probe_inner(policy: GitPolicy, https: &str) -> anyhow::Result<Probe> {
+    const SUFFIX: &str = "/info/refs?service=git-upload-pack";
+    let base = url::Url::parse(https.trim().trim_end_matches('/')).with_context(|| format!("'{https}' is not a URL"))?;
+    let (base, address) = vet(policy, base, "repo URLs").await?;
+    let asked = url::Url::parse(&format!("{}{SUFFIX}", base.as_str().trim_end_matches('/')))?;
+    let mut client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(60))
+        .user_agent("git/2 (cactarium)");
+    if let Some((host, addr)) = &address {
+        client = client.resolve(host, *addr);
+    }
+    let resp = client.build()?.get(asked.clone()).send().await?;
+    let status = resp.status();
+    if status.is_redirection() {
+        let to = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .and_then(|l| asked.join(l).ok())
+            .map(|u| {
+                let u = u.as_str();
+                u.split_once(SUFFIX).map_or(u, |(head, _)| head).to_owned()
+            });
+        return Ok(Probe::Moved(to));
+    }
+    let advert = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|t| t.to_str().ok())
+        .is_some_and(|t| t.starts_with("application/x-git-upload-pack-advertisement"));
+    Ok(if status.is_success() && advert {
+        Probe::Answers
+    } else if status.is_success() {
+        Probe::Silent("it answered, but not as a git repo".into())
+    } else {
+        Probe::Silent(format!("it answered {status}"))
+    })
 }
 
 async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
@@ -2505,8 +2588,62 @@ mod tests {
         }
     }
 
+    /// The anonymous probe: git's advertisement answers; an authentication challenge doesn't; a
+    /// redirect is a moved repo, its location less the smart-HTTP suffix. No credentials are sent.
+    #[tokio::test]
+    async fn anonymous_probes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply = if req.starts_with("GET /public/y.git/info/refs?service=git-upload-pack ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 0\r\n\r\n".to_owned()
+                } else if req.starts_with("GET /old/y/info/refs") {
+                    format!("HTTP/1.1 301 Moved\r\nLocation: http://127.0.0.1:{port}/new/y/info/refs?service=git-upload-pack\r\nContent-Length: 0\r\n\r\n")
+                } else if req.starts_with("GET /page/info/refs") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n".to_owned()
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n".to_owned()
+                };
+                log.lock().unwrap().push(req);
+                s.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let dev = GitPolicy { allow_local: true };
+        let at = |p: &str| format!("http://127.0.0.1:{port}/{p}");
+        assert!(matches!(probe_anonymous(dev, &at("public/y.git")).await, Probe::Answers));
+        assert!(matches!(probe_anonymous(dev, &at("private/y")).await, Probe::Silent(w) if w.contains("401")));
+        assert!(matches!(probe_anonymous(dev, &at("page")).await, Probe::Silent(w) if w.contains("not as a git repo")));
+        match probe_anonymous(dev, &at("old/y")).await {
+            Probe::Moved(Some(to)) => assert_eq!(to, at("new/y")),
+            other => panic!("{other:?}"),
+        }
+        for req in seen.lock().unwrap().iter() {
+            assert!(!req.to_ascii_lowercase().contains("authorization") && !req.to_ascii_lowercase().contains("cookie"), "{req}");
+        }
+    }
+
     #[tokio::test]
     async fn url_policy() {
+        // The shared rule's refusals come first, each saying why (and never showing a token).
+        let strict = GitPolicy { allow_local: false };
+        for (url, says) in [
+            ("https://s3cret@github.com/x/y", "remove them"),
+            ("https://github.com/x/y?private_token=s3cret", "remove them"),
+            ("/srv/repos/x", "local path"),
+            ("s3://bucket/x", "not a URL others can fetch"),
+            ("user@host.org:~user/x", "no https equivalent"),
+        ] {
+            let e = format!("{:#}", check_url(strict, url).await.unwrap_err());
+            assert!(e.contains(says) && !e.contains("s3cret"), "{url}: {e}");
+        }
         let strict = GitPolicy { allow_local: false };
         assert!(check_url(strict, "file:///etc").await.is_err());
         assert!(check_url(strict, "ssh://github.com/x").await.is_err());

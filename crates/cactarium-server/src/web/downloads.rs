@@ -120,7 +120,11 @@ fn validate(url: &str, sha256: &str, note: Option<&str>) -> AppResult<()> {
     // outside development) is the fetch's to apply.
     match url::Url::parse(url) {
         Ok(u) if matches!(u.scheme(), "https" | "http") && u.host_str().is_some() => {}
-        _ => return Err(AppError::bad(format!("'{url}' is no https:// URL"))),
+        _ => return Err(AppError::bad(format!("'{}' is no https:// URL", cactup_ecosystem_common::url::Redacted(url)))),
+    }
+    // Approved downloads are published in sims: never with a user name or password in them.
+    if let Some(e) = crate::remotes::credentials_problem(url) {
+        return Err(AppError::bad(e));
     }
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return Err(AppError::bad(format!("'{sha256}' is not a sha256 (64 lowercase hex digits)")));

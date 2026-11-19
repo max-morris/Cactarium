@@ -225,6 +225,24 @@ pub async fn resolve(
         base_pins.remove(&o.repo);
     }
 
+    // Every URL the release will publish, overrides applied: no credentials, nothing others can't
+    // fetch (the shared rule `cactup sim export` applies too). An informational [[stack.pin]] url
+    // is checked for credentials only.
+    let mut url_problems = Vec::new();
+    for c in merged.iter().filter(|c| c.ty != ComponentType::Ignore) {
+        crate::remotes::component_problems(c, policy.allow_local, &mut url_problems);
+    }
+    for p in &section.pins {
+        if let Some(u) = &p.url {
+            url_problems.extend(crate::remotes::credentials_problem(u).map(|e| format!("[[stack.pin]] '{}': {e}", p.name)));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    url_problems.retain(|u| seen.insert(u.clone()));
+    if !url_problems.is_empty() {
+        return Err(AppError::bad(format!("the stack publishes URLs it can't: {}", url_problems.join("; "))));
+    }
+
     if tip == Some(Tip::Master) {
         for c in merged.iter_mut() {
             c.branch = None;

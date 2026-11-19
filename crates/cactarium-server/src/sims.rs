@@ -238,14 +238,44 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     .await?;
     let policy = crate::git::GitPolicy { allow_local: state.cfg.allow_local_repos };
     let mut out = PinProblems::default();
+    // Every URL the sim publishes: no credentials, no remote others can't fetch (the shared rule
+    // `cactup sim export` applies too). Facts about the file: they hold at any time.
+    let mut urls = Vec::new();
+    if let Ok(list) = crl::parse(&sim.thornlist.text) {
+        for c in list.components().iter().filter(|c| c.ty != ComponentType::Ignore) {
+            crate::remotes::component_problems(c, policy.allow_local, &mut urls);
+        }
+    }
+    // A pin or input whose URL is refused gets no further checks: their messages would quote it.
+    let mut refused: BTreeSet<&str> = BTreeSet::new();
+    for pin in &sim.repos {
+        let problem = match pin.commit {
+            Some(_) => crate::remotes::remote_problem(&pin.url, policy.allow_local),
+            None => crate::remotes::credentials_problem(&pin.url),
+        };
+        if let Some(e) = problem {
+            urls.push(format!("[[repo]] '{}': {e}", pin.name));
+            refused.insert(&pin.url);
+        }
+    }
+    for i in &sim.inputs {
+        if let Some(u) = &i.url
+            && let Some(e) = crate::remotes::credentials_problem(u)
+        {
+            urls.push(format!("input {}: {e}", i.knob));
+            refused.insert(u);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    out.facts.extend(urls.into_iter().filter(|u| seen.insert(u.clone())));
     // An input's download is pinned by its sha256 like a tarball component, and reviewed the same
     // way (one read from the sim's own repo, `repo-file`, is pinned by the commit instead).
-    for i in &sim.inputs {
+    for i in sim.inputs.iter().filter(|i| !i.url.as_deref().is_some_and(|u| refused.contains(u))) {
         if let (Some(url), Some(sha)) = (&i.url, &i.sha256) {
             download_problem(state, &format!("input {}", i.knob), url, sha, &mut out).await?;
         }
     }
-    for pin in &sim.repos {
+    for pin in sim.repos.iter().filter(|p| !refused.contains(p.url.as_str())) {
         let Some(commit) = pin.commit.as_deref() else {
             // A download (a tarball component pinned by sha256) belongs to no package: it must be
             // one the Cactarium's reviewers approved, at exactly this content.
