@@ -67,7 +67,11 @@ pub async fn publishable_remote(policy: GitPolicy, raw: &str) -> Result<String, 
     };
     let mut asked = candidate.clone();
     loop {
-        let (outcome, why) = probe_anonymous(policy, &asked).await;
+        let (outcome, why) = match probe_anonymous(policy, &asked).await {
+            Probed::Done(outcome, why) => (outcome, why),
+            Probed::Private(host) => return Err(cactup_ecosystem_common::url::private_address_refusal(raw, &host)),
+            Probed::Unreachable(detail) => return Err(cactup_ecosystem_common::url::unreachable_refusal(raw, &detail)),
+        };
         match next_step(raw, &candidate, &asked, &outcome) {
             Step::Publish(u) => return Ok(u),
             Step::Probe(next) => asked = next,
@@ -79,24 +83,37 @@ pub async fn publishable_remote(policy: GitPolicy, raw: &str) -> Result<String, 
     }
 }
 
-/// Asks `https` anonymously, by the crate's rules ([`cactup_ecosystem_common::probe`]): `GET` its
-/// [`probe_url`](cactup_ecosystem_common::probe::probe_url) under the outbound-fetch policy (a
-/// public address, pinned), with no credentials of any kind (no helper, `.netrc`, cookie or extra
-/// header: a bare request), a `git/` user agent, and no redirect followed. Returns the outcome and,
-/// for anything but an answer or a redirect, what happened (for the message).
-pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> (cactup_ecosystem_common::probe::Outcome, Option<String>) {
-    use cactup_ecosystem_common::probe::Outcome;
-    match probe_inner(policy, https).await {
-        Ok(r) => r,
-        Err(e) => (Outcome::Other, Some(format!("{e:#}"))),
-    }
+/// What one anonymous probe came to ([`probe_anonymous`]).
+#[derive(Debug)]
+pub enum Probed {
+    /// The host answered: the crate's outcome, and for anything but an answer or a redirect, what
+    /// it answered (for the message).
+    Done(cactup_ecosystem_common::probe::Outcome, Option<String>),
+    /// Nothing was asked: the host resolves to an address that isn't public.
+    Private(String),
+    /// Nothing was asked: the host couldn't be reached (no such host, refused, timed out).
+    Unreachable(String),
 }
 
-async fn probe_inner(policy: GitPolicy, https: &str) -> anyhow::Result<(cactup_ecosystem_common::probe::Outcome, Option<String>)> {
+/// Asks `https` anonymously, by the crate's rules ([`cactup_ecosystem_common::probe`]): `GET` its
+/// [`probe_url`](cactup_ecosystem_common::probe::probe_url) under the outbound-fetch policy (a
+/// public address, pinned; http as well as https), with no credentials of any kind (no helper,
+/// `.netrc`, cookie or extra header: a bare request), a `git/` user agent, and no redirect followed.
+pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> Probed {
     use cactup_ecosystem_common::probe::{Outcome, USER_AGENT_PREFIX, is_answer, probe_url, redirect_target};
-    let asked = url::Url::parse(&probe_url(https)).with_context(|| format!("'{https}' is not a URL"))?;
-    // http as well as https (a remote may be published as http), public addresses only.
-    let (asked, address) = vet_with(policy, asked, "repo URLs", true).await?;
+    let asked = match url::Url::parse(&probe_url(https)) {
+        Ok(u) => u,
+        Err(e) => return Probed::Done(Outcome::Other, Some(format!("'{https}' is not a URL: {e}"))),
+    };
+    let (asked, address) = match vet_with(policy, asked, "repo URLs", true).await {
+        Ok(v) => v,
+        Err(e) => {
+            return match e.downcast_ref::<NotPublic>() {
+                Some(NotPublic(host)) => Probed::Private(host.clone()),
+                None => Probed::Unreachable(format!("{e:#}")),
+            };
+        }
+    };
     let mut client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
@@ -105,17 +122,25 @@ async fn probe_inner(policy: GitPolicy, https: &str) -> anyhow::Result<(cactup_e
     if let Some((host, addr)) = &address {
         client = client.resolve(host, *addr);
     }
-    let resp = client.build()?.get(asked.clone()).send().await?;
+    let client = match client.build() {
+        Ok(c) => c,
+        Err(e) => return Probed::Unreachable(e.without_url().to_string()),
+    };
+    let resp = match client.get(asked.clone()).send().await {
+        Ok(r) => r,
+        // No answer at all: refused, timed out, TLS failed. Nothing is known about the repo.
+        Err(e) => return Probed::Unreachable(format!("{:#}", anyhow::Error::from(e.without_url()))),
+    };
     let status = resp.status();
     let header = |h| resp.headers().get(h).and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok());
     if status.is_redirection() {
         let to = header(reqwest::header::LOCATION).and_then(|l| redirect_target(asked.as_str(), l));
-        return Ok((Outcome::Redirect(to), None));
+        return Probed::Done(Outcome::Redirect(to), None);
     }
     if is_answer(status.as_u16(), header(reqwest::header::CONTENT_TYPE)) {
-        return Ok((Outcome::Answer, None));
+        return Probed::Done(Outcome::Answer, None);
     }
-    Ok((Outcome::Other, Some(format!("it answered {status}"))))
+    Probed::Done(Outcome::Other, Some(format!("it answered {status}")))
 }
 
 async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
@@ -171,11 +196,16 @@ async fn vet_with(
         .with_context(|| format!("cannot resolve '{host}'"))?
         .collect();
     if addrs.is_empty() || addrs.iter().any(|a| private(a.ip())) {
-        bail!("'{host}' is not a public host");
+        return Err(NotPublic(host).into());
     }
     let bare = host.trim_start_matches('[').trim_end_matches(']').to_owned();
     Ok((url, Some((bare, addrs[0]))))
 }
+
+/// A host that resolves to an address the registry must never fetch from ([`vet`]).
+#[derive(Debug, thiserror::Error)]
+#[error("'{0}' is not a public host")]
+pub struct NotPublic(pub String);
 
 /// What fetching a download read: its content's sha256 (hex) and size.
 #[derive(Debug)]
@@ -2600,10 +2630,14 @@ mod tests {
         let dev = GitPolicy { allow_local: true };
         let at = |p: &str| format!("http://127.0.0.1:{port}/{p}");
         use cactup_ecosystem_common::probe::Outcome;
-        assert_eq!(probe_anonymous(dev, &at("public/y.git")).await.0, Outcome::Answer);
-        assert!(matches!(probe_anonymous(dev, &at("private/y")).await, (Outcome::Other, Some(w)) if w.contains("401")));
-        assert!(matches!(probe_anonymous(dev, &at("page")).await, (Outcome::Other, Some(w)) if w.contains("200")));
-        assert_eq!(probe_anonymous(dev, &at("old/y")).await.0, Outcome::Redirect(Some(at("new/y"))));
+        assert!(matches!(probe_anonymous(dev, &at("public/y.git")).await, Probed::Done(Outcome::Answer, _)));
+        assert!(matches!(probe_anonymous(dev, &at("private/y")).await, Probed::Done(Outcome::Other, Some(w)) if w.contains("401")));
+        assert!(matches!(probe_anonymous(dev, &at("page")).await, Probed::Done(Outcome::Other, Some(w)) if w.contains("200")));
+        assert!(matches!(probe_anonymous(dev, &at("old/y")).await, Probed::Done(Outcome::Redirect(Some(to)), _) if to == at("new/y")));
+        // Nothing listening: unreachable, not "private". A private address, outside development.
+        assert!(matches!(probe_anonymous(dev, "http://127.0.0.1:9/x").await, Probed::Unreachable(_)));
+        let strict = GitPolicy { allow_local: false };
+        assert!(matches!(probe_anonymous(strict, "https://127.0.0.1/x").await, Probed::Private(h) if h == "127.0.0.1"));
         for req in seen.lock().unwrap().iter() {
             assert!(!req.to_ascii_lowercase().contains("authorization") && !req.to_ascii_lowercase().contains("cookie"), "{req}");
         }
@@ -2614,8 +2648,8 @@ mod tests {
         // The shared rule's refusals come first, each saying why (and never showing a token).
         let strict = GitPolicy { allow_local: false };
         for (url, says) in [
-            ("https://s3cret@github.com/x/y", "remove them"),
-            ("https://github.com/x/y?private_token=s3cret", "remove them"),
+            ("https://s3cret@github.com/x/y", "remove it"),
+            ("https://github.com/x/y?private_token=s3cret", "remove it"),
             ("/srv/repos/x", "local path"),
             ("s3://bucket/x", "not a URL others can fetch"),
             ("user@host.org:~user/x", "no https equivalent"),

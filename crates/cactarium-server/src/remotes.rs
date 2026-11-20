@@ -235,7 +235,7 @@ mod tests {
         let ssh = remote_problem("git@github.com:x/y.git", false).unwrap();
         assert!(ssh.contains("https://github.com/x/y.git") && ssh.contains("instead"), "{ssh}");
         let tok = remote_problem("https://s3cret@github.com/x/y", false).unwrap();
-        assert!(!tok.contains("s3cret") && tok.contains("remove them"), "{tok}");
+        assert!(!tok.contains("s3cret") && tok.contains("remove it"), "{tok}");
         assert!(remote_problem("https://github.com/x/y?private_token=s3cret", false).is_some());
     }
 

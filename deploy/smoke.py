@@ -2825,9 +2825,9 @@ check("in-progress is true exactly on not-read items still being read", not in_p
 # ---------------------------------------------------------------------------------------------
 # Shareable remotes: nothing published carries credentials or points where others can't fetch
 # (the shared rule `cactup sim export` applies too). Messages say why, and never show the token.
-for url, says in [("https://s3cret@github.com/x/y", "remove them"),
-                  ("https://github.com/x/y?private_token=s3cret", "remove them"),
-                  ("git@localhost:x/y.git", "doesn't answer without credentials"),
+for url, says in [("https://s3cret@github.com/x/y", "remove it"),
+                  ("https://github.com/x/y?private_token=s3cret", "remove it"),
+                  ("git@localhost:x/y.git", "its host couldn't be reached"),
                   ("s3://bucket/x", "not a URL others can fetch")]:
     s, r, _ = api("POST", "/repos", {"url": url, "dry-run": True}, BOB)
     msg = json.dumps(r)
@@ -2836,18 +2836,18 @@ _, sim_text, _ = anon.get("/api/v1/sims/max/qc0-demo/1.0.0/download")
 leaky = re.sub(r'(\[\[repo\]\][^\[]*?url = )"[^"]*"', r'\1"https://s3cret@github.com/max/qc0.git"', sim_text, count=1)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=9.9.9", raw=leaky.encode(), headers=MAXAUTH)
 check("a sim pinning a repo by a URL with a token is refused, the token not shown",
-      leaky != sim_text and s == 400 and "remove them" in body and "s3cret" not in body, f"{s} {body[:300]}")
+      leaky != sim_text and s == 400 and "remove it" in body and "s3cret" not in body, f"{s} {body[:300]}")
 s, r, _ = api("POST", "/repos", {"url": "https://localhost/me/private.git", "dry-run": True}, BOB)
-check("registering an https remote that doesn't answer a stranger is refused",
-      s == 400 and "doesn't answer git without credentials" in json.dumps(r), r)
+check("registering an https remote that can't be reached is refused, saying so",
+      s == 400 and "can't be checked: its host couldn't be reached" in json.dumps(r), r)
 silent = re.sub(r'(\[\[repo\]\][^\[]*?url = )"[^"]*"', r'\1"https://localhost/me/private.git"', sim_text, count=1)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=9.9.8", raw=silent.encode(), headers=MAXAUTH)
-check("a sim pinning a remote that doesn't answer a stranger is refused",
-      silent != sim_text and s == 400 and "doesn't answer git without credentials" in body, f"{s} {body[:300]}")
+check("a sim pinning a remote that can't be reached is refused, saying so",
+      silent != sim_text and s == 400 and "its host couldn't be reached" in body, f"{s} {body[:300]}")
 s, r, _ = api("POST", "/downloads", {"url": "https://u:s3cret@example.org/x.tgz", "sha256": "0" * 64}, BOB)
 check("a download with a password in its URL is refused", s == 400 and "s3cret" not in json.dumps(r), r)
 s, r, _ = api("POST", "/downloads", {"url": "https://gitlab.com/api/v4/x/archive?private_token=s3cret", "sha256": "0" * 64}, BOB)
-check("a download with a token in its query is refused", s == 400 and "token or signature" in json.dumps(r) and "s3cret" not in json.dumps(r), r)
+check("a download with a token in its query is refused", s == 400 and "private_token` in its query" in json.dumps(r) and "s3cret" not in json.dumps(r), r)
 ok, out = cli("check-urls")
 check("check-urls finds every stored URL publishable", ok and "every stored URL is publishable" in out, out[-500:])
 psql("INSERT INTO downloads (url, sha256) VALUES ('https://u:s3cret@example.org/leak.tgz', '" + "1" * 64 + "')")
