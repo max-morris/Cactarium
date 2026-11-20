@@ -2839,6 +2839,8 @@ check("a sim pinning a repo by a URL with a token is refused, the token not show
       leaky != sim_text and s == 400 and "remove them" in body and "s3cret" not in body, f"{s} {body[:300]}")
 s, r, _ = api("POST", "/downloads", {"url": "https://u:s3cret@example.org/x.tgz", "sha256": "0" * 64}, BOB)
 check("a download with a password in its URL is refused", s == 400 and "s3cret" not in json.dumps(r), r)
+s, r, _ = api("POST", "/downloads", {"url": "https://gitlab.com/api/v4/x/archive?private_token=s3cret", "sha256": "0" * 64}, BOB)
+check("a download with a token in its query is refused", s == 400 and "token or signature" in json.dumps(r) and "s3cret" not in json.dumps(r), r)
 ok, out = cli("check-urls")
 check("check-urls finds every stored URL publishable", ok and "every stored URL is publishable" in out, out[-500:])
 psql("INSERT INTO downloads (url, sha256) VALUES ('https://u:s3cret@example.org/leak.tgz', '" + "1" * 64 + "')")

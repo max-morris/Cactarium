@@ -24,30 +24,10 @@ pub struct GitPolicy {
     pub allow_local: bool,
 }
 
-/// Addresses the registry must never fetch from: anything not globally routable.
+/// Addresses the registry must never fetch from: anything not globally routable (the crate's
+/// list, which cactup's probe uses too).
 fn private(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => {
-            let o = v.octets();
-            v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast()
-                || v.is_multicast() || v.is_documentation()
-                || o[0] == 0                                   // 0/8
-                || o[0] == 100 && (o[1] & 0xc0) == 64          // 100.64/10, shared address space
-                || o[0] == 192 && o[1] == 0 && o[2] == 0       // 192.0.0/24, protocol assignments
-                || o[0] == 198 && (o[1] & 0xfe) == 18          // 198.18/15, benchmarking
-                || o[0] >= 240 // 240/4, reserved
-        }
-        IpAddr::V6(v) => {
-            let s = v.segments();
-            v.is_loopback() || v.is_unspecified() || v.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00                   // unique local
-                || (s[0] & 0xffc0) == 0xfe80                   // link local
-                || s[0] == 0x0064 && s[1] == 0xff9b            // 64:ff9b::/96 and /48, NAT64
-                || s[0] == 0x2001 && s[1] == 0x0db8            // documentation
-                || v.to_ipv4_mapped().is_some_and(|m| private(IpAddr::V4(m)))
-                || v.to_ipv4().is_some_and(|m| private(IpAddr::V4(m)))
-        }
-    }
+    !cactup_ecosystem_common::probe::is_public_address(ip)
 }
 
 /// A repo URL that passed the policy, and the address git must connect to.
@@ -66,85 +46,68 @@ pub struct Target {
 /// refused saying why; an ssh URL is replaced by its https equivalent when that answers with no
 /// credentials ([`probe_anonymous`]), and refused when it doesn't.
 pub async fn check_url(policy: GitPolicy, raw: &str) -> anyhow::Result<String> {
-    use cactup_ecosystem_common::url::{Shareability, moved_refusal, shareability};
+    use cactup_ecosystem_common::probe::{Step, next_step};
+    use cactup_ecosystem_common::url::{Shareability, shareability, unquote};
     let url = match shareability(raw) {
-        Shareability::Shareable => raw.trim().to_owned(),
-        Shareability::Local if policy.allow_local => raw.trim().to_owned(),
-        Shareability::Ssh { https: Some(https) } => match probe_anonymous(policy, &https).await {
-            Probe::Answers => https,
-            Probe::Moved(to) => bail!("{}", moved_refusal(raw, &https, to.as_deref())),
-            Probe::Silent(why) => {
-                let refusal = Shareability::Ssh { https: Some(https) }.refusal(raw).unwrap_or_default();
-                bail!("{refusal} ({why})")
+        Shareability::Shareable => unquote(raw).to_owned(),
+        Shareability::Local if policy.allow_local => unquote(raw).to_owned(),
+        // The crate decides what each probe means; this only asks (at most twice: once more at a
+        // redirect to the same repo, GitLab's `.git` form).
+        Shareability::Ssh { https: Some(https) } => {
+            let (mut asked, mut first) = (https, true);
+            loop {
+                let (outcome, why) = probe_anonymous(policy, &asked).await;
+                match next_step(raw, &asked, &outcome, first) {
+                    Step::Publish(u) => break u,
+                    Step::Probe(next) => (asked, first) = (next, false),
+                    Step::Refuse(m) => match why {
+                        Some(why) => bail!("{m} ({why})"),
+                        None => bail!("{m}"),
+                    },
+                }
             }
-        },
+        }
         s => bail!("{}", s.refusal(raw).unwrap_or_default()),
     };
     Ok(check(policy, &url).await?.url)
 }
 
-/// What asking a repo's https URL anonymously found ([`probe_anonymous`]).
-#[derive(Debug)]
-pub enum Probe {
-    /// It served git's ref advertisement to nobody in particular.
-    Answers,
-    /// It redirected (a renamed or transferred repo), to the URL given when there was one.
-    Moved(Option<String>),
-    /// Anything else: an authentication challenge, not found, not a git server, no connection.
-    Silent(String),
-}
-
-/// Asks `https` for git's smart-HTTP ref advertisement (`/info/refs?service=git-upload-pack`, what
-/// `git ls-remote` asks first) the way a stranger would: under the outbound-fetch policy, with no
-/// credentials of any kind (no helper, `.netrc`, cookie or extra header: a bare request), and
-/// following no redirect. A redirect is [`Probe::Moved`], with its location less the
-/// smart-HTTP suffix.
-pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> Probe {
+/// Asks `https` anonymously, by the crate's rules ([`cactup_ecosystem_common::probe`]): `GET` its
+/// [`probe_url`](cactup_ecosystem_common::probe::probe_url) under the outbound-fetch policy (a
+/// public address, pinned), with no credentials of any kind (no helper, `.netrc`, cookie or extra
+/// header: a bare request), a `git/` user agent, and no redirect followed. Returns the outcome and,
+/// for anything but an answer or a redirect, what happened (for the message).
+pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> (cactup_ecosystem_common::probe::Outcome, Option<String>) {
+    use cactup_ecosystem_common::probe::Outcome;
     match probe_inner(policy, https).await {
-        Ok(p) => p,
-        Err(e) => Probe::Silent(format!("{e:#}")),
+        Ok(r) => r,
+        Err(e) => (Outcome::Other, Some(format!("{e:#}"))),
     }
 }
 
-async fn probe_inner(policy: GitPolicy, https: &str) -> anyhow::Result<Probe> {
-    const SUFFIX: &str = "/info/refs?service=git-upload-pack";
-    let base = url::Url::parse(https.trim().trim_end_matches('/')).with_context(|| format!("'{https}' is not a URL"))?;
-    let (base, address) = vet(policy, base, "repo URLs").await?;
-    let asked = url::Url::parse(&format!("{}{SUFFIX}", base.as_str().trim_end_matches('/')))?;
+async fn probe_inner(policy: GitPolicy, https: &str) -> anyhow::Result<(cactup_ecosystem_common::probe::Outcome, Option<String>)> {
+    use cactup_ecosystem_common::probe::{Outcome, USER_AGENT_PREFIX, is_answer, probe_url, redirect_target};
+    let asked = url::Url::parse(&probe_url(https)).with_context(|| format!("'{https}' is not a URL"))?;
+    let (asked, address) = vet(policy, asked, "repo URLs").await?;
     let mut client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(60))
-        .user_agent("git/2 (cactarium)");
+        .user_agent(format!("{USER_AGENT_PREFIX}2 (cactarium)"));
     if let Some((host, addr)) = &address {
         client = client.resolve(host, *addr);
     }
     let resp = client.build()?.get(asked.clone()).send().await?;
     let status = resp.status();
+    let header = |h| resp.headers().get(h).and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok());
     if status.is_redirection() {
-        let to = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|l| l.to_str().ok())
-            .and_then(|l| asked.join(l).ok())
-            .map(|u| {
-                let u = u.as_str();
-                u.split_once(SUFFIX).map_or(u, |(head, _)| head).to_owned()
-            });
-        return Ok(Probe::Moved(to));
+        let to = header(reqwest::header::LOCATION).and_then(|l| redirect_target(asked.as_str(), l));
+        return Ok((Outcome::Redirect(to), None));
     }
-    let advert = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|t| t.to_str().ok())
-        .is_some_and(|t| t.starts_with("application/x-git-upload-pack-advertisement"));
-    Ok(if status.is_success() && advert {
-        Probe::Answers
-    } else if status.is_success() {
-        Probe::Silent("it answered, but not as a git repo".into())
-    } else {
-        Probe::Silent(format!("it answered {status}"))
-    })
+    if is_answer(status.as_u16(), header(reqwest::header::CONTENT_TYPE)) {
+        return Ok((Outcome::Answer, None));
+    }
+    Ok((Outcome::Other, Some(format!("it answered {status}"))))
 }
 
 async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
@@ -2618,13 +2581,11 @@ mod tests {
         });
         let dev = GitPolicy { allow_local: true };
         let at = |p: &str| format!("http://127.0.0.1:{port}/{p}");
-        assert!(matches!(probe_anonymous(dev, &at("public/y.git")).await, Probe::Answers));
-        assert!(matches!(probe_anonymous(dev, &at("private/y")).await, Probe::Silent(w) if w.contains("401")));
-        assert!(matches!(probe_anonymous(dev, &at("page")).await, Probe::Silent(w) if w.contains("not as a git repo")));
-        match probe_anonymous(dev, &at("old/y")).await {
-            Probe::Moved(Some(to)) => assert_eq!(to, at("new/y")),
-            other => panic!("{other:?}"),
-        }
+        use cactup_ecosystem_common::probe::Outcome;
+        assert_eq!(probe_anonymous(dev, &at("public/y.git")).await.0, Outcome::Answer);
+        assert!(matches!(probe_anonymous(dev, &at("private/y")).await, (Outcome::Other, Some(w)) if w.contains("401")));
+        assert!(matches!(probe_anonymous(dev, &at("page")).await, (Outcome::Other, Some(w)) if w.contains("200")));
+        assert_eq!(probe_anonymous(dev, &at("old/y")).await.0, Outcome::Redirect(Some(at("new/y"))));
         for req in seen.lock().unwrap().iter() {
             assert!(!req.to_ascii_lowercase().contains("authorization") && !req.to_ascii_lowercase().contains("cookie"), "{req}");
         }

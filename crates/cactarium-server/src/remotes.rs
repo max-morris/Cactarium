@@ -6,7 +6,7 @@
 //! checked here.
 
 use cactup_ecosystem_common::crl::{self, ComponentType};
-use cactup_ecosystem_common::url::{Redacted, Shareability, shareability};
+use cactup_ecosystem_common::url::{Redacted, Shareability, download_shareability, shareability};
 
 /// What is wrong with a git remote written in published content, if anything: the shared rule,
 /// except that an ssh URL is refused even when its https equivalent answers, since the Cactarium
@@ -25,34 +25,36 @@ pub fn remote_problem(url: &str, allow_local: bool) -> Option<String> {
     }
 }
 
-/// What is wrong with a URL that may name something other than a git remote others fetch (a
-/// download, an input, a thornlist's `!AUTH_URL` for people with access): only credentials. A
-/// download's query string is common and allowed; a user name or password is not.
+/// What is wrong with a URL that names a file to download (a tarball component, a sim's input, a
+/// `.sim` pin by sha256, a submitted download), if anything: the crate's rule for downloads
+/// ([`download_shareability`]), the same one `cactup sim export` applies. A query string is fine
+/// unless a key looks like a credential (`private_token`, `X-Amz-Signature`, …). Local paths pass
+/// when local repos are allowed (development and tests).
+pub fn download_problem(url: &str, allow_local: bool) -> Option<String> {
+    match download_shareability(url) {
+        Shareability::Local if allow_local => None,
+        s => s.download_refusal(url),
+    }
+}
+
+/// What is wrong with a URL meant for people with access (a thornlist's `!AUTH_URL`, often ssh) or
+/// only informational (a `[[stack.pin]] url`): only credentials in it, by the shared rule.
 pub fn credentials_problem(url: &str) -> Option<String> {
-    let leaks = match url::Url::parse(url.trim()) {
-        Ok(u) if url.contains("://") => !u.username().is_empty() || u.password().is_some(),
-        // An scp-like ssh address (`git:pw@host:x` parses as a `git:` URL with a path) or nothing
-        // the parser takes: the shared rule decides.
-        _ => shareability(url) == Shareability::Credentials,
-    };
-    leaks.then(|| {
-        format!(
-            "{} carries credentials (a user name or password), which must never be published; \
-             remove them from the URL",
-            Redacted(url)
-        )
-    })
+    match shareability(url) {
+        s @ Shareability::Credentials => s.refusal(url),
+        _ => None,
+    }
 }
 
 /// What is wrong with the URL of one thornlist component, labeled by its repo: a git remote by
-/// [`remote_problem`], a download by [`credentials_problem`], and any `!AUTH_URL` by
+/// [`remote_problem`], a download by [`download_problem`], and any `!AUTH_URL` by
 /// [`credentials_problem`] (an ssh one is fine there: it's for people with access).
 pub fn component_problems(c: &crl::Component, allow_local: bool, out: &mut Vec<String>) {
     let label = |p: String| format!("repo '{}': {p}", c.repo);
     match (&c.ty, c.url.as_deref().filter(|u| !u.trim().is_empty())) {
         (ComponentType::Git, Some(u)) => out.extend(remote_problem(u, allow_local).map(label)),
         (ComponentType::Http | ComponentType::Https | ComponentType::Ftp, Some(u)) => {
-            out.extend(credentials_problem(u).map(label))
+            out.extend(download_problem(u, allow_local).map(label))
         }
         _ => {}
     }
@@ -83,7 +85,7 @@ pub async fn stored_problems(db: &sqlx::PgPool, allow_local: bool) -> anyhow::Re
     .fetch_all(db)
     .await?;
     for (owner, name, version, sim, repo, url, git) in pins {
-        let problem = if git { remote_problem(&url, allow_local) } else { credentials_problem(&url) };
+        let problem = if git { remote_problem(&url, allow_local) } else { download_problem(&url, allow_local) };
         let at = if sim.is_empty() { format!("{owner}/{name}@{version}") } else { format!("{owner}/{name}/{sim}@{version}") };
         out.extend(problem.map(|e| format!("{at}: pin '{repo}': {e}")));
     }
@@ -110,13 +112,13 @@ pub async fn stored_problems(db: &sqlx::PgPool, allow_local: bool) -> anyhow::Re
         out.extend(thornlist_problems(&file.thornlist.text, allow_local).into_iter().map(|e| format!("{at}: thornlist: {e}")));
         for i in &file.inputs {
             if let Some(u) = &i.url {
-                out.extend(credentials_problem(u).map(|e| format!("{at}: input {}: {e}", i.knob)));
+                out.extend(download_problem(u, allow_local).map(|e| format!("{at}: input {}: {e}", i.knob)));
             }
         }
     }
     let downloads: Vec<(String, String)> = sqlx::query_as("SELECT url, review FROM downloads ORDER BY url").fetch_all(db).await?;
     for (url, review) in downloads {
-        out.extend(credentials_problem(&url).map(|e| format!("download ({review}): {e}")));
+        out.extend(download_problem(&url, allow_local).map(|e| format!("download ({review}): {e}")));
     }
     let mut seen = std::collections::BTreeSet::new();
     out.retain(|l| seen.insert(l.clone()));
@@ -152,11 +154,17 @@ mod tests {
 
     #[test]
     fn downloads_and_auth_urls() {
-        assert_eq!(credentials_problem("https://zenodo.org/records/1/files/x.h5?download=1"), None);
-        assert_eq!(credentials_problem("git@github.com:x/y"), None, "an ssh user name");
-        assert!(credentials_problem("https://u:s3cret@host/x.tgz").is_some_and(|p| !p.contains("s3cret")));
-        assert!(credentials_problem("https://s3cret@host/x.tgz").is_some());
+        assert_eq!(download_problem("https://zenodo.org/records/1/files/x.h5?download=1", false), None);
+        assert!(download_problem("https://u:s3cret@host/x.tgz", false).is_some_and(|p| !p.contains("s3cret")));
+        assert!(download_problem("https://host/x?private_token=s3cret", false).is_some_and(|p| !p.contains("s3cret")));
+        assert!(download_problem("https://b.s3.amazonaws.com/x?X-Amz-Signature=s3cret", false).is_some());
+        assert!(download_problem("svn+ssh://host/x", false).is_some());
+        assert_eq!(download_problem("/data/x.h5", true), None, "development");
+        assert!(download_problem("/data/x.h5", false).is_some());
+        // An !AUTH_URL: an ssh user name is fine, a password or token isn't.
+        assert_eq!(credentials_problem("git@github.com:x/y"), None);
         assert!(credentials_problem("git:s3cret@host:x").is_some());
-        assert!(credentials_problem("ftp://anon:pw@host/x").is_some());
+        assert!(credentials_problem("https://s3cret@host/x").is_some());
     }
+
 }

@@ -251,7 +251,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     for pin in &sim.repos {
         let problem = match pin.commit {
             Some(_) => crate::remotes::remote_problem(&pin.url, policy.allow_local),
-            None => crate::remotes::credentials_problem(&pin.url),
+            None => crate::remotes::download_problem(&pin.url, policy.allow_local),
         };
         if let Some(e) = problem {
             urls.push(format!("[[repo]] '{}': {e}", pin.name));
@@ -260,7 +260,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     }
     for i in &sim.inputs {
         if let Some(u) = &i.url
-            && let Some(e) = crate::remotes::credentials_problem(u)
+            && let Some(e) = crate::remotes::download_problem(u, policy.allow_local)
         {
             urls.push(format!("input {}: {e}", i.knob));
             refused.insert(u);
