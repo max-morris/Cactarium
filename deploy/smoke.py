@@ -2837,6 +2837,13 @@ leaky = re.sub(r'(\[\[repo\]\][^\[]*?url = )"[^"]*"', r'\1"https://s3cret@github
 s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=9.9.9", raw=leaky.encode(), headers=MAXAUTH)
 check("a sim pinning a repo by a URL with a token is refused, the token not shown",
       leaky != sim_text and s == 400 and "remove them" in body and "s3cret" not in body, f"{s} {body[:300]}")
+s, r, _ = api("POST", "/repos", {"url": "https://localhost/me/private.git", "dry-run": True}, BOB)
+check("registering an https remote that doesn't answer a stranger is refused",
+      s == 400 and "doesn't answer git without credentials" in json.dumps(r), r)
+silent = re.sub(r'(\[\[repo\]\][^\[]*?url = )"[^"]*"', r'\1"https://localhost/me/private.git"', sim_text, count=1)
+s, body, _ = anon.req("POST", "/api/v1/sims/max/qc0-demo?version=9.9.8", raw=silent.encode(), headers=MAXAUTH)
+check("a sim pinning a remote that doesn't answer a stranger is refused",
+      silent != sim_text and s == 400 and "doesn't answer git without credentials" in body, f"{s} {body[:300]}")
 s, r, _ = api("POST", "/downloads", {"url": "https://u:s3cret@example.org/x.tgz", "sha256": "0" * 64}, BOB)
 check("a download with a password in its URL is refused", s == 400 and "s3cret" not in json.dumps(r), r)
 s, r, _ = api("POST", "/downloads", {"url": "https://gitlab.com/api/v4/x/archive?private_token=s3cret", "sha256": "0" * 64}, BOB)

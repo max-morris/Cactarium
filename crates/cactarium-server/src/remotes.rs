@@ -46,6 +46,56 @@ pub fn credentials_problem(url: &str) -> Option<String> {
     }
 }
 
+/// How long a probe's verdict on a remote is reused: an answer for an hour (a stack of ~80 repos is
+/// resolved on every tip read), no answer for two minutes (the author may be fixing it now).
+const ANSWERED_FOR: std::time::Duration = std::time::Duration::from_secs(3600);
+const UNANSWERED_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+/// Probes running at once for one call of [`unanswered`].
+const PROBES_AT_ONCE: usize = 8;
+
+type Verdicts = std::collections::HashMap<String, (std::time::Instant, Option<String>)>;
+static VERDICTS: std::sync::LazyLock<std::sync::Mutex<Verdicts>> = std::sync::LazyLock::new(Default::default);
+
+/// Every git remote in `urls` (each already fine by its form, [`remote_problem`]) that doesn't
+/// answer the anonymous probe ([`crate::git::publishable_remote`]), as `(url, why)`, in the order
+/// given and once each. Local paths (development) aren't probed. Verdicts are reused for a while.
+pub async fn unanswered(policy: crate::git::GitPolicy, urls: &[String]) -> Vec<(String, String)> {
+    let mut wanted: Vec<String> = Vec::new();
+    for u in urls {
+        let u = u.trim().to_owned();
+        if !u.is_empty() && !wanted.contains(&u) && shareability(&u) != Shareability::Local {
+            wanted.push(u);
+        }
+    }
+    let now = std::time::Instant::now();
+    let cached = |u: &String| {
+        let v = VERDICTS.lock().unwrap();
+        v.get(u).and_then(|(at, why)| {
+            let fresh = now.duration_since(*at) < if why.is_none() { ANSWERED_FOR } else { UNANSWERED_FOR };
+            fresh.then(|| why.clone())
+        })
+    };
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(PROBES_AT_ONCE));
+    let mut set = tokio::task::JoinSet::new();
+    let mut verdicts: Vec<Option<Option<String>>> = wanted.iter().map(cached).collect();
+    for (i, u) in wanted.iter().enumerate().filter(|(i, _)| verdicts[*i].is_none()) {
+        let (u, gate) = (u.clone(), gate.clone());
+        set.spawn(async move {
+            let _permit = gate.acquire_owned().await;
+            (i, crate::git::publishable_remote(policy, &u).await.err())
+        });
+    }
+    while let Some(Ok((i, why))) = set.join_next().await {
+        VERDICTS.lock().unwrap().insert(wanted[i].clone(), (std::time::Instant::now(), why.clone()));
+        verdicts[i] = Some(why);
+    }
+    wanted
+        .into_iter()
+        .zip(verdicts)
+        .filter_map(|(u, v)| v.flatten().map(|why| (u, why)))
+        .collect()
+}
+
 /// What is wrong with the URL of one thornlist component, labeled by its repo: a git remote by
 /// [`remote_problem`], a download by [`download_problem`], and any `!AUTH_URL` by
 /// [`credentials_problem`] (an ssh one is fine there: it's for people with access).
@@ -139,6 +189,43 @@ fn thornlist_problems(text: &str, allow_local: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every remote is probed (a local path isn't, in development), each once, and a private one
+    /// is reported with the https wording.
+    #[tokio::test]
+    async fn remotes_are_probed() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = if buf[..n].starts_with(b"GET /public.git/info/refs") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
+                };
+                s.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let dev = crate::git::GitPolicy { allow_local: true };
+        let public = format!("http://127.0.0.1:{port}/public.git");
+        let private = format!("http://127.0.0.1:{port}/private.git");
+        let urls = vec![public.clone(), private.clone(), "/srv/local".to_owned(), private.clone()];
+        let silent = unanswered(dev, &urls).await;
+        assert_eq!(silent.len(), 1, "{silent:?}");
+        assert_eq!(silent[0].0, private);
+        assert!(silent[0].1.contains("doesn't answer git without credentials"), "{}", silent[0].1);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "each remote once; no local path");
+        // Asked again: the verdicts are reused.
+        assert_eq!(unanswered(dev, &urls).await.len(), 1);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn remotes_in_content() {

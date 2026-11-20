@@ -242,6 +242,18 @@ pub async fn resolve(
     if !url_problems.is_empty() {
         return Err(AppError::bad(format!("the stack publishes URLs it can't: {}", url_problems.join("; "))));
     }
+    // Every git remote must answer a stranger. Not a fact about the definition (the repo may be
+    // made public, the host may be down): a tag waits, a person is told ([`for_a_person`]).
+    let remotes: Vec<String> = merged
+        .iter()
+        .filter(|c| c.ty == ComponentType::Git)
+        .filter_map(|c| c.url.clone())
+        .collect();
+    let silent = crate::remotes::unanswered(policy, &remotes).await;
+    if !silent.is_empty() {
+        let why: Vec<String> = silent.into_iter().map(|(_, why)| why).collect();
+        return Err(AppError::Upstream(format!("the stack publishes remotes others can't fetch: {}", why.join("; "))));
+    }
 
     if tip == Some(Tip::Master) {
         for c in merged.iter_mut() {

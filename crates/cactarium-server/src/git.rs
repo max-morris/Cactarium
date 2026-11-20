@@ -46,30 +46,37 @@ pub struct Target {
 /// refused saying why; an ssh URL is replaced by its https equivalent when that answers with no
 /// credentials ([`probe_anonymous`]), and refused when it doesn't.
 pub async fn check_url(policy: GitPolicy, raw: &str) -> anyhow::Result<String> {
-    use cactup_ecosystem_common::probe::{Step, next_step};
-    use cactup_ecosystem_common::url::{Shareability, shareability, unquote};
-    let url = match shareability(raw) {
-        Shareability::Shareable => unquote(raw).to_owned(),
-        Shareability::Local if policy.allow_local => unquote(raw).to_owned(),
-        // The crate decides what each probe means; this only asks (at most twice: once more at a
-        // redirect to the same repo, GitLab's `.git` form).
-        Shareability::Ssh { https: Some(https) } => {
-            let (mut asked, mut first) = (https, true);
-            loop {
-                let (outcome, why) = probe_anonymous(policy, &asked).await;
-                match next_step(raw, &asked, &outcome, first) {
-                    Step::Publish(u) => break u,
-                    Step::Probe(next) => (asked, first) = (next, false),
-                    Step::Refuse(m) => match why {
-                        Some(why) => bail!("{m} ({why})"),
-                        None => bail!("{m}"),
-                    },
-                }
-            }
-        }
-        s => bail!("{}", s.refusal(raw).unwrap_or_default()),
-    };
+    let url = publishable_remote(policy, raw).await.map_err(|m| anyhow!(m))?;
     Ok(check(policy, &url).await?.url)
+}
+
+/// Whether the git remote `raw` may be published, by the crate's rules (the same ones `cactup sim
+/// export` applies): `Ok` with the URL to publish (`raw` itself, or an ssh URL's https equivalent)
+/// once it answers the anonymous probe ([`probe_anonymous`]), `Err` with the message saying why not.
+/// Every remote is probed; the crate decides what each probe means and whether to ask once more (a
+/// redirect to the same repo, GitLab's `.git` form). A local path passes unprobed in development.
+pub async fn publishable_remote(policy: GitPolicy, raw: &str) -> Result<String, String> {
+    use cactup_ecosystem_common::probe::{Start, Step, next_step, start};
+    use cactup_ecosystem_common::url::{Shareability, shareability, unquote};
+    let candidate = match start(raw) {
+        Start::Probe { candidate } => candidate,
+        Start::Refuse(_) if policy.allow_local && shareability(raw) == Shareability::Local => {
+            return Ok(unquote(raw).to_owned());
+        }
+        Start::Refuse(m) => return Err(m),
+    };
+    let mut asked = candidate.clone();
+    loop {
+        let (outcome, why) = probe_anonymous(policy, &asked).await;
+        match next_step(raw, &candidate, &asked, &outcome) {
+            Step::Publish(u) => return Ok(u),
+            Step::Probe(next) => asked = next,
+            Step::Refuse(m) => return Err(match why {
+                Some(why) => format!("{m} ({why})"),
+                None => m,
+            }),
+        }
+    }
 }
 
 /// Asks `https` anonymously, by the crate's rules ([`cactup_ecosystem_common::probe`]): `GET` its
@@ -88,7 +95,8 @@ pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> (cactup_ecosyste
 async fn probe_inner(policy: GitPolicy, https: &str) -> anyhow::Result<(cactup_ecosystem_common::probe::Outcome, Option<String>)> {
     use cactup_ecosystem_common::probe::{Outcome, USER_AGENT_PREFIX, is_answer, probe_url, redirect_target};
     let asked = url::Url::parse(&probe_url(https)).with_context(|| format!("'{https}' is not a URL"))?;
-    let (asked, address) = vet(policy, asked, "repo URLs").await?;
+    // http as well as https (a remote may be published as http), public addresses only.
+    let (asked, address) = vet_with(policy, asked, "repo URLs", true).await?;
     let mut client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
@@ -135,12 +143,22 @@ async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
 /// allowed, the host (without brackets) and the checked address to connect to, so the fetch can't
 /// be sent elsewhere by a second lookup (DNS rebinding). `what` names the URLs in messages.
 async fn vet(policy: GitPolicy, url: url::Url, what: &str) -> anyhow::Result<(url::Url, Option<(String, std::net::SocketAddr)>)> {
+    vet_with(policy, url, what, policy.allow_local).await
+}
+
+/// [`vet`], taking http as well as https when `http` is set (the anonymous probe).
+async fn vet_with(
+    policy: GitPolicy,
+    url: url::Url,
+    what: &str,
+    http: bool,
+) -> anyhow::Result<(url::Url, Option<(String, std::net::SocketAddr)>)> {
     if !url.username().is_empty() || url.password().is_some() {
         bail!("{what} must not contain credentials");
     }
     match url.scheme() {
         "https" => {}
-        "http" if policy.allow_local => {}
+        "http" if http => {}
         _ => bail!("{what} must be https://"),
     }
     let host = url.host_str().ok_or_else(|| anyhow!("'{url}' has no host"))?.to_owned();
