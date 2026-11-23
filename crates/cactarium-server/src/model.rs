@@ -118,7 +118,7 @@ pub fn frozen_at<'a>(versions: &'a [Version], commit: &str) -> Option<&'a Versio
 
 /// The label a pin at `commit` of the package `owner/name` carries (`RepoPin::cactarium`):
 /// `owner/name@<version>` when an approved, valid version froze the commit ([`frozen_at`] among
-/// them), else none. Never `owner/name#<sha>`: older CactUp can't read one, and the pin's commit
+/// them), else none. Never `owner/name#<sha>`: older Cactup can't read one, and the pin's commit
 /// already says it.
 pub async fn pin_label(
     db: &mut sqlx::PgConnection,
@@ -139,7 +139,7 @@ pub async fn pin_label(
 
 /// Labels each git pin of `pins` with the version of its package that froze its commit
 /// ([`pin_label`]), matching repos as a sim's pins are matched ([`find_repo`] among public
-/// packages). A label the pin carries is replaced by the derived one; one the Cactarium can't
+/// packages). A label the pin carries is replaced by the derived one; one that Cactarium can't
 /// confirm is dropped, except a bare `owner/name` naming the package matched. Downloads (sha256
 /// pins) carry none. Returns whether anything changed.
 pub async fn label_pins(db: &mut sqlx::PgConnection, pins: &mut [cactup_ecosystem_common::sim::RepoPin]) -> AppResult<bool> {
@@ -289,7 +289,7 @@ pub fn latest_on<'a>(versions: &'a [Version], track: &str) -> Option<&'a Version
     on.iter().find(|v| v.usable()).or(on.first()).copied()
 }
 
-/// The key two repo URLs are compared by, the one CactUp compares with too (the crate's
+/// The key by which two repo URLs are compared, the one that Cactup compares with too (the crate's
 /// `url::normalize_repo_url`): what `source_pins.url_norm` stores.
 pub fn repo_key(url: &str) -> String {
     cactup_ecosystem_common::url::normalize_repo_url(url)

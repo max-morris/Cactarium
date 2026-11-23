@@ -1,4 +1,4 @@
-# The Cactarium. `just` lists the recipes.
+# Cactarium. `just` lists the recipes.
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Docker as you are allowed to run it: directly when you can reach the daemon (the docker group,
@@ -16,7 +16,7 @@ dev:
     grep -q '^DEMO_REPOS=' deploy/.env || echo "DEMO_REPOS=$PWD/deploy/demo/repos" >> deploy/.env
     mkdir -p deploy/demo/repos deploy/demo/files
     {{devc}} up -d --build
-    @echo "The Cactarium is at http://localhost:$(grep -E '^PORT=' deploy/.env | cut -d= -f2 || echo 8000)"
+    @echo "Cactarium is at http://localhost:$(grep -E '^PORT=' deploy/.env | cut -d= -f2 || echo 8000)"
 
 # Fill the local site with demo repos, stacks, a sim, a pending review and a moved tag
 dev-seed:

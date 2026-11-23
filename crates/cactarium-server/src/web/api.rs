@@ -64,7 +64,7 @@ impl FromRequestParts<AppState> for TokenUser {
 }
 
 /// What awaits review this request may see. It must say `x-cactarium-include-unreviewed: true`
-/// ([`INCLUDE_UNREVIEWED_HEADER`], which CactUp sends for `--risky-allow-untrusted-artifacts`).
+/// ([`INCLUDE_UNREVIEWED_HEADER`], which Cactup sends for `--risky-allow-untrusted-artifacts`).
 /// Then an admin's token reaches releases awaiting review and entries awaiting their first review;
 /// anyone else reaches releases awaiting review of public entries when the site serves unreviewed
 /// code (the `untrusted-tips` setting is `allow`). Otherwise it is an ordinary request.
@@ -395,7 +395,7 @@ pub async fn resolve(
 async fn third_segment(state: &AppState, e: &Entry, slug: &Slug, reviewer: &Reviewer) -> ApiResult<Option<String>> {
     if e.kind != "sim" {
         // Worded apart from older servers' "is not a Cactarium reference: ... is not a thorn
-        // name", which CactUp reads as a server that predates multi-sim entries.
+        // name", which Cactup reads as a server that predates multi-sim entries.
         if let (Err(_), Some(x)) = (slug.as_thorn(), &slug.thorn) {
             return Err(AppError::bad(format!(
                 "{} is a {}, not a sim entry: a third segment names one of its thorns, and '{x}' can't be a thorn's",

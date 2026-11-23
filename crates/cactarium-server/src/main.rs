@@ -1,4 +1,4 @@
-//! The Cactarium: a registry of thorn packages, stacks and sim files for the Cactup ecosystem.
+//! Cactarium: a registry of thorn packages, stacks and sim files for the Cactup ecosystem.
 
 // Database rows are read as tuples; naming each one would add nothing.
 #![allow(clippy::type_complexity)]
@@ -71,7 +71,7 @@ enum Command {
         #[arg(long = "only")]
         only: Vec<String>,
     },
-    /// List every stored URL the Cactarium would refuse now (credentials, ssh, local paths, other
+    /// List every stored URL that Cactarium would refuse now (credentials, ssh, local paths, other
     /// schemes): repos, pins and thornlists of stack releases and sims, sims' inputs, downloads.
     /// Read-only. Exits 1 when it lists any.
     CheckUrls,
@@ -334,7 +334,7 @@ async fn main() -> anyhow::Result<()> {
             if found.is_empty() {
                 println!("every stored URL is publishable");
             } else {
-                println!("{} stored URLs the Cactarium would refuse now", found.len());
+                println!("{} stored URLs that Cactarium would refuse now", found.len());
                 std::process::exit(1);
             }
             Ok(())

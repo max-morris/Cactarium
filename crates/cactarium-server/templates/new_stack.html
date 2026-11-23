@@ -7,10 +7,10 @@
   <p class="lead">A stack is a versioned thornlist. Upload its definition here and name the version yourself, or publish it from a repo, where each release tag becomes a release. Either way, every release pins each repo to a commit and never changes. One stack uses one way, not both.</p>
   <p class="card small">From a repo, where each release tag becomes a release: commit <span class="mono">cactarium-stack.toml</span> (and its thornlist) at the repo root, listing your name or organization in <span class="mono">owners</span>, push a release tag such as <span class="mono">v1.0.0</span>, then <a href="/new/repo">register the repo</a>. See <a href="/docs/stacks">the stack reference</a>.</p>
   <h2 class="h-small">By upload</h2>
-  <p class="small muted">Give the definition directly. The Cactarium merges its sources, pins every repo (its pins first, then each branch's current commit) and freezes the result as the version you name.</p>
+  <p class="small muted">Give the definition directly. Cactarium merges its sources, pins every repo (its pins first, then each branch's current commit) and freezes the result as the version that you name.</p>
   {% else %}
   <h1>Upload a new release of <span class="mono">{{ release_of }}</span></h1>
-  <p class="lead">Filled in from its latest release. Change what you need and name the new version; the Cactarium pins every repo and freezes the result.</p>
+  <p class="lead">Filled in from its latest release. Change what you need and name the new version; Cactarium pins every repo and freezes the result.</p>
   {% endif %}
   {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
   <form class="stack" method="post" action="/new/stack">

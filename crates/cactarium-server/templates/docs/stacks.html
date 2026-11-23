@@ -98,7 +98,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
   <li>its base release's pin, if the repo still comes from where the base had it (the same URL and branch);</li>
   <li>the current head of the branch the thornlist names, or of the default branch if it names none.</li>
 </ol>
-<p>A download can't follow a branch, so pin it with a <code>sha256</code> in <code>[[stack.pin]]</code> unless a base release already pins it. Pinning by tag suits an Einstein Toolkit release, which tags each of its repos <code>ET_YYYY_MM_vN</code>. Without pins, a release takes the branch heads at the moment the Cactarium reads its tag, or at the moment of the upload.</p>
+<p>A download can't follow a branch, so pin it with a <code>sha256</code> in <code>[[stack.pin]]</code> unless a base release already pins it. Pinning by tag suits an Einstein Toolkit release, which tags each of its repos <code>ET_YYYY_MM_vN</code>. Without pins, a release takes the branch heads as they are when Cactarium reads its tag, or when the release is uploaded.</p>
 
 <h2 id="checks">Checks</h2>
 <p>A release is refused, with the reason, when:</p>
@@ -109,7 +109,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
   <li>the sources disagree on <code>ROOT</code>;</li>
   <li>a base release doesn't exist, isn't public, or isn't exact;</li>
   <li>a repo can't be pinned: a missing pin tag, an unreachable repo, or a download without a sha256;</li>
-  <li>a thorn the frozen thornlist builds (every source's, bases included) has a hard CCL requirement no thorn it builds meets, a header it can't compile without included: the check a sim passes (<a href="/docs/sims#checks">what it builds builds together</a>), with the same conservative reading of repos the Cactarium has no facts for. The refusal names the thorn, the requirement and the published thorn that would meet it.</li>
+  <li>a thorn built by the frozen thornlist (every source's, bases included) has a hard CCL requirement not met by any thorn that it builds (a header that it can't compile without included): the check that a sim passes (<a href="/docs/sims#checks">what it builds builds together</a>), with the same conservative reading of repos for which Cactarium has no facts. The refusal names the thorn, the requirement and the published thorn that would meet it.</li>
 </ul>
 
 <h2 id="frozen">The frozen thornlist</h2>
@@ -132,8 +132,8 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
 </ul>
 <p>Neither is a release, and neither can be a base. Two installs a day apart can differ. Since branch tips are never reviewed, a trusted stack (the entry or its owner is trusted, see <a href="/docs/review#trust">trust</a>) always serves them, and for any other stack the superadmin's site setting <em>Branch tips of untrusted stacks</em> decides:</p>
 <ul>
-  <li><strong>Refuse</strong> (the default): the Cactarium doesn't serve them at all.</li>
-  <li><strong>Allow</strong>: they are served, marked untrusted; CactUp warns and asks before installing.</li>
+  <li><strong>Refuse</strong> (the default): Cactarium doesn't serve them at all.</li>
+  <li><strong>Allow</strong>: they are served, marked untrusted; Cactup warns and asks before installing.</li>
 </ul>
 <p>The API marks these responses with the <code>x-cactarium-unpinned</code> and <code>x-cactarium-untrusted</code> headers (see <a href="/docs/api#headers">the API</a>).</p>
 {% endblock %}

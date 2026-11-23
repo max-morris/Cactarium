@@ -2,9 +2,9 @@
 //! build together. Each hard CCL requirement of each built thorn (what it inherits or befriends,
 //! the capabilities, thorns and functions it requires, the headers it includes outside any
 //! conditional) must be met by a thorn the thornlist builds, by the crate's rule (`ccl::needs_of`,
-//! `meets`, `counts`), shared with CactUp and with the package check in `deps.rs`.
+//! `meets`, `counts`), shared with Cactup and with the package check in `deps.rs`.
 //!
-//! What a built thorn needs comes from the facts the Cactarium stored for the package version
+//! What a built thorn needs comes from the facts stored by Cactarium for the package version
 //! that froze the commit its repo is pinned at. A header (`Need::Include`) counts only where some
 //! published thorn provides it (`ccl::counts`): one nothing provides compiles empty, which is how
 //! hooks work, so it never refuses anything. Nor does one whose provider is optional to the thorn
@@ -16,9 +16,9 @@
 //! check stays conservative about them, so that they never cause a refusal that may be false:
 //! their own needs aren't checked (nothing says what they are), and they are taken to meet every
 //! need they plausibly could. A thorn meets `Need::Thorn` by its name alone, so that is decided
-//! by the name. Anything else is plausible when some thorn of the same name the Cactarium knows
+//! by the name. Anything else is plausible when some thorn of the same name known to Cactarium
 //! (any version of any package; Cactus thorn names are global, so it is most likely the same
-//! thorn) meets it, or when the Cactarium knows no thorn of that name at all: then nothing can be
+//! thorn) meets it, or when Cactarium knows no thorn of that name at all: then nothing can be
 //! said about it, and it may meet anything.
 
 use std::collections::{BTreeMap, HashMap};
@@ -105,14 +105,14 @@ pub async fn counts(
     Ok(ccl::counts(needing, need, local.iter().copied().chain(&cache[&key])))
 }
 
-/// A thorn a thornlist builds, with what the Cactarium knows of it.
+/// A thorn built by a thornlist, with what Cactarium knows of it.
 #[derive(Clone, Debug)]
 pub struct Built {
     /// `Arrangement/Thorn`, as the thornlist checks it out.
     pub checkout: String,
     /// Its facts, when a package version froze the commit its repo is pinned at and publishes it.
     pub facts: Option<ThornFacts>,
-    /// For a thorn whose facts aren't known: the facts of every thorn of the same name the
+    /// For a thorn whose facts aren't known: the facts of every thorn of the same name
     /// Cactarium knows, which say what it plausibly meets ([`Built::may_meet`]).
     pub like: Vec<ThornFacts>,
 }
@@ -123,7 +123,7 @@ impl Built {
     }
 
     /// Whether this thorn, whose facts aren't known, could meet `need` (see the module's doc): a
-    /// thorn need by its name; anything else when a thorn of its name the Cactarium knows meets
+    /// thorn need by its name; anything else when a thorn of its name known to Cactarium meets
     /// it, or when it knows no thorn of that name at all.
     fn may_meet(&self, need: &Need) -> bool {
         match need {
@@ -175,7 +175,7 @@ pub fn said(checkout: &str, need: &Need, what: &str, providers: &[(String, Strin
     let named: Vec<String> = providers.iter().take(3).map(|(t, p)| format!("{t} ({p})")).collect();
     let more = providers.len().saturating_sub(named.len());
     let fix = match (named.as_slice(), more) {
-        ([], _) => format!("no package on the Cactarium provides it either: add a thorn that does, or drop {checkout}"),
+        ([], _) => format!("no package on Cactarium provides it either: add a thorn that does, or drop {checkout}"),
         ([one], _) => format!("{one} does: add it to the thornlist"),
         (some, 0) => format!("{} and {} do: add one of them to the thornlist", some[..some.len() - 1].join(", "), some[some.len() - 1]),
         (some, n) => format!("{}, and {n} more, do: add one of them to the thornlist", some.join(", ")),
@@ -240,7 +240,7 @@ pub async fn problems(state: &AppState, what: &str, thornlist: &str, pins: &[Rep
             like: Vec::new(),
         })
         .collect();
-    // What the thorns whose facts aren't known plausibly meet: every thorn of their name the
+    // What the thorns whose facts aren't known plausibly meet: every thorn of their name
     // Cactarium knows, in any version of any package.
     let unknown: Vec<String> = built.iter().filter(|b| b.facts.is_none()).map(|b| b.name().to_ascii_lowercase()).collect();
     if !unknown.is_empty() {
@@ -328,7 +328,7 @@ mod tests {
         // A download named like TwoPunctures, which a published version provides the header in.
         let built = [admbase.clone(), known("EinsteinInitialData/TwoPuncturesX", tpx()), unknown("Downloads/TwoPunctures", vec![tp])];
         assert!(unmet(&built).is_empty());
-        // One the Cactarium knows nothing of may be anything.
+        // One unknown to Cactarium may be anything.
         let built = [admbase.clone(), known("EinsteinInitialData/TwoPuncturesX", tpx()), unknown("Mine/Secret", vec![])];
         assert!(unmet(&built).is_empty());
         // One known by name that doesn't provide the header doesn't stand in for it.
@@ -414,7 +414,7 @@ mod tests {
             return;
         };
         let drop = std::env::var("CACTARIUM_TEST_DROP").ok();
-        // CactUp's trees link each thorn into arrangements/ from its repo: scanned where it is.
+        // Cactup's trees link each thorn into arrangements/ from its repo: scanned where it is.
         let arrangements = std::path::Path::new(&tree).join("arrangements");
         let mut all: HashMap<String, ThornFacts> = HashMap::new();
         for a in std::fs::read_dir(&arrangements).unwrap().flatten() {
@@ -468,6 +468,6 @@ mod tests {
         let s = said("A/B", &Need::Implementation("driver".into()), "the release", &drivers);
         assert!(s.contains("PUGH/PUGH (et/pugh), and 1 more, do"), "{s}");
         let s = said("A/B", &Need::Thorn("Helper".into()), "the sim", &[]);
-        assert_eq!(s, "A/B requires the thorn Helper, which the sim doesn't build; no package on the Cactarium provides it either: add a thorn that does, or drop A/B");
+        assert_eq!(s, "A/B requires the thorn Helper, which the sim doesn't build; no package on Cactarium provides it either: add a thorn that does, or drop A/B");
     }
 }

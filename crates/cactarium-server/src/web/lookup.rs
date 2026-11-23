@@ -1,4 +1,4 @@
-//! What the Cactarium knows of things named outside it: which package a pinned commit is
+//! What Cactarium knows of things named outside it: which package a pinned commit is
 //! (`POST /lookup`), whether a pinned download was reviewed, and which published thorns meet a CCL
 //! requirement (`GET /providers`). Anonymous reads, under the same review and visibility rules as
 //! every other read ([`Reviewer`]).

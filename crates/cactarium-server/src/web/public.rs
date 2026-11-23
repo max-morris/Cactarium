@@ -290,7 +290,7 @@ pub struct SourcesQ {
     url: String,
 }
 
-/// Everything that pins a repo, registered on the Cactarium or not.
+/// Everything that pins a repo, registered on Cactarium or not.
 pub async fn sources(
     State(state): State<AppState>,
     v: Visitor,

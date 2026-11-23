@@ -1,4 +1,4 @@
-/* The Cactarium's look. Every color, size and radius is a token here, so restyling is local. */
+/* Cactarium's look. Every color, size and radius is a token here, so restyling is local. */
 :root {
   --bg: #F7F4EC; --surface: #FFFFFF; --ink: #1E2A22; --muted: #56615A; --line: #E2DCCD;
   --accent: #2F6B47; --accent-ink: #FFFFFF; --accent-soft: #E3EEE6;

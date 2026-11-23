@@ -206,8 +206,8 @@ async fn review_view(state: &AppState, s: &SubFull, e: &Entry) -> AppResult<Revi
     }
     let checked: HashMap<String, bool> = serde_json::from_value(s.checklist.clone()).unwrap_or_default();
     let release = latest.filter(|_| s.version_id.is_some()).map(|v| v.label());
-    // How to try it: the CactUp command for this kind, reaching what awaits review with the admin's
-    // token (CactUp sends x-cactarium-include-unreviewed for --risky-allow-untrusted-artifacts).
+    // How to try it: the Cactup command for this kind, reaching what awaits review with the admin's
+    // token (Cactup sends x-cactarium-include-unreviewed for --risky-allow-untrusted-artifacts).
     let first_sim = match latest {
         Some(v) if e.kind == "sim" => model::sim_names(state, v.id).await?.into_iter().find(|n| !n.is_empty()),
         _ => None,

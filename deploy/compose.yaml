@@ -1,4 +1,4 @@
-# The Cactarium: the app and its Postgres. The app publishes only on loopback (BIND); in
+# Cactarium: the app and its Postgres. The app publishes only on loopback (BIND); in
 # production the host's Apache terminates TLS and proxies to it.
 name: cactarium
 
