@@ -6,7 +6,7 @@
 //! checked here.
 
 use cactup_ecosystem_common::crl::{self, ComponentType};
-use cactup_ecosystem_common::url::{Redacted, Shareability, shareability};
+use cactup_ecosystem_common::url::{Redacted, Shareability, download_shareability, shareability};
 
 /// What is wrong with a git remote written in published content, if anything: the shared rule,
 /// except that an ssh URL is refused even when its https equivalent answers, since the Cactarium
@@ -25,34 +25,86 @@ pub fn remote_problem(url: &str, allow_local: bool) -> Option<String> {
     }
 }
 
-/// What is wrong with a URL that may name something other than a git remote others fetch (a
-/// download, an input, a thornlist's `!AUTH_URL` for people with access): only credentials. A
-/// download's query string is common and allowed; a user name or password is not.
+/// What is wrong with a URL that names a file to download (a tarball component, a sim's input, a
+/// `.sim` pin by sha256, a submitted download), if anything: the crate's rule for downloads
+/// ([`download_shareability`]), the same one `cactup sim export` applies. A query string is fine
+/// unless a key looks like a credential (`private_token`, `X-Amz-Signature`, …). Local paths pass
+/// when local repos are allowed (development and tests).
+pub fn download_problem(url: &str, allow_local: bool) -> Option<String> {
+    match download_shareability(url) {
+        Shareability::Local if allow_local => None,
+        s => s.download_refusal(url),
+    }
+}
+
+/// What is wrong with a URL meant for people with access (a thornlist's `!AUTH_URL`, often ssh) or
+/// only informational (a `[[stack.pin]] url`): only credentials in it, by the shared rule.
 pub fn credentials_problem(url: &str) -> Option<String> {
-    let leaks = match url::Url::parse(url.trim()) {
-        Ok(u) if url.contains("://") => !u.username().is_empty() || u.password().is_some(),
-        // An scp-like ssh address (`git:pw@host:x` parses as a `git:` URL with a path) or nothing
-        // the parser takes: the shared rule decides.
-        _ => shareability(url) == Shareability::Credentials,
+    match shareability(url) {
+        s @ Shareability::Credentials => s.refusal(url),
+        _ => None,
+    }
+}
+
+/// How long a probe's verdict on a remote is reused: an answer for an hour (a stack of ~80 repos is
+/// resolved on every tip read), no answer for two minutes (the author may be fixing it now).
+const ANSWERED_FOR: std::time::Duration = std::time::Duration::from_secs(3600);
+const UNANSWERED_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+/// Probes running at once for one call of [`unanswered`].
+const PROBES_AT_ONCE: usize = 8;
+
+type Verdicts = std::collections::HashMap<String, (std::time::Instant, Option<String>)>;
+static VERDICTS: std::sync::LazyLock<std::sync::Mutex<Verdicts>> = std::sync::LazyLock::new(Default::default);
+
+/// Every git remote in `urls` (each already fine by its form, [`remote_problem`]) that doesn't
+/// answer the anonymous probe ([`crate::git::publishable_remote`]), as `(url, why)`, in the order
+/// given and once each. Local paths (development) aren't probed. Verdicts are reused for a while.
+pub async fn unanswered(policy: crate::git::GitPolicy, urls: &[String]) -> Vec<(String, String)> {
+    let mut wanted: Vec<String> = Vec::new();
+    for u in urls {
+        let u = u.trim().to_owned();
+        if !u.is_empty() && !wanted.contains(&u) && shareability(&u) != Shareability::Local {
+            wanted.push(u);
+        }
+    }
+    let now = std::time::Instant::now();
+    let cached = |u: &String| {
+        let v = VERDICTS.lock().unwrap();
+        v.get(u).and_then(|(at, why)| {
+            let fresh = now.duration_since(*at) < if why.is_none() { ANSWERED_FOR } else { UNANSWERED_FOR };
+            fresh.then(|| why.clone())
+        })
     };
-    leaks.then(|| {
-        format!(
-            "{} carries credentials (a user name or password), which must never be published; \
-             remove them from the URL",
-            Redacted(url)
-        )
-    })
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(PROBES_AT_ONCE));
+    let mut set = tokio::task::JoinSet::new();
+    let mut verdicts: Vec<Option<Option<String>>> = wanted.iter().map(cached).collect();
+    for (i, u) in wanted.iter().enumerate().filter(|(i, _)| verdicts[*i].is_none()) {
+        let (u, gate) = (u.clone(), gate.clone());
+        set.spawn(async move {
+            let _permit = gate.acquire_owned().await;
+            (i, crate::git::publishable_remote(policy, &u).await.err())
+        });
+    }
+    while let Some(Ok((i, why))) = set.join_next().await {
+        VERDICTS.lock().unwrap().insert(wanted[i].clone(), (std::time::Instant::now(), why.clone()));
+        verdicts[i] = Some(why);
+    }
+    wanted
+        .into_iter()
+        .zip(verdicts)
+        .filter_map(|(u, v)| v.flatten().map(|why| (u, why)))
+        .collect()
 }
 
 /// What is wrong with the URL of one thornlist component, labeled by its repo: a git remote by
-/// [`remote_problem`], a download by [`credentials_problem`], and any `!AUTH_URL` by
+/// [`remote_problem`], a download by [`download_problem`], and any `!AUTH_URL` by
 /// [`credentials_problem`] (an ssh one is fine there: it's for people with access).
 pub fn component_problems(c: &crl::Component, allow_local: bool, out: &mut Vec<String>) {
     let label = |p: String| format!("repo '{}': {p}", c.repo);
     match (&c.ty, c.url.as_deref().filter(|u| !u.trim().is_empty())) {
         (ComponentType::Git, Some(u)) => out.extend(remote_problem(u, allow_local).map(label)),
         (ComponentType::Http | ComponentType::Https | ComponentType::Ftp, Some(u)) => {
-            out.extend(credentials_problem(u).map(label))
+            out.extend(download_problem(u, allow_local).map(label))
         }
         _ => {}
     }
@@ -83,7 +135,7 @@ pub async fn stored_problems(db: &sqlx::PgPool, allow_local: bool) -> anyhow::Re
     .fetch_all(db)
     .await?;
     for (owner, name, version, sim, repo, url, git) in pins {
-        let problem = if git { remote_problem(&url, allow_local) } else { credentials_problem(&url) };
+        let problem = if git { remote_problem(&url, allow_local) } else { download_problem(&url, allow_local) };
         let at = if sim.is_empty() { format!("{owner}/{name}@{version}") } else { format!("{owner}/{name}/{sim}@{version}") };
         out.extend(problem.map(|e| format!("{at}: pin '{repo}': {e}")));
     }
@@ -110,13 +162,13 @@ pub async fn stored_problems(db: &sqlx::PgPool, allow_local: bool) -> anyhow::Re
         out.extend(thornlist_problems(&file.thornlist.text, allow_local).into_iter().map(|e| format!("{at}: thornlist: {e}")));
         for i in &file.inputs {
             if let Some(u) = &i.url {
-                out.extend(credentials_problem(u).map(|e| format!("{at}: input {}: {e}", i.knob)));
+                out.extend(download_problem(u, allow_local).map(|e| format!("{at}: input {}: {e}", i.knob)));
             }
         }
     }
     let downloads: Vec<(String, String)> = sqlx::query_as("SELECT url, review FROM downloads ORDER BY url").fetch_all(db).await?;
     for (url, review) in downloads {
-        out.extend(credentials_problem(&url).map(|e| format!("download ({review}): {e}")));
+        out.extend(download_problem(&url, allow_local).map(|e| format!("download ({review}): {e}")));
     }
     let mut seen = std::collections::BTreeSet::new();
     out.retain(|l| seen.insert(l.clone()));
@@ -138,6 +190,43 @@ fn thornlist_problems(text: &str, allow_local: bool) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Every remote is probed (a local path isn't, in development), each once, and a private one
+    /// is reported with the https wording.
+    #[tokio::test]
+    async fn remotes_are_probed() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = if buf[..n].starts_with(b"GET /public.git/info/refs") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
+                };
+                s.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let dev = crate::git::GitPolicy { allow_local: true };
+        let public = format!("http://127.0.0.1:{port}/public.git");
+        let private = format!("http://127.0.0.1:{port}/private.git");
+        let urls = vec![public.clone(), private.clone(), "/srv/local".to_owned(), private.clone()];
+        let silent = unanswered(dev, &urls).await;
+        assert_eq!(silent.len(), 1, "{silent:?}");
+        assert_eq!(silent[0].0, private);
+        assert!(silent[0].1.contains("doesn't answer git without credentials"), "{}", silent[0].1);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "each remote once; no local path");
+        // Asked again: the verdicts are reused.
+        assert_eq!(unanswered(dev, &urls).await.len(), 1);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn remotes_in_content() {
         assert_eq!(remote_problem("https://github.com/x/y", false), None);
@@ -146,17 +235,23 @@ mod tests {
         let ssh = remote_problem("git@github.com:x/y.git", false).unwrap();
         assert!(ssh.contains("https://github.com/x/y.git") && ssh.contains("instead"), "{ssh}");
         let tok = remote_problem("https://s3cret@github.com/x/y", false).unwrap();
-        assert!(!tok.contains("s3cret") && tok.contains("remove them"), "{tok}");
+        assert!(!tok.contains("s3cret") && tok.contains("remove it"), "{tok}");
         assert!(remote_problem("https://github.com/x/y?private_token=s3cret", false).is_some());
     }
 
     #[test]
     fn downloads_and_auth_urls() {
-        assert_eq!(credentials_problem("https://zenodo.org/records/1/files/x.h5?download=1"), None);
-        assert_eq!(credentials_problem("git@github.com:x/y"), None, "an ssh user name");
-        assert!(credentials_problem("https://u:s3cret@host/x.tgz").is_some_and(|p| !p.contains("s3cret")));
-        assert!(credentials_problem("https://s3cret@host/x.tgz").is_some());
+        assert_eq!(download_problem("https://zenodo.org/records/1/files/x.h5?download=1", false), None);
+        assert!(download_problem("https://u:s3cret@host/x.tgz", false).is_some_and(|p| !p.contains("s3cret")));
+        assert!(download_problem("https://host/x?private_token=s3cret", false).is_some_and(|p| !p.contains("s3cret")));
+        assert!(download_problem("https://b.s3.amazonaws.com/x?X-Amz-Signature=s3cret", false).is_some());
+        assert!(download_problem("svn+ssh://host/x", false).is_some());
+        assert_eq!(download_problem("/data/x.h5", true), None, "development");
+        assert!(download_problem("/data/x.h5", false).is_some());
+        // An !AUTH_URL: an ssh user name is fine, a password or token isn't.
+        assert_eq!(credentials_problem("git@github.com:x/y"), None);
         assert!(credentials_problem("git:s3cret@host:x").is_some());
-        assert!(credentials_problem("ftp://anon:pw@host/x").is_some());
+        assert!(credentials_problem("https://s3cret@host/x").is_some());
     }
+
 }

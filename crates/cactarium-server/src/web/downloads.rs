@@ -122,8 +122,9 @@ fn validate(url: &str, sha256: &str, note: Option<&str>) -> AppResult<()> {
         Ok(u) if matches!(u.scheme(), "https" | "http") && u.host_str().is_some() => {}
         _ => return Err(AppError::bad(format!("'{}' is no https:// URL", cactup_ecosystem_common::url::Redacted(url)))),
     }
-    // Approved downloads are published in sims: never with a user name or password in them.
-    if let Some(e) = crate::remotes::credentials_problem(url) {
+    // Approved downloads are published in sims: never with credentials in them (a user name, a
+    // password, a token or signature in the query), by the crate's rule for downloads.
+    if let Some(e) = crate::remotes::download_problem(url, true) {
         return Err(AppError::bad(e));
     }
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {

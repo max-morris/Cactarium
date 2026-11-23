@@ -251,7 +251,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     for pin in &sim.repos {
         let problem = match pin.commit {
             Some(_) => crate::remotes::remote_problem(&pin.url, policy.allow_local),
-            None => crate::remotes::credentials_problem(&pin.url),
+            None => crate::remotes::download_problem(&pin.url, policy.allow_local),
         };
         if let Some(e) = problem {
             urls.push(format!("[[repo]] '{}': {e}", pin.name));
@@ -260,7 +260,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     }
     for i in &sim.inputs {
         if let Some(u) = &i.url
-            && let Some(e) = crate::remotes::credentials_problem(u)
+            && let Some(e) = crate::remotes::download_problem(u, policy.allow_local)
         {
             urls.push(format!("input {}: {e}", i.knob));
             refused.insert(u);
@@ -268,6 +268,17 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     }
     let mut seen = BTreeSet::new();
     out.facts.extend(urls.into_iter().filter(|u| seen.insert(u.clone())));
+    // Every git remote (the thornlist's and the commit pins', fine by their form) must answer a
+    // stranger. The world can change that (the repo made public, the host back up).
+    let mut remotes: Vec<String> = sim.repos.iter().filter(|p| p.commit.is_some() && !refused.contains(p.url.as_str())).map(|p| p.url.clone()).collect();
+    if let Ok(list) = crl::parse(&sim.thornlist.text) {
+        remotes.extend(list.components().iter().filter(|c| c.ty == ComponentType::Git).filter_map(|c| c.url.clone()));
+    }
+    remotes.retain(|u| crate::remotes::remote_problem(u, policy.allow_local).is_none());
+    for (u, why) in crate::remotes::unanswered(policy, &remotes).await {
+        out.passing.push(why);
+        refused.insert(sim.repos.iter().find(|p| p.url.trim() == u).map_or("", |p| p.url.as_str()));
+    }
     // An input's download is pinned by its sha256 like a tarball component, and reviewed the same
     // way (one read from the sim's own repo, `repo-file`, is pinned by the commit instead).
     for i in sim.inputs.iter().filter(|i| !i.url.as_deref().is_some_and(|u| refused.contains(u))) {
