@@ -100,7 +100,7 @@ pub enum Probed {
 /// public address, pinned; http as well as https), with no credentials of any kind (no helper,
 /// `.netrc`, cookie or extra header: a bare request), a `git/` user agent, and no redirect followed.
 pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> Probed {
-    use cactup_ecosystem_common::probe::{Outcome, USER_AGENT_PREFIX, is_answer, probe_url, redirect_target};
+    use cactup_ecosystem_common::probe::{Outcome, USER_AGENT_PREFIX, outcome, probe_url};
     let asked = match url::Url::parse(&probe_url(https)) {
         Ok(u) => u,
         Err(e) => return Probed::Done(Outcome::Other, Some(format!("'{https}' is not a URL: {e}"))),
@@ -133,14 +133,11 @@ pub async fn probe_anonymous(policy: GitPolicy, https: &str) -> Probed {
     };
     let status = resp.status();
     let header = |h| resp.headers().get(h).and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok());
-    if status.is_redirection() {
-        let to = header(reqwest::header::LOCATION).and_then(|l| redirect_target(asked.as_str(), l));
-        return Probed::Done(Outcome::Redirect(to), None);
+    // The crate classifies the response; only an `Other` needs what it answered, for the message.
+    match outcome(asked.as_str(), status.as_u16(), header(reqwest::header::CONTENT_TYPE), header(reqwest::header::LOCATION)) {
+        Outcome::Other => Probed::Done(Outcome::Other, Some(format!("it answered {status}"))),
+        o => Probed::Done(o, None),
     }
-    if is_answer(status.as_u16(), header(reqwest::header::CONTENT_TYPE)) {
-        return Probed::Done(Outcome::Answer, None);
-    }
-    Probed::Done(Outcome::Other, Some(format!("it answered {status}")))
 }
 
 async fn check(policy: GitPolicy, raw: &str) -> anyhow::Result<Target> {
@@ -2618,6 +2615,8 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 0\r\n\r\n".to_owned()
                 } else if req.starts_with("GET /old/y/info/refs") {
                     format!("HTTP/1.1 301 Moved\r\nLocation: http://127.0.0.1:{port}/new/y/info/refs?service=git-upload-pack\r\nContent-Length: 0\r\n\r\n")
+                } else if req.starts_with("GET /busy/info/refs") {
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n".to_owned()
                 } else if req.starts_with("GET /page/info/refs") {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n".to_owned()
                 } else {
@@ -2633,6 +2632,7 @@ mod tests {
         assert!(matches!(probe_anonymous(dev, &at("public/y.git")).await, Probed::Done(Outcome::Answer, _)));
         assert!(matches!(probe_anonymous(dev, &at("private/y")).await, Probed::Done(Outcome::Other, Some(w)) if w.contains("401")));
         assert!(matches!(probe_anonymous(dev, &at("page")).await, Probed::Done(Outcome::Other, Some(w)) if w.contains("200")));
+        assert!(matches!(probe_anonymous(dev, &at("busy")).await, Probed::Done(Outcome::Busy(429), None)));
         assert!(matches!(probe_anonymous(dev, &at("old/y")).await, Probed::Done(Outcome::Redirect(Some(to)), _) if to == at("new/y")));
         // Nothing listening: unreachable, not "private". A private address, outside development.
         assert!(matches!(probe_anonymous(dev, "http://127.0.0.1:9/x").await, Probed::Unreachable(_)));
