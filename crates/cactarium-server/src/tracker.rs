@@ -963,13 +963,13 @@ pub fn nothing_to_add(p: &Preview) -> Option<String> {
         return None;
     }
     let list: Vec<String> = p.entries.iter().map(|e| format!("{} ({})", e.slug, e.file)).collect();
-    Some(format!("{} already has every entry its manifests give: {}; nothing to add", p.url, list.join(", ")))
+    Some(format!("{} already has every entry given by its manifests: {}; nothing to add", p.url, list.join(", ")))
 }
 
 /// The preview's mark on a release whose manifest file isn't on the default branch anymore.
 fn off_head_note(p: &Planned) -> String {
     if p.off_head {
-        format!("; {} isn't on the default branch (a kind the repo dropped? leave it unchecked, or use --only)", p.file)
+        format!("; {} isn't on the default branch (a kind dropped by the repo? leave it unchecked, or use --only)", p.file)
     } else {
         String::new()
     }
@@ -2661,8 +2661,8 @@ fn judge(entry: &Entry, file: &str, form: Option<&str>, tag: &str, own: &Read, s
             .iter()
             .find_map(|(id, slug, why, r)| {
                 let claims = match own {
-                    None => r.version(tag).map(|_| format!("the rule it follows ({}) reads {tag}", r.describe_with_since())),
-                    Some(own) => claimed_by(tag, own, r).map(|w| format!("by the rule it follows, {w}")),
+                    None => r.version(tag).map(|_| format!("the rule that it follows ({}) reads {tag}", r.describe_with_since())),
+                    Some(own) => claimed_by(tag, own, r).map(|w| format!("by the rule that it follows, {w}")),
                 };
                 claims.map(|c| (*id, format!("{why}, and {c}, so it is taken as {slug}'s")))
             })

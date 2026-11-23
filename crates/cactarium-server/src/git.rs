@@ -1166,7 +1166,7 @@ async fn update_mirror_in(
                     Ok(p) => p,
                     Err(e) => return Some(format!("updating the mirror failed: {e}")),
                 },
-                () = abandoned() => return Some("the preview this mirror was for went away".to_owned()),
+                () = abandoned() => return Some("the preview that this mirror was for went away".to_owned()),
             },
             Wait::Never => match slots.try_acquire() {
                 Ok(p) => p,
@@ -1196,7 +1196,7 @@ async fn update_mirror_in(
         };
         let result = tokio::select! {
             r = work => r,
-            () = abandoned() => Err(anyhow!("the preview this mirror was for went away")),
+            () = abandoned() => Err(anyhow!("the preview that this mirror was for went away")),
         };
         // A kept mirror just cloned has no file contents: warmed at its default branch's tip.
         if matches!(result, Ok(true)) && matches!(held, Mirrors::Shared) {

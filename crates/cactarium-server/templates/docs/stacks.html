@@ -1,7 +1,7 @@
 {% extends "docs/_layout.html" %}
 {% block doc %}
 <h1>Stacks: cactarium-stack.toml</h1>
-<p>A stack is a versioned thornlist. Each release pins every repo it checks out, a git repo to a commit and a download to its sha256, and then never changes, so installing the same release twice gives the same sources. The definition is a <code>cactarium-stack.toml</code>: in a repo, where each version tag cuts a release, or uploaded on the site, where you name each release yourself.</p>
+<p>A stack is a versioned thornlist. Each release pins every repo that it checks out, a git repo to a commit and a download to its sha256, and then never changes, so installing the same release twice gives the same sources. The definition is a <code>cactarium-stack.toml</code>: in a repo, where each version tag cuts a release, or uploaded on the site, where you name each release yourself.</p>
 <p>A repo that holds only a stack file and its thornlist is called a <em>manifest repo</em>. A stack file can also sit next to a package's <code>cactarium.toml</code> in the same repo.</p>
 
 <h2 id="shapes">Three shapes</h2>
@@ -50,7 +50,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
     <tr><td><code>contact</code></td><td>Where to go for help: an <code>https://</code> URL or a <code>mailto:</code> address. Default: the repo.</td></tr>
     <tr><td><code>thornlist</code></td><td>A CRL thornlist file, relative to the repo root. For a flat stack it is the whole list; with <code>extends</code>, its sections go on top of the bases and win over them. In an upload, paste the thornlist into its own box instead.</td></tr>
     <tr><td><code>extends</code></td><td>Base releases, highest priority first. Each is an exact release, <code>owner/stack@1.2.0</code> or <code>owner/stack@track:1.2.0</code>: not a range, not <code>@head</code>. A base must be public, or a stack of the same owner.</td></tr>
-    <tr><td><code>enable</code></td><td>Thorns to enable, as <code>Arrangement/Thorn</code>: a <code>#DISABLED</code> line in any source is uncommented, and a thorn a source only checks out (on its <code>!CHECKOUT</code> line) is built.</td></tr>
+    <tr><td><code>enable</code></td><td>Thorns to enable, as <code>Arrangement/Thorn</code>: a <code>#DISABLED</code> line in any source is uncommented, and a thorn that a source only checks out (on its <code>!CHECKOUT</code> line) is built.</td></tr>
     <tr><td><code>disable</code></td><td>Thorns to disable, as <code>Arrangement/Thorn</code>; they are written as <code>#DISABLED</code>. Some source must check the thorn out. A thorn can't be both enabled and disabled.</td></tr>
     <tr><td><code>pin-tag</code></td><td>Pin every git repo that has a tag of this name to that tag's commit, such as <code>"ET_2026_05_v0"</code>. See <a href="#pinning">the pin order</a>.</td></tr>
     <tr><td><code>tag-pattern</code>, <code>since</code></td><td>Which tags of a repo-backed stack cut releases, as for <a href="/docs/packages#package">packages</a> and explained under <a href="/docs/versions#tag-pattern">tag patterns</a>. In a repo that also carries a package, a stack without a pattern is released by the package's <code>vX.Y.Z</code> tags too; give it a pattern (<code>stack-v{major}.{minor}.{patch}</code>, never <code>stack/v…</code>) to release it on its own (<a href="/docs/publishing#tags">how tags become versions</a>).</td></tr>
@@ -60,7 +60,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
 </table></div>
 
 <h2 id="merging">How sources are merged</h2>
-<p>The sources, highest priority first, are the stack's own thornlist and then each base release in the order <code>extends</code> lists them. Components are merged by checkout location, and the first source to check out a location wins. Then <code>enable</code> and <code>disable</code> apply, then the overrides. All sources must agree on <code>ROOT</code>.</p>
+<p>The sources, highest priority first, are the stack's own thornlist and then each base release in the order that <code>extends</code> lists them. Components are merged by checkout location, and the first source to check out a location wins. Then <code>enable</code> and <code>disable</code> apply, then the overrides. All sources must agree on <code>ROOT</code>.</p>
 
 <h2 id="override">[[stack.override]]</h2>
 <p>An override points one repo of the bases somewhere else: a fork, another branch, or a version of a Cactarium package. Overrides need <code>extends</code>, and each repo can be overridden once.</p>
@@ -96,7 +96,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
   <li>a <code>!REPO_COMMIT</code> in the thornlist (an override with <code>package</code> brings one);</li>
   <li><code>pin-tag</code>, if the repo has that tag;</li>
   <li>its base release's pin, if the repo still comes from where the base had it (the same URL and branch);</li>
-  <li>the current head of the branch the thornlist names, or of the default branch if it names none.</li>
+  <li>the current head of the branch named by the thornlist, or of the default branch if it names none.</li>
 </ol>
 <p>A download can't follow a branch, so pin it with a <code>sha256</code> in <code>[[stack.pin]]</code> unless a base release already pins it. Pinning by tag suits an Einstein Toolkit release, which tags each of its repos <code>ET_YYYY_MM_vN</code>. Without pins, a release takes the branch heads as they are when Cactarium reads its tag, or when the release is uploaded.</p>
 
@@ -105,7 +105,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
 <ul>
   <li>two built thorns share a name, ignoring case (Cactus thorn names are global; disable one of each pair). Thorns that are only checked out, not built, don't collide;</li>
   <li>one repo is checked out from conflicting sources (different URLs, branches or commits);</li>
-  <li>an override, a pin or a <code>disable</code> names something no source has;</li>
+  <li>an override, a pin or a <code>disable</code> names something that no source has;</li>
   <li>the sources disagree on <code>ROOT</code>;</li>
   <li>a base release doesn't exist, isn't public, or isn't exact;</li>
   <li>a repo can't be pinned: a missing pin tag, an unreachable repo, or a download without a sha256;</li>
@@ -114,7 +114,7 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
 
 <h2 id="frozen">The frozen thornlist</h2>
 <p>A flat stack with nothing to change keeps its thornlist verbatim. Any other stack's thornlist is written out afresh, with a <code>!REPO_COMMIT</code> line for every git repo and a comment naming its sources, so the downloaded <code>.th</code> is pinned on its own.</p>
-<p>The stack's page shows the frozen thornlist (with <em>Download .th</em> and a JSON link), the pin of every repo, what changed since the previous release on the same track, what it extends, and the definition it was cut from.</p>
+<p>The stack's page shows the frozen thornlist (with <em>Download .th</em> and a JSON link), the pin of every repo, what changed since the previous release on the same track, what it extends, and the definition that it was cut from.</p>
 
 <h2 id="releases">Releases: from tags or by upload</h2>
 <p>A stack gets its releases in one of two ways, never both:</p>
@@ -127,8 +127,8 @@ package = "max-morris/spacetimex@mixed-precision:^1"</pre>
 <h2 id="tips">@head and @master</h2>
 <p>Besides its releases, every stack has two unpinned forms, for development:</p>
 <ul>
-  <li><code>owner/stack@head</code>: the definition as it stands now (for a repo-backed stack, on its default branch; for an uploaded one, the definition of its latest release). Repos keep the pins the definition gives (<code>[[stack.pin]]</code>, <code>!REPO_COMMIT</code>, <code>pin-tag</code>) and their base releases' pins; every other repo is at the tip of the branch the thornlist names.</li>
-  <li><code>owner/stack@master</code>: every repo at the tip of its default branch, ignoring the branches and pins the definition names, like <code>cactup install master</code>.</li>
+  <li><code>owner/stack@head</code>: the definition as it stands now (for a repo-backed stack, on its default branch; for an uploaded one, the definition of its latest release). Repos keep the pins given by the definition (<code>[[stack.pin]]</code>, <code>!REPO_COMMIT</code>, <code>pin-tag</code>) and their base releases' pins; every other repo is at the tip of the branch named by the thornlist.</li>
+  <li><code>owner/stack@master</code>: every repo at the tip of its default branch, ignoring the branches and pins named by the definition, like <code>cactup install master</code>.</li>
 </ul>
 <p>Neither is a release, and neither can be a base. Two installs a day apart can differ. Since branch tips are never reviewed, a trusted stack (the entry or its owner is trusted, see <a href="/docs/review#trust">trust</a>) always serves them, and for any other stack the superadmin's site setting <em>Branch tips of untrusted stacks</em> decides:</p>
 <ul>

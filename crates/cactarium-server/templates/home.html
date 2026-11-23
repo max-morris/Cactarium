@@ -3,7 +3,7 @@
 {% block content %}
 <section class="hero stack">
   <h1>Thorns, stacks and simulations for Cactus</h1>
-  <p class="lead">Publish thorns straight from your own repo, release pinned stacks, and hand anyone a simulation they can rebuild and run with one cactup command. No single release decides what works together.</p>
+  <p class="lead">Publish thorns straight from your own repo, release pinned stacks, and hand anyone a simulation that they can rebuild and run with one cactup command. No single release decides what works together.</p>
   <form role="search" action="/search" method="get" class="big-search">
     <label class="sr-only" for="q">Search Cactarium</label>
     <input id="q" type="search" name="q" placeholder="Search packages, stacks, sims, thorns, implementations…">
@@ -25,7 +25,7 @@
   </a>
   <a class="card kind-card" href="/search?kind=sim">
     <span class="eyebrow">Sims · {{ sims }}</span>
-    <span class="card-title">A parfile and the exact code it ran on</span>
+    <span class="card-title">A parfile and the exact code that it ran on</span>
     <span class="muted">One .sim file: parfile and thornlist verbatim, every repo pinned, inputs declared.</span>
     <code class="mono command-static">cactup import owner/sim</code>
   </a>

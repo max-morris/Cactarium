@@ -1264,7 +1264,7 @@ pub async fn register_repo(
     let mut refused = None;
     let expected = match &req.expect {
         Some(e) => {
-            let e = Expect::decode(e).ok_or_else(|| AppError::bad("expect is no fingerprint a dry run gave; preview again"))?;
+            let e = Expect::decode(e).ok_or_else(|| AppError::bad("expect is no fingerprint given by a dry run; preview again"))?;
             if e.id != request_id {
                 return Err(AppError::Conflict(
                     "expect is from a dry run of another request (url, owner, tag or only differ); preview again".into(),

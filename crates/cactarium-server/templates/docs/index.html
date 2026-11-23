@@ -5,13 +5,13 @@
 <ul>
   <li><strong>Packages</strong>: a git repo of thorns, versioned by its tags. The code stays in its repo. For each version Cactarium records the commit named by the tag when it first saw it, the thorns found there, and what their CCL files declare.</li>
   <li><strong>Stacks</strong>: versioned thornlists. A stack can be a plain thornlist, a recipe built on other stacks, or both. Every release pins every repo to a commit and never changes afterward.</li>
-  <li><strong>Sims</strong>: a parfile together with the exact configuration it ran on, as one <code>.sim</code> file: the thornlist, a pin for every repo, and the inputs the parfile needs from outside the source tree.</li>
+  <li><strong>Sims</strong>: a parfile together with the exact configuration that it ran on, as one <code>.sim</code> file: the thornlist, a pin for every repo, and the inputs that the parfile needs from outside the source tree.</li>
 </ul>
 <p>Thorns have pages of their own: <code>/thorns/CarpetX/Loop</code> lists the packages that provide the thorn and the stacks and sims that build it. See <a href="/docs/finding">Finding things</a>.</p>
 
 <h2 id="accounts">Accounts</h2>
 <p>Reading needs no account. Every public page, every download and the whole read API are open to anyone.</p>
-<p>To publish, sign in with GitHub or ORCID. The first time, you choose your Cactarium name: the namespace everything you publish lives under, as in <code>yourname/package</code>. Names use lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, start with a letter or a digit, and are at most 64 characters long. Users and organizations share one namespace, and a few names, such as <code>docs</code>, <code>api</code> and <code>cactarium</code>, are reserved.</p>
+<p>To publish, sign in with GitHub or ORCID. The first time, you choose your Cactarium name: the namespace under which everything that you publish lives, as in <code>yourname/package</code>. Names use lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, start with a letter or a digit, and are at most 64 characters long. Users and organizations share one namespace, and a few names, such as <code>docs</code>, <code>api</code> and <code>cactarium</code>, are reserved.</p>
 <p>Your Settings page lets you link the other sign-in method, so either one reaches the same account. It also holds your API tokens, which let Cactup publish on your behalf (see <a href="/docs/api#tokens">the API</a>).</p>
 
 <h2 id="cactup">How Cactup uses it</h2>

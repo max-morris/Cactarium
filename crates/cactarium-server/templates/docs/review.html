@@ -8,11 +8,11 @@
   <li><strong>New entries</strong>: a new package, stack or sim.</li>
   <li><strong>Every new release of a public entry</strong>: a newly pushed version tag, an uploaded stack release, a new sim version.</li>
 </ul>
-<p>A version of a <a href="/docs/sims#multi">multi-sim entry</a> is reviewed as a whole: the review page shows every sim it holds, with each sim's warnings. A new version that sorts below a version taken from a different tag form (a new <code>v1.1.5</code> under an earlier <code>sim-v1.2.0</code>) carries a warning: ranges keep choosing the higher one, which usually means the entry <a href="/docs/publishing#cottonmouth">switched tag schemes</a> without renumbering.</p>
+<p>A version of a <a href="/docs/sims#multi">multi-sim entry</a> is reviewed as a whole: the review page shows every sim that it holds, with each sim's warnings. A new version that sorts below a version taken from a different tag form (a new <code>v1.1.5</code> under an earlier <code>sim-v1.2.0</code>) carries a warning: ranges keep choosing the higher one, which usually means the entry <a href="/docs/publishing#cottonmouth">switched tag schemes</a> without renumbering.</p>
 <p>While an entry is itself waiting for review, its releases wait with it and are published when it is approved. Tags that already exist when a repo is registered count as published by the person registering it, so they are reviewed, or not, according to that person's trust. A tag found later by polling or a webhook has no publishing user; the trust of the entry and its owner decides.</p>
 
 <h2 id="pending">What pending means</h2>
-<p>A pending entry or release is hidden. Only the entry's managers (its owner, the members of the organization it belongs to) and the admins see it, marked "pending review" or "awaiting review". For everyone else it doesn't exist yet: it isn't listed or searchable, the API doesn't serve it, no range chooses it, and no stack can use it as a base.</p>
+<p>A pending entry or release is hidden. Only the entry's managers (its owner, the members of the organization that it belongs to) and the admins see it, marked "pending review" or "awaiting review". For everyone else it doesn't exist yet: it isn't listed or searchable, the API doesn't serve it, no range chooses it, and no stack can use it as a base.</p>
 <p>You can follow your submissions on your <a href="/dashboard">dashboard</a>, which lists each one's status and the reviewer's note.</p>
 
 <h2 id="decisions">Approve, request changes, reject</h2>
@@ -29,7 +29,7 @@
 <div class="table-box"><table>
   <thead><tr><th scope="col">Trusted</th><th scope="col">Skips review for</th></tr></thead>
   <tbody>
-    <tr><td>A user</td><td>the entries they create and every release they publish, and every new release of entries under their name. Admins count as trusted.</td></tr>
+    <tr><td>A user</td><td>the entries that they create and every release that they publish, and every new release of entries under their name. Admins count as trusted.</td></tr>
     <tr><td>An organization</td><td>entries created under it, and every new release of its entries.</td></tr>
     <tr><td>An entry</td><td>every new release of that entry.</td></tr>
   </tbody>
@@ -43,7 +43,7 @@
 
 <h2 id="downloads">Downloads</h2>
 <p>A sim may pin a file by its sha256 (a tarball component, an input's download) rather than a repo by its commit. Such a download belongs to no package, so it is reviewed on its own: its URL and content are submitted (<code>cactup download submit &lt;url&gt;</code>), Cactarium fetches it once in the background to check the sha256 (it keeps no copy), and an admin approves or rejects it under Admin, Downloads, once it is verified; the page shows downloads still being fetched, and those whose fetch failed with why (submitting one again tries again). A sim pinning a download is published only once that download is approved: an upload is refused, a tag waits, and a tag pinning a rejected download becomes an invalid version. A trusted user's or an admin's submission is approved as soon as it is verified.</p>
-<p>An admin can also approve a download without the server fetching it, for one too big to fetch or on a host the server can't reach: <em>Approve without fetching</em> on Admin, Downloads, or <code>just cli download approve &lt;admin&gt; &lt;url&gt; &lt;sha256&gt; [--note …]</code>. It creates the download, or approves one awaiting review, whose fetch failed or that was rejected; its size is unknown, and the audit log records that it wasn't verified.</p>
+<p>An admin can also approve a download without the server fetching it, for one too big to fetch or on a host that the server can't reach: <em>Approve without fetching</em> on Admin, Downloads, or <code>just cli download approve &lt;admin&gt; &lt;url&gt; &lt;sha256&gt; [--note …]</code>. It creates the download, or approves one awaiting review, whose fetch failed or that was rejected; its size is unknown, and the audit log records that it wasn't verified.</p>
 <p>An admin can reopen a rejected download (back to pending) or approve it directly; both are in the audit log. Tags that became invalid over it stay invalid until read again: <code>just cli reread &lt;admin&gt; &lt;owner/name&gt; &lt;version&gt;</code>, or Admin, Entries, <em>Re-read invalid version</em>.</p>
 
 <h2 id="hidden">Hidden entries</h2>

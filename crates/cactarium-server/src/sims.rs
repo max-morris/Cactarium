@@ -102,7 +102,7 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
     let extra: Vec<&String> = pinned.difference(&crl_repos).collect();
     if !extra.is_empty() {
         return Err(AppError::bad(format!(
-            "[[repo]] pins repos the thornlist never checks out: {}",
+            "[[repo]] pins repos that the thornlist never checks out: {}",
             extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         )));
     }
