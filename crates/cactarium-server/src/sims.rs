@@ -183,10 +183,10 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
 }
 
 /// Every repo a sim pins must be a registered package's, at a commit that package's repo has: a
-/// downstream user must be able to rebuild the sim from the Cactarium alone. The pin's identity is
+/// downstream user must be able to rebuild the sim from Cactarium alone. The pin's identity is
 /// then `owner/pkg@version` (a commit a version froze) or `owner/pkg` at that commit (any other
 /// commit of the repo). A download (a tarball component pinned by sha256) has no package identity:
-/// it must be one the Cactarium's reviewers approved (`cactup download submit <url>`), and so must
+/// it must be one Cactarium's reviewers approved (`cactup download submit <url>`), and so must
 /// every `[[input]]` downloaded by url and sha256. Refuses with every pin that fails, and what to
 /// do about it. For an upload, where the uploader sees the answer and can try
 /// again; a tag read from a repo uses [`check_pins_at_tag`].
@@ -199,7 +199,7 @@ pub async fn check_pins(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// The thorns a sim builds must build together: every hard CCL requirement of each (a header it
 /// includes too, where a published thorn provides it) met by a thorn the sim builds, its facts
 /// those of the package version that froze its pinned commit (`closure::problems`, which is
-/// conservative about thorns whose facts the Cactarium can't know). Refuses with every need left
+/// conservative about thorns whose facts Cactarium can't know). Refuses with every need left
 /// unmet and the published thorn that would meet it. Run once the pins pass (`check_pins`,
 /// `pin_problems`): before that, the pins say what is wrong.
 pub async fn check_closure(state: &AppState, sim: &SimFile) -> AppResult<()> {
@@ -211,7 +211,7 @@ pub async fn check_closure(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// sim's repo.
 #[derive(Default)]
 pub struct PinProblems {
-    /// Facts about the commit: a download (a tarball pin or an input's) the Cactarium's reviewers
+    /// Facts about the commit: a download (a tarball pin or an input's) Cactarium's reviewers
     /// rejected.
     pub facts: Vec<String>,
     /// Things the world can change: no package for the repo is registered yet, or it is but isn't
@@ -289,7 +289,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     for pin in sim.repos.iter().filter(|p| !refused.contains(p.url.as_str())) {
         let Some(commit) = pin.commit.as_deref() else {
             // A download (a tarball component pinned by sha256) belongs to no package: it must be
-            // one the Cactarium's reviewers approved, at exactly this content.
+            // one Cactarium's reviewers approved, at exactly this content.
             if let Some(sha) = &pin.sha256 {
                 download_problem(state, &pin.name, &pin.url, sha, &mut out).await?;
             } else {
@@ -305,7 +305,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
             // No public package for the URL right now: registering it (or the sibling it is)
             // makes the same commit valid, so at a tag this waits rather than freezing.
             out.passing.push(format!(
-                "{} ({}) isn't the repo of any package on the Cactarium yet: register it (or fork a package that is, and pin the fork)",
+                "{} ({}) isn't the repo of any package on Cactarium yet: register it (or fork a package that is, and pin the fork)",
                 pin.name, pin.url
             ));
             continue;
@@ -352,29 +352,29 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
 }
 
 /// What is wrong with a download a sim pins (`url` with content `sha256`), if anything: it must be
-/// approved on the Cactarium. Never submitted, or awaiting review, may change (an upload is refused
+/// approved on Cactarium. Never submitted, or awaiting review, may change (an upload is refused
 /// saying how to submit it; a tag waits); rejected is a fact.
 async fn download_problem(state: &AppState, name: &str, url: &str, sha: &str, out: &mut PinProblems) -> AppResult<()> {
     let submit = crate::web::downloads::submit_command(url);
     let short = &sha[..12];
     let Some(st) = crate::web::downloads::status_of(state, url, sha).await? else {
         out.passing.push(format!(
-            "{name}: the download {url} (sha256 {short}) hasn't been reviewed by the Cactarium: submit it with `{submit}`, and publish once it is approved"
+            "{name}: the download {url} (sha256 {short}) hasn't been reviewed by Cactarium: submit it with `{submit}`, and publish once it is approved"
         ));
         return Ok(());
     };
     match (st.review.as_str(), st.fetch_state.as_str()) {
         ("approved", _) => {}
-        ("rejected", _) => out.facts.push(format!("{name}: the download {url} (sha256 {short}) was rejected by the Cactarium's reviewers")),
+        ("rejected", _) => out.facts.push(format!("{name}: the download {url} (sha256 {short}) was rejected by Cactarium's reviewers")),
         (_, "fetching") => out.passing.push(format!(
-            "{name}: the download {url} (sha256 {short}) is being verified by the Cactarium (`{submit}` shows how it stands); publish once it is approved"
+            "{name}: the download {url} (sha256 {short}) is being verified by Cactarium (`{submit}` shows how it stands); publish once it is approved"
         )),
         (_, "failed") => out.passing.push(format!(
             "{name}: the server couldn't verify {url}: {}; fix the url or the sha256, or submit it again with `{submit}`",
             st.fetch_error.as_deref().unwrap_or("its fetch failed")
         )),
         _ => out.passing.push(format!(
-            "{name}: the download {url} (sha256 {short}) awaits review on the Cactarium (`{submit}` shows its review); publish once it is approved"
+            "{name}: the download {url} (sha256 {short}) awaits review on Cactarium (`{submit}` shows its review); publish once it is approved"
         )),
     }
     Ok(())
@@ -532,7 +532,7 @@ pub async fn store_version(
 ) -> AppResult<String> {
     let Checked { mut sim, index } = checked;
     let mut tx = sqlx::Connection::begin(&mut *db).await?;
-    // Each pin says which package version it is, as the Cactarium knows it now (a label: the
+    // Each pin says which package version it is, as Cactarium knows it now (a label: the
     // commit is what gets fetched). Only files stored from now on; stored ones never change.
     model::label_pins(&mut tx, &mut sim.repos).await?;
     let (stored, sha) = stamped(entry, name, label, &sim)?;

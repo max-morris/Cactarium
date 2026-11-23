@@ -1,4 +1,4 @@
-# The Cactarium
+# Cactarium
 
 A registry for the Cactup ecosystem: **packages** of Cactus thorns (published from the authors'
 own git repos, versioned by tags), **stacks** (versioned thornlists whose releases pin every repo),
@@ -38,7 +38,7 @@ localhost.
 
 ## The API
 
-CactUp talks to the server under `/api/v1`; the shapes are the crate's `api.rs`, and its
+Cactup talks to the server under `/api/v1`; the shapes are the crate's `api.rs`, and its
 `docs/api.md` is the reference (the site's `/docs/api` describes each route). Reads are anonymous;
 writes take a bearer token from the site's Settings page (or `just cli token <user>`).
 
@@ -61,7 +61,7 @@ writes take a bearer token from the site's Settings page (or `just cli token <us
 | `GET /whoami` (bearer) | `WhoAmI` |
 | `POST /downloads` (bearer, `DownloadSubmission`) | `DownloadReview`; 409 `DownloadConflict` when submitted before |
 
-Every read honors `x-cactarium-include-unreviewed: true` (CactUp's
+Every read honors `x-cactarium-include-unreviewed: true` (Cactup's
 `--risky-allow-untrusted-artifacts`): an admin's token also gets what awaits review, anyone gets
 releases awaiting review of public entries when the site serves unreviewed code, and such answers
 say `x-cactarium-unreviewed: true`.
@@ -130,7 +130,7 @@ say `x-cactarium-unreviewed: true`.
 
 ## Deploying
 
-The production setup mirrors the CactUp tutorial server: the host's Apache terminates TLS and
+The production setup mirrors the Cactup tutorial server: the host's Apache terminates TLS and
 proxies to the app, which Docker Compose publishes on loopback only. Copy `deploy/.env.example` to
 `deploy/.env`, fill it in, then `just up`. `just update` snapshots the database, pulls, rebuilds,
 migrates and restarts.
@@ -171,7 +171,7 @@ organization with `just cli org create et <your-username> --display-name "Einste
   `USES INCLUDE` header its sources include outside any `#if`/`#ifdef`, where a published thorn
   provides it (`INCLUDE ... IN`) and the thorn doesn't declare such a provider `OPTIONAL` or
   `OPTIONAL_IFACTIVE`, and the sources don't test the header's own guard macro. A built thorn
-  the Cactarium has no facts for (a download, a commit no version froze) is not checked and is
+  Cactarium has no facts for (a download, a commit no version froze) is not checked and is
   taken to meet whatever a known thorn of its name meets, or anything when none is known. `rescan-facts` reads the stored facts of package versions again at their frozen
   commits: facts stored before the scanner read headers say a thorn needs and provides none.
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site
@@ -287,6 +287,6 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
    `just cli register --owner et --tag sim-v2026.5.1 <you> https://github.com/EinsteinToolkit/Cottonmouth`,
    which adds only the entries that read that tag.
 7. The starter sim: create a token on the site's Settings page, `cactup login --token <token>`, then,
-   in cactarium-curate, `cactup sim publish sims/wavetoy.sim et/wavetoy`. CactUp talks to
+   in cactarium-curate, `cactup sim publish sims/wavetoy.sim et/wavetoy`. Cactup talks to
    `https://cactarium.cct.lsu.edu` unless `CACTARIUM_URL` or the `cactarium-url` knob says otherwise.
-8. Check it from a CactUp: `cactup install et/carpet-stack@2026.5.0` and `cactup import et/wavetoy --run`.
+8. Check it from a Cactup: `cactup install et/carpet-stack@2026.5.0` and `cactup import et/wavetoy --run`.

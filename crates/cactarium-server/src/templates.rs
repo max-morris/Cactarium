@@ -472,7 +472,7 @@ pub struct ComparePage {
 /// The docs pages in sidebar order: (path under `/docs`, title, one-line summary). The empty path
 /// is `/docs` itself.
 pub const DOC_PAGES: &[(&str, &str, &str)] = &[
-    ("", "Overview", "What the Cactarium holds, accounts, and how CactUp uses it."),
+    ("", "Overview", "What Cactarium holds, accounts, and how Cactup uses it."),
     (
         "publishing",
         "Publishing",
@@ -507,7 +507,7 @@ pub const DOC_PAGES: &[(&str, &str, &str)] = &[
     (
         "curated",
         "Curated packages",
-        "Manifests kept on the Cactarium for repos without one, and handing them over.",
+        "Manifests kept on Cactarium for repos without one, and handing them over.",
     ),
     ("finding", "Finding things", "Search, thorn pages, forks and comparisons, saves."),
     ("api", "HTTP API", "Every endpoint under /api/v1, its headers, and API tokens."),
@@ -556,7 +556,7 @@ impl DocsCtx {
         })
     }
 
-    /// A link into CactUp's own docs (`CACTUP_DOCS_URL`) on `topic`: `cli`, `sim-format`,
+    /// A link into Cactup's own docs (`CACTUP_DOCS_URL`) on `topic`: `cli`, `sim-format`,
     /// `inputs` or `publishing`.
     pub fn cactup(&self, topic: &str) -> String {
         let page = match topic {
@@ -634,7 +634,7 @@ pub struct SubRow {
 #[derive(Clone, Debug)]
 pub struct ReviewView {
     pub id: i64,
-    /// The CactUp command that fetches what is under review, for an admin to try it.
+    /// The Cactup command that fetches what is under review, for an admin to try it.
     pub command: String,
     /// The newest version id the reviewer is shown: approving a new entry publishes only up to it.
     pub seen: i64,

@@ -14,7 +14,7 @@
   <div class="alert warn" role="alert">
     Tag <span class="mono">{{ a.tag }}</span> on <a class="mono" href="{{ a.entry_url }}">{{ a.entry }}</a>
     {% if a.now.is_empty() %}was deleted upstream.{% else %}now points at <span class="mono">{{ a.now }}</span>.{% endif %}
-    The Cactarium keeps serving the frozen commit <span class="mono">{{ a.frozen }}</span>. Publish a new version instead of moving tags.
+    Cactarium keeps serving the frozen commit <span class="mono">{{ a.frozen }}</span>. Publish a new version instead of moving tags.
   </div>
   {% endfor %}
   {% let rows = entries %}

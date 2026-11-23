@@ -55,12 +55,12 @@ pub struct Config {
     pub read_network_slots: usize,
     /// Where the static files are.
     pub static_dir: String,
-    /// The base URL of CactUp's own documentation (its CLI and the `.sim` format), which the
+    /// The base URL of Cactup's own documentation (its CLI and the `.sim` format), which the
     /// site's docs link to instead of repeating it. No trailing slash.
     pub cactup_docs_url: String,
 }
 
-/// Where CactUp's docs are published (from its master branch), unless `CACTUP_DOCS_URL` says
+/// Where Cactup's docs are published (from its master branch), unless `CACTUP_DOCS_URL` says
 /// otherwise.
 const DEFAULT_CACTUP_DOCS_URL: &str = "https://max-morris.github.io/Cactup";
 

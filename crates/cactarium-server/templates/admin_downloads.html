@@ -4,7 +4,7 @@
 {% block content %}
 {% include "_admin_nav.html" %}
 <section class="stack">
-  <p class="muted">Files a sim pins by sha256 (a tarball component, an input's download), submitted with <code>cactup download submit &lt;url&gt;</code>. The Cactarium fetches each once in the background and checks its sha256; it keeps no copy. Only a verified download can be decided. A sim pinning a download that isn't approved isn't published: an upload is refused, a tag waits, and a tag pinning a rejected download becomes an invalid version. Trusted users' and admins' submissions are approved once verified.</p>
+  <p class="muted">Files a sim pins by sha256 (a tarball component, an input's download), submitted with <code>cactup download submit &lt;url&gt;</code>. Cactarium fetches each once in the background and checks its sha256; it keeps no copy. Only a verified download can be decided. A sim pinning a download that isn't approved isn't published: an upload is refused, a tag waits, and a tag pinning a rejected download becomes an invalid version. Trusted users' and admins' submissions are approved once verified.</p>
   <form method="post" action="/admin/downloads/vouch" class="card stack-sm">
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <h2 class="h-small">Approve without fetching</h2>

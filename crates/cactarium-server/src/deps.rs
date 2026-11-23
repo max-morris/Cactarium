@@ -3,17 +3,17 @@
 //! A thorn's CCL says what it needs (implementations it inherits or befriends, capabilities and
 //! thorns it requires, functions it requires), and its sources which `USES INCLUDE` headers it
 //! can't compile without (included outside any conditional); a `[[dependency]]` says which thorns
-//! of which package supply that (`needs`). The Cactarium hosts only what works as delivered, so a
+//! of which package supply that (`needs`). Cactarium hosts only what works as delivered, so a
 //! version is refused unless the two agree: every hard CCL requirement of every published thorn is
 //! met by the package itself, or by the `needs` thorns of a dependency that applies to that thorn
-//! (for an `any-of`, by every alternative). A header counts only where some thorn the Cactarium
+//! (for an `any-of`, by every alternative). A header counts only where some thorn Cactarium
 //! knows of provides it, and none that does is optional to the thorn (`ccl::counts`, through
 //! `closure::counts`): one nothing provides is a hook, and compiles empty.
 //! Smells are what a reviewer should look at but that don't block:
 //! needs the CCL doesn't explain, includes that reach another thorn's sources by path, and so on.
 //!
 //! What a requirement is and what meets it is the crate's (`ccl::needs_of`, `meets`, `unmet`),
-//! shared with CactUp's composition and trim, so the two can't disagree about what a thorn needs.
+//! shared with Cactup's composition and trim, so the two can't disagree about what a thorn needs.
 
 use std::path::Path;
 
@@ -28,7 +28,7 @@ use crate::state::AppState;
 /// A published thorn as `prepare` scanned it: (arrangement, name, directory in the repo, facts).
 pub type Thorn = (String, String, String, ThornFacts);
 
-/// The version of a dependency's target that the check reads: the newest one on the Cactarium
+/// The version of a dependency's target that the check reads: the newest one on Cactarium
 /// within its range (or at its commit), reviewed or awaiting review (a rejected one never counts).
 /// One awaiting review, or of an entry that isn't public, makes the dependent wait ([`judge`]).
 struct TargetVersion {
@@ -46,7 +46,7 @@ struct TargetVersion {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Reading {
     /// A version to freeze (a tag, a registration's preview, a snapshot release): every target
-    /// the Cactarium has counts, and one awaiting review, or not public, makes it wait ([`judge`]).
+    /// Cactarium has counts, and one awaiting review, or not public, makes it wait ([`judge`]).
     /// What it reports goes to the entry's managers and the admins.
     #[default]
     Freeze,
@@ -135,10 +135,10 @@ fn judge(target: &str, tv: &TargetVersion) -> Option<String> {
     })
 }
 
-/// What a dependent waits for when the Cactarium has no public version of its target in range: one
+/// What a dependent waits for when Cactarium has no public version of its target in range: one
 /// not registered yet, not public yet, or with none in range yet, said alike.
 fn no_public_version(target: &str, at: &str) -> String {
-    format!("the dependency on {target}{at}: the Cactarium has no public version of that package in that range yet; this waits until it has")
+    format!("the dependency on {target}{at}: Cactarium has no public version of that package in that range yet; this waits until it has")
 }
 
 /// Whether the target of `alt` has tags in its range not read yet (see
@@ -322,7 +322,7 @@ fn refuse(mut problems: Vec<String>, mut waiting: Vec<String>) -> AppResult<()> 
 
 /// Checks a stack release's dependencies as a package version's are checked, but for the CCL (its
 /// own thornlist names what it builds): each target (every alternative of an any-of) is a package
-/// with a version on the Cactarium in range (or at the commit) that has the `needs` thorns, if any
+/// with a version on Cactarium in range (or at the commit) that has the `needs` thorns, if any
 /// are named. A target awaiting review, or not public, makes the release wait ([`judge`]).
 pub async fn check_stack(state: &AppState, claims: &[ClaimRec]) -> AppResult<()> {
     let r = resolve_dependencies(state, claims, Of::Stack, Reading::Freeze).await?;
@@ -366,7 +366,7 @@ pub async fn check(
         .collect();
     let mut headers = std::collections::HashMap::new();
     for (arr, name, _, facts) in own {
-        // What CactUp reads a thorn's requirements as, and meets them by (the crate's `ccl`): the
+        // What Cactup reads a thorn's requirements as, and meets them by (the crate's `ccl`): the
         // needs the package's own thorns leave unmet.
         for need in unmet(facts, own.iter().map(|(_, n, _, f)| (n.as_str(), f))) {
             if !crate::closure::counts(state, facts, &need, &known, &mut headers).await? {

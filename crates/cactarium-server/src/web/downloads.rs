@@ -54,7 +54,7 @@ pub fn submit_command(url: &str) -> String {
     format!("cactup download submit {url}")
 }
 
-/// What the Cactarium knows of a submitted download.
+/// What Cactarium knows of a submitted download.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     /// `pending`, `approved` or `rejected`.
@@ -79,7 +79,7 @@ impl Status {
     }
 }
 
-/// What the Cactarium knows of each (url, sha256), in order; `None` when it was never submitted.
+/// What Cactarium knows of each (url, sha256), in order; `None` when it was never submitted.
 /// The URL is compared as written.
 pub async fn statuses_of(state: &AppState, asked: &[DownloadQuery]) -> AppResult<Vec<Option<Status>>> {
     if asked.is_empty() {
@@ -102,7 +102,7 @@ pub async fn statuses_of(state: &AppState, asked: &[DownloadQuery]) -> AppResult
     Ok(asked.iter().map(|d| known.get(&(d.url.trim().to_owned(), d.sha256.clone())).cloned()).collect())
 }
 
-/// What the Cactarium knows of one download, if it was submitted.
+/// What Cactarium knows of one download, if it was submitted.
 pub async fn status_of(state: &AppState, url: &str, sha256: &str) -> AppResult<Option<Status>> {
     let asked = [DownloadQuery { url: url.to_owned(), sha256: sha256.to_owned() }];
     Ok(statuses_of(state, &asked).await?.pop().flatten())

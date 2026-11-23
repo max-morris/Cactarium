@@ -1,4 +1,4 @@
-//! Repo URLs in what the Cactarium publishes: the shared rule
+//! Repo URLs in what Cactarium publishes: the shared rule
 //! ([`cactup_ecosystem_common::url::shareability`]) that `cactup sim export` applies too, so both
 //! refuse the same URLs. A registered repo's URL goes through [`crate::git::check_url`], which
 //! also turns an ssh URL into its https equivalent when that answers anonymously; URLs written in
@@ -9,7 +9,7 @@ use cactup_ecosystem_common::crl::{self, ComponentType};
 use cactup_ecosystem_common::url::{Redacted, Shareability, download_shareability, shareability};
 
 /// What is wrong with a git remote written in published content, if anything: the shared rule,
-/// except that an ssh URL is refused even when its https equivalent answers, since the Cactarium
+/// except that an ssh URL is refused even when its https equivalent answers, since Cactarium
 /// can't rewrite a file someone else committed or uploaded; the message names the https URL to
 /// use. Local paths pass when local repos are allowed (development and tests).
 pub fn remote_problem(url: &str, allow_local: bool) -> Option<String> {

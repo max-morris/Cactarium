@@ -1,6 +1,6 @@
 //! Curated packages in bulk: `cactarium curate <admin> <curate.toml>`.
 //!
-//! A curated package keeps its manifest on the Cactarium for a repo whose maintainers haven't
+//! A curated package keeps its manifest on Cactarium for a repo whose maintainers haven't
 //! committed a cactarium.toml yet: the stopgap until they do (then an admin hands it over, see
 //! `tracker::hand_over`). The file lists one `[[package]]` per repo:
 //!

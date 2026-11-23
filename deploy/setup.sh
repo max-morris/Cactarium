@@ -15,7 +15,7 @@
 #   out. Docker's published ports bypass ufw, which is why compose.yaml publishes the app on
 #   loopback only.
 #
-# Adapted from the CactUp tutorial server's deploy/setup.sh (Cactup, feature/notebook-tutorial).
+# Adapted from the Cactup tutorial server's deploy/setup.sh (Cactup, feature/notebook-tutorial).
 set -eu
 
 deploy=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -108,7 +108,7 @@ apache() {
 
 apache_settings() {
     cat <<EOF
-# The Cactarium, behind this virtual host: written by deploy/setup.sh (\`just setup\`) and
+# Cactarium, behind this virtual host: written by deploy/setup.sh (\`just setup\`) and
 # included by the virtual host that serves https://$domain/. To undo: remove that Include line.
 ProxyPreserveHost On
 RequestHeader set X-Forwarded-Proto https

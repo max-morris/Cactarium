@@ -1,7 +1,7 @@
 {% extends "docs/_layout.html" %}
 {% block doc %}
 <h1>Curated packages</h1>
-<p>Many repos, including most of the Einstein Toolkit's, have no <code>cactarium.toml</code> of their own yet. A curated package covers such a repo: Cactarium admins write its manifest, and the Cactarium keeps it instead of reading it from the repo. Everything else works as for any package. The page marks it <em>curated</em>: published by Cactarium admins for a repo whose authors haven't published it themselves.</p>
+<p>Many repos, including most of the Einstein Toolkit's, have no <code>cactarium.toml</code> of their own yet. A curated package covers such a repo: Cactarium admins write its manifest, and Cactarium keeps it instead of reading it from the repo. Everything else works as for any package. The page marks it <em>curated</em>: published by Cactarium admins for a repo whose authors haven't published it themselves.</p>
 <p>A curated package is a stopgap. When the maintainers commit their own manifest, it is handed over to them.</p>
 
 <h2 id="versions">Where its versions come from</h2>
@@ -11,12 +11,12 @@
 </ul>
 
 <h2 id="maintainers">For maintainers: taking it over</h2>
-<p>If your repo is on the Cactarium as a curated package and you'd like to maintain the entry yourself:</p>
+<p>If your repo is on Cactarium as a curated package and you'd like to maintain the entry yourself:</p>
 <ol class="steps">
   <li>Commit a <code>cactarium.toml</code> (see <a href="/docs/packages">the reference</a>) to your repo's default branch. Give it the same <code>name</code> as the curated package, and list the package's current owner, the part before the slash (such as <code>et</code>), in <code>owners</code>. If you'd like the entry moved under your own name or organization, list that as well.</li>
   <li>Ask a Cactarium admin to choose <em>Use the repo's manifest</em> for the package, and to move it to your namespace if you want that.</li>
 </ol>
-<p>The hand-over keeps the package's name, its URL and every version already published. From then on the Cactarium reads your manifest at each new tag: its <code>tag-pattern</code> and <code>since</code> decide which tags are versions, and its <code>owners</code> must keep naming the entry's owner. The <em>curated</em> mark goes away.</p>
+<p>The hand-over keeps the package's name, its URL and every version already published. From then on Cactarium reads your manifest at each new tag: its <code>tag-pattern</code> and <code>since</code> decide which tags are versions, and its <code>owners</code> must keep naming the entry's owner. The <em>curated</em> mark goes away.</p>
 
 <h2 id="admins">For admins</h2>
 <h3 id="creating">Creating one</h3>

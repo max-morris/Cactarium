@@ -1361,7 +1361,7 @@ fn sims_note(p: &Prepared) -> String {
     if named.is_empty() { String::new() } else { format!(" (sims: {})", named.join(", ")) }
 }
 
-/// Admin-only: a package for a repo nobody on the Cactarium controls, with an overlay manifest
+/// Admin-only: a package for a repo nobody on Cactarium controls, with an overlay manifest
 /// kept here instead of in the repo. Its `tag-pattern` and `since` say which upstream tags are
 /// versions.
 pub async fn register_curated(
@@ -1517,7 +1517,7 @@ pub async fn hand_over(state: &AppState, admin: &User, entry: &Entry) -> AppResu
 }
 
 /// Admin-only: re-reads the published versions of a curated package with its current overlay
-/// manifest. A curated package's manifest is metadata the Cactarium keeps, not repo content, so a
+/// manifest. A curated package's manifest is metadata Cactarium keeps, not repo content, so a
 /// fix to it (dependencies added, a thorn list corrected) can apply to versions already published.
 /// Each version keeps its commit and tree; its manifest, thorns and claims are replaced by what a
 /// fresh ingest of that commit with the current overlay gives, in one transaction. A version that

@@ -521,7 +521,7 @@ r = json.loads(body) if s == 200 else {}
 check("an API refresh counts the tag as new and awaiting review",
       r.get("new-versions") == 1 and r.get("awaiting-review") == 1, f"{s} {body[:200]}")
 page(anon, "/alice/spacetimex/0.2.0", expect=404)
-# An admin reviewing can fetch what awaits review (CactUp's --risky-allow-untrusted-artifacts sends
+# An admin reviewing can fetch what awaits review (Cactup's --risky-allow-untrusted-artifacts sends
 # the header); nobody else can, header or not.
 REV = {"x-cactarium-include-unreviewed": "true"}
 pending_req = "/api/v1/resolve?req=alice/spacetimex@0.2.0"
@@ -1468,7 +1468,7 @@ s, r, _ = resolve("max/relpat@1.0.0")
 check("rel-1.0 has no manifest, so rel-1.00, the release, is 1.0.0", s == 200 and r.get("tag") == "rel-1.00", r)
 
 # --- Cottonmouth's case: sims share v tags with the package, then switch to their own sim-v tags by
-# a manifest change alone; nobody switches anything on the Cactarium.
+# a manifest change alone; nobody switches anything on Cactarium.
 CM = new_tree("cmlike")
 CMURL = REPOS + "/cmlike.git"
 thorn_at(CM, "CmArr")
@@ -1887,17 +1887,17 @@ page(anon, "/max/bbh-demo-sims/1.0.0?sim=tov&tab=thornlist", contains="BBHDemoAr
 s, r, _ = resolve("max/bbh-demo-sims/qc0")
 check("the seeded sims resolve by name", s == 200 and r.get("slug") == "max/bbh-demo-sims/qc0@1.0.0", r)
 
-# --- An old CactUp against this server: it knows neither sims nor the new fields.
+# --- An old Cactup against this server: it knows neither sims nor the new fields.
 s, r, _ = resolve("max/repo-sim@1")
-check("old CactUp: a one-sim entry resolves exactly as before (no new fields)",
+check("old Cactup: a one-sim entry resolves exactly as before (no new fields)",
       s == 200 and r.get("slug", "").startswith("max/repo-sim@1.") and "sim" not in r and "newer-without-sim" not in r, r)
 s, body, hdrs = anon.get("/api/v1/sims/max/repo-sim/1.0.0/download")
-check("old CactUp: its download is unchanged (no ?sim=, a two-part stamp, its old format)",
+check("old Cactup: its download is unchanged (no ?sim=, a two-part stamp, its old format)",
       s == 200 and 'cactarium = "max/repo-sim@1.0.0"' in body and body.startswith("format = 3") and hdrs.get("x-sha256"), body[:120])
 s, r, _ = resolve("max/msrepo-sims@1")
-check("old CactUp: owner/name on a multi-sim entry is an error it shows, never a wrong file", s == 400 and r.get("error", {}).get("code") == "bad-request", r)
+check("old Cactup: owner/name on a multi-sim entry is an error it shows, never a wrong file", s == 400 and r.get("error", {}).get("code") == "bad-request", r)
 s, _, _ = anon.get("/api/v1/sims/max/msrepo-sims/1.2.0/download")
-check("old CactUp: a download without ?sim= is refused, so it can't fetch a sim it didn't name", s == 400, s)
+check("old Cactup: a download without ?sim= is refused, so it can't fetch a sim it didn't name", s == 400, s)
 s, r, _ = resolve("max/msrepo-sims@1")
 check("a bare multi-sim entry: the answer says first that it is a sim entry, not a package or stack",
       s == 400 and r.get("error", {}).get("message", "").startswith("max/msrepo-sims is a sim entry, not a package or a stack"), r)
