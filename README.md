@@ -171,7 +171,7 @@ organization with `just cli org create et <your-username> --display-name "Einste
   `USES INCLUDE` header its sources include outside any `#if`/`#ifdef`, where a published thorn
   provides it (`INCLUDE ... IN`) and the thorn doesn't declare such a provider `OPTIONAL` or
   `OPTIONAL_IFACTIVE`, and the sources don't test the header's own guard macro. A built thorn
-  Cactarium has no facts for (a download, a commit no version froze) is not checked and is
+  for which Cactarium has no facts (a download, a commit not frozen by any version) is not checked and is
   taken to meet whatever a known thorn of its name meets, or anything when none is known. `rescan-facts` reads the stored facts of package versions again at their frozen
   commits: facts stored before the scanner read headers say a thorn needs and provides none.
 - New tags are examined per sync up to `CACTARIUM_EXAMINE_PER_SYNC` (default 300; the dev site

@@ -1897,7 +1897,7 @@ check("old Cactup: its download is unchanged (no ?sim=, a two-part stamp, its ol
 s, r, _ = resolve("max/msrepo-sims@1")
 check("old Cactup: owner/name on a multi-sim entry is an error it shows, never a wrong file", s == 400 and r.get("error", {}).get("code") == "bad-request", r)
 s, _, _ = anon.get("/api/v1/sims/max/msrepo-sims/1.2.0/download")
-check("old Cactup: a download without ?sim= is refused, so it can't fetch a sim it didn't name", s == 400, s)
+check("old Cactup: a download without ?sim= is refused, so it can't fetch a sim that it didn't name", s == 400, s)
 s, r, _ = resolve("max/msrepo-sims@1")
 check("a bare multi-sim entry: the answer says first that it is a sim entry, not a package or stack",
       s == 400 and r.get("error", {}).get("message", "").startswith("max/msrepo-sims is a sim entry, not a package or a stack"), r)

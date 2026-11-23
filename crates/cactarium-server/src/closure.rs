@@ -4,7 +4,7 @@
 //! conditional) must be met by a thorn the thornlist builds, by the crate's rule (`ccl::needs_of`,
 //! `meets`, `counts`), shared with Cactup and with the package check in `deps.rs`.
 //!
-//! What a built thorn needs comes from the facts Cactarium stored for the package version
+//! What a built thorn needs comes from the facts stored by Cactarium for the package version
 //! that froze the commit its repo is pinned at. A header (`Need::Include`) counts only where some
 //! published thorn provides it (`ccl::counts`): one nothing provides compiles empty, which is how
 //! hooks work, so it never refuses anything. Nor does one whose provider is optional to the thorn
@@ -16,7 +16,7 @@
 //! check stays conservative about them, so that they never cause a refusal that may be false:
 //! their own needs aren't checked (nothing says what they are), and they are taken to meet every
 //! need they plausibly could. A thorn meets `Need::Thorn` by its name alone, so that is decided
-//! by the name. Anything else is plausible when some thorn of the same name Cactarium knows
+//! by the name. Anything else is plausible when some thorn of the same name known to Cactarium
 //! (any version of any package; Cactus thorn names are global, so it is most likely the same
 //! thorn) meets it, or when Cactarium knows no thorn of that name at all: then nothing can be
 //! said about it, and it may meet anything.
@@ -105,7 +105,7 @@ pub async fn counts(
     Ok(ccl::counts(needing, need, local.iter().copied().chain(&cache[&key])))
 }
 
-/// A thorn a thornlist builds, with what Cactarium knows of it.
+/// A thorn built by a thornlist, with what Cactarium knows of it.
 #[derive(Clone, Debug)]
 pub struct Built {
     /// `Arrangement/Thorn`, as the thornlist checks it out.
@@ -123,7 +123,7 @@ impl Built {
     }
 
     /// Whether this thorn, whose facts aren't known, could meet `need` (see the module's doc): a
-    /// thorn need by its name; anything else when a thorn of its name Cactarium knows meets
+    /// thorn need by its name; anything else when a thorn of its name known to Cactarium meets
     /// it, or when it knows no thorn of that name at all.
     fn may_meet(&self, need: &Need) -> bool {
         match need {
@@ -328,7 +328,7 @@ mod tests {
         // A download named like TwoPunctures, which a published version provides the header in.
         let built = [admbase.clone(), known("EinsteinInitialData/TwoPuncturesX", tpx()), unknown("Downloads/TwoPunctures", vec![tp])];
         assert!(unmet(&built).is_empty());
-        // One Cactarium knows nothing of may be anything.
+        // One unknown to Cactarium may be anything.
         let built = [admbase.clone(), known("EinsteinInitialData/TwoPuncturesX", tpx()), unknown("Mine/Secret", vec![])];
         assert!(unmet(&built).is_empty());
         // One known by name that doesn't provide the header doesn't stand in for it.

@@ -6,8 +6,8 @@
 //! of which package supply that (`needs`). Cactarium hosts only what works as delivered, so a
 //! version is refused unless the two agree: every hard CCL requirement of every published thorn is
 //! met by the package itself, or by the `needs` thorns of a dependency that applies to that thorn
-//! (for an `any-of`, by every alternative). A header counts only where some thorn Cactarium
-//! knows of provides it, and none that does is optional to the thorn (`ccl::counts`, through
+//! (for an `any-of`, by every alternative). A header counts only where some thorn known to
+//! Cactarium provides it, and none that does is optional to the thorn (`ccl::counts`, through
 //! `closure::counts`): one nothing provides is a hook, and compiles empty.
 //! Smells are what a reviewer should look at but that don't block:
 //! needs the CCL doesn't explain, includes that reach another thorn's sources by path, and so on.
@@ -46,7 +46,7 @@ struct TargetVersion {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Reading {
     /// A version to freeze (a tag, a registration's preview, a snapshot release): every target
-    /// Cactarium has counts, and one awaiting review, or not public, makes it wait ([`judge`]).
+    /// that Cactarium has counts, and one awaiting review, or not public, makes it wait ([`judge`]).
     /// What it reports goes to the entry's managers and the admins.
     #[default]
     Freeze,

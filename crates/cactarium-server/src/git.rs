@@ -39,7 +39,7 @@ pub struct Target {
     resolve: Option<String>,
 }
 
-/// Checks a repo URL someone gives Cactarium to register (or move, or curate) against the
+/// Checks a repo URL given to Cactarium to register (or move, or curate) against the
 /// policy. Returns it normalized (no trailing slash). First the shared rule for what may be
 /// published ([`shareability`](cactup_ecosystem_common::url::shareability), the same one `cactup
 /// sim export` applies): credentials, local paths (outside development) and other schemes are
@@ -247,7 +247,7 @@ pub async fn fetch_and_hash(policy: GitPolicy, raw: &str, max_bytes: u64, time_l
         if let Some(n) = resp.content_length()
             && n > max_bytes
         {
-            bail!("it is {n} bytes, more than the {max_bytes} Cactarium reads");
+            bail!("it is {n} bytes, more than the {max_bytes} that Cactarium reads");
         }
         let mut h = sha2::Sha256::new();
         let mut size: u64 = 0;
@@ -259,7 +259,7 @@ pub async fn fetch_and_hash(policy: GitPolicy, raw: &str, max_bytes: u64, time_l
             let Some(chunk) = chunk else { break };
             size += chunk.len() as u64;
             if size > max_bytes {
-                bail!("it is more than the {max_bytes} bytes Cactarium reads");
+                bail!("it is more than the {max_bytes} bytes that Cactarium reads");
             }
             h.update(&chunk);
         }

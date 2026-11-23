@@ -186,7 +186,7 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
 /// downstream user must be able to rebuild the sim from Cactarium alone. The pin's identity is
 /// then `owner/pkg@version` (a commit a version froze) or `owner/pkg` at that commit (any other
 /// commit of the repo). A download (a tarball component pinned by sha256) has no package identity:
-/// it must be one Cactarium's reviewers approved (`cactup download submit <url>`), and so must
+/// it must be one approved by Cactarium's reviewers (`cactup download submit <url>`), and so must
 /// every `[[input]]` downloaded by url and sha256. Refuses with every pin that fails, and what to
 /// do about it. For an upload, where the uploader sees the answer and can try
 /// again; a tag read from a repo uses [`check_pins_at_tag`].
@@ -211,8 +211,8 @@ pub async fn check_closure(state: &AppState, sim: &SimFile) -> AppResult<()> {
 /// sim's repo.
 #[derive(Default)]
 pub struct PinProblems {
-    /// Facts about the commit: a download (a tarball pin or an input's) Cactarium's reviewers
-    /// rejected.
+    /// Facts about the commit: a download (a tarball pin or an input's) rejected by
+    /// Cactarium's reviewers.
     pub facts: Vec<String>,
     /// Things the world can change: no package for the repo is registered yet, or it is but isn't
     /// public yet (awaiting review, a sibling entry not yet approved, or being registered along
@@ -289,7 +289,7 @@ pub async fn pin_problems(state: &AppState, sim: &SimFile, registering: &[String
     for pin in sim.repos.iter().filter(|p| !refused.contains(p.url.as_str())) {
         let Some(commit) = pin.commit.as_deref() else {
             // A download (a tarball component pinned by sha256) belongs to no package: it must be
-            // one Cactarium's reviewers approved, at exactly this content.
+            // one approved by Cactarium's reviewers, at exactly this content.
             if let Some(sha) = &pin.sha256 {
                 download_problem(state, &pin.name, &pin.url, sha, &mut out).await?;
             } else {
