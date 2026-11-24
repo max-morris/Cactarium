@@ -2294,7 +2294,8 @@ if pins[2].get("commit-known") is None:
     pins[2] = (again.get("pins") or [{}])[0]
 check("a commit the repo doesn't have is not known", pins[2].get("package") == "max/carpetx" and pins[2].get("commit-known") is False, pins[2])
 check("a repo no package has: no package, nothing known", pins[3].get("package") is None and pins[3].get("commit-known") is None, pins[3])
-check("a download never submitted has no review", (r.get("downloads") or [{}])[0].get("review", "x") is None, r.get("downloads"))
+check("a download never submitted has no review and no verification", (r.get("downloads") or [{}])[0].get("review", "x") is None
+      and "verification" not in (r.get("downloads") or [{}])[0], r.get("downloads"))
 s, r, _ = api("POST", "/lookup", {"pins": [{"url": carpetx_url, "commit": v110[:12]}]})
 check("the lookup takes full commit ids only", s == 400 and r["error"]["code"] == "bad-request", r)
 
@@ -2353,6 +2354,10 @@ check("the row keeps its submitter and note, and the retry is recorded as the ad
       psql(f"SELECT s.username FROM downloads d JOIN users s ON s.id = d.submitter WHERE d.id = {bad_id}") == "bob"
       and psql(f"SELECT count(*) FROM audit_log a JOIN users u ON u.id = a.actor WHERE a.action = 'download.retry' AND u.username = 'max' AND a.details->>'id' = '{bad_id}'") == "1")
 check("which fails once more", until_fetched(bad_id).startswith("failed|pending|"))
+s, r, _ = api("POST", "/lookup", {"downloads": [{"url": css_url, "sha256": "0" * 64}]})
+d0 = (r.get("downloads") or [{}])[0]
+check("the lookup says a failed download's verification failed, and why",
+      s == 200 and d0.get("review") == "pending" and d0.get("verification") == "failed" and "the file's sha256 is" in (d0.get("reason") or ""), d0)
 s, r, _ = api("POST", "/downloads", {"url": "file:///etc/hostname", "sha256": css_sha}, BOB)
 check("a URL no fetch could read is refused at once", s == 400 and "https://" in r["error"]["message"], r)
 s, r, _ = api("POST", "/downloads", {"url": css_url, "sha256": css_sha, "note": "the site's stylesheet"}, BOB)
@@ -2363,7 +2368,8 @@ check("submitting it again is a 409 that carries its review and where verificati
       s == 409 and r.get("id") == did and r.get("review") == "pending" and r["error"]["code"] == "conflict" and "verified" in r["error"]["message"], r)
 check("its fetch verifies it, still pending review", until_fetched(did) == "ok|pending|", download_state(did))
 s, r, _ = api("POST", "/lookup", {"pins": [], "downloads": [{"url": css_url, "sha256": css_sha}]})
-check("the lookup says it is pending", s == 200 and r["downloads"][0]["review"] == "pending" and r["pins"] == [], r)
+check("the lookup says it is pending, verified, with no reason", s == 200 and r["downloads"][0]["review"] == "pending"
+      and r["downloads"][0].get("verification") == "ok" and "reason" not in r["downloads"][0] and r["pins"] == [], r)
 s, body, _ = anon.req("POST", "/api/v1/sims/max/dlsim", raw=dlsim.encode(), headers=MAXAUTH)
 check("a sim pinning a download that isn't approved is refused, naming the command",
       s == 400 and f"cactup download submit {css_url}" in body and "awaits review" in body, f"{s} {body[:400]}")

@@ -160,7 +160,18 @@ pub async fn lookup(
         .downloads
         .iter()
         .zip(downloads)
-        .map(|(d, st)| DownloadInfo { url: d.url.clone(), sha256: d.sha256.clone(), review: st.map(|s| s.review) })
+        .map(|(d, st)| {
+            // How the server's check stands, and why it failed when it did: a failed check stays
+            // `pending` in review, which alone reads as "awaiting verification".
+            let (review, verification, reason) = match st {
+                Some(s) => {
+                    let reason = s.fetch_error.filter(|_| s.fetch_state == "failed");
+                    (Some(s.review), Some(s.fetch_state), reason)
+                }
+                None => (None, None, None),
+            };
+            DownloadInfo { url: d.url.clone(), sha256: d.sha256.clone(), review, verification, reason }
+        })
         .collect();
     Ok((AppendHeaders(unreviewed_mark(unreviewed)), Json(LookedUp { pins, downloads })).into_response())
 }
