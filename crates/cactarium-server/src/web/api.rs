@@ -1238,7 +1238,11 @@ pub async fn register_repo(
         // As registering will read it: the full preview, then, when only some entries are chosen,
         // the preview with only them as new siblings (as their syncs will judge their tags).
         let full = tracker::preview(&state, Some(&user), Some(&owner), &req.url, at(), None).await?.preview;
-        let (files, others) = chosen_files(&full, &owner, &req.only)?;
+        let (files, others) = chosen_files(&full, &req.only)?;
+        if !req.only.is_empty() && files.is_empty() {
+            // Every entry `only` names is on the repo already: answered as it is, nothing to confirm.
+            return Ok(Json(Registered { entries: as_registered(&full), warnings: vec![], expect: None }));
+        }
         let shown = if others.is_empty() {
             full
         } else {
@@ -1282,10 +1286,10 @@ pub async fn register_repo(
     };
     let done = match tracker::register(&state, &user, &req.url, Some(&owner), tag, choice, &mut refused).await {
         Ok(done) => done,
-        // Nothing to add: the repo is registered, as asked.
-        Err(AppError::BadRequest(_)) if refused.as_ref().is_some_and(|p| tracker::nothing_to_add(p).is_some()) => {
+        // Nothing to add, or every entry `only` names is there already: registered, as asked.
+        Err(AppError::BadRequest(_)) if refused.as_ref().is_some_and(|p| registered_already(p, &req.only)) => {
             let p = refused.expect("checked above");
-            return Ok(Json(Registered { entries: p.entries.iter().map(registered_entry).collect(), warnings: vec![], expect: None }));
+            return Ok(Json(Registered { entries: as_registered(&p), warnings: vec![], expect: None }));
         }
         Err(e) => return Err(e.into()),
     };
@@ -1359,21 +1363,40 @@ fn registered_entry(e: &tracker::PreviewEntry) -> RegisteredEntry {
 }
 
 /// The manifest files of the new (or failing) entries `only` names (by manifest name), and those
-/// of the others; every one when `only` is empty. A name that is no new entry here is refused.
-fn chosen_files(p: &tracker::Preview, owner: &str, only: &[String]) -> ApiResult<(Vec<String>, Vec<String>)> {
+/// of the others; every one when `only` is empty. A name `only` gives for an entry already on the
+/// repo chooses nothing (none, when it names only those); a name that is no entry is refused.
+fn chosen_files(p: &tracker::Preview, only: &[String]) -> ApiResult<(Vec<String>, Vec<String>)> {
     let planned: Vec<&tracker::PreviewEntry> = p.entries.iter().filter(|e| !e.shown.is_empty()).collect();
     if only.is_empty() {
         return Ok((planned.iter().map(|e| e.file.clone()).collect(), vec![]));
     }
-    for name in only {
-        if !planned.iter().any(|e| e.slug == format!("{owner}/{name}")) {
-            let new: Vec<&str> = planned.iter().map(|e| e.slug.rsplit('/').next().unwrap_or("")).collect();
-            return Err(AppError::bad(format!("no new entry named '{name}' to register (new here: {})", new.join(", "))).into());
-        }
-    }
-    let (chosen, others): (Vec<&tracker::PreviewEntry>, Vec<&tracker::PreviewEntry>) =
-        planned.into_iter().partition(|e| only.iter().any(|n| e.slug == format!("{owner}/{n}")));
+    let (new, _) = tracker::only_names(p, only)?;
+    let named = |e: &tracker::PreviewEntry| new.iter().any(|n| e.slug.rsplit('/').next() == Some(n.as_str()));
+    let (chosen, others): (Vec<&tracker::PreviewEntry>, Vec<&tracker::PreviewEntry>) = planned.into_iter().partition(|e| named(e));
     Ok((chosen.iter().map(|e| e.file.clone()).collect(), others.iter().map(|e| e.file.clone()).collect()))
+}
+
+/// Whether a registration refused with this preview has nothing to do, as asked: every entry the
+/// repo's manifests give is on it, or every one `only` names is.
+fn registered_already(p: &tracker::Preview, only: &[String]) -> bool {
+    tracker::nothing_to_add(p).is_some() || (!only.is_empty() && tracker::only_names(p, only).is_ok_and(|(new, _)| new.is_empty()))
+}
+
+/// A preview with nothing to register, in the API's words: the entries on the repo `existing`,
+/// any new one `skipped` (`only` leaves it out).
+fn as_registered(p: &tracker::Preview) -> Vec<RegisteredEntry> {
+    p.entries
+        .iter()
+        .map(|e| {
+            let mut r = registered_entry(e);
+            if !e.shown.is_empty() {
+                r.status = "skipped".into();
+                r.note = Some("only leaves it out".into());
+                r.review = None;
+            }
+            r
+        })
+        .collect()
 }
 
 /// Which registration request a dry run answered: its URL, owner, tag and `only`.
@@ -1513,8 +1536,8 @@ pub(crate) mod tests {
         assert_eq!((existing.status.as_str(), existing.review, existing.url), ("existing", None, None));
     }
 
-    /// `only` names manifests; the rest of the new entries are the others. A name that is no new
-    /// entry is refused.
+    /// `only` names manifests; the rest of the new entries are the others. A name of an entry
+    /// already registered chooses nothing; a name that is no entry is refused.
     #[test]
     fn only_chooses_by_manifest_name() {
         let p = tracker::Preview {
@@ -1527,11 +1550,22 @@ pub(crate) mod tests {
             ],
             fingerprint: "f".into(),
         };
-        let (all, none) = chosen_files(&p, "et", &[]).unwrap();
+        let (all, none) = chosen_files(&p, &[]).unwrap();
         assert_eq!((all.len(), none.len()), (2, 0));
-        let (chosen, others) = chosen_files(&p, "et", &["cottonmouth".into()]).unwrap();
+        let (chosen, others) = chosen_files(&p, &["cottonmouth".into()]).unwrap();
         assert_eq!((chosen, others), (vec!["cactarium.toml".to_owned()], vec!["cactarium-sim.toml".to_owned()]));
-        assert!(chosen_files(&p, "et", &["old".into()]).is_err(), "already registered");
+        // An entry already registered chooses nothing; a mix chooses the new ones.
+        let (chosen, others) = chosen_files(&p, &["old".into()]).unwrap();
+        assert_eq!((chosen.len(), others.len()), (0, 2));
+        assert!(registered_already(&p, &["old".into()]));
+        assert!(!registered_already(&p, &["old".into(), "cottonmouth".into()]));
+        let (chosen, _) = chosen_files(&p, &["old".into(), "cottonmouth".into()]).unwrap();
+        assert_eq!(chosen, vec!["cactarium.toml".to_owned()]);
+        let rows = as_registered(&p);
+        assert_eq!(rows.iter().map(|r| r.status.as_str()).collect::<Vec<_>>(), ["skipped", "skipped", "existing"]);
+        // A name that is no entry is refused, naming those there are.
+        let err = chosen_files(&p, &["nope".into()]).unwrap_err();
+        assert!(format!("{err:?}").contains("cottonmouth, cottonmouth-sims, old"), "{err:?}");
     }
 
     /// Only a preview with entries, all already registered, has nothing to add: an empty one (a
