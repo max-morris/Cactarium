@@ -85,6 +85,24 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
     }
     let list = crl::parse(&sim.thornlist.text)
         .map_err(|e| AppError::bad(format!("the thornlist does not parse: {e:#}")))?;
+    // A `!TYPE = ignore` section names thorns the sim needs but nobody else can fetch (private,
+    // or untracked): a sim built from them isn't reproducible, so it can't be published. Cactup's
+    // `sim export --local` writes one for your own use; this refuses it, hand-edited or not.
+    if !list.ignored().is_empty() {
+        let sections: Vec<String> = list
+            .ignored()
+            .iter()
+            .map(|c| match c.name.as_deref() {
+                Some(n) => format!("{} ({n})", c.checkout),
+                None => c.checkout.clone(),
+            })
+            .collect();
+        return Err(AppError::bad(format!(
+            "the thornlist has !TYPE = ignore sections, thorns others can't fetch: {}. Publish them in a repo \
+             anyone can fetch (and pin it), or keep the sim for your own use",
+            sections.join(", ")
+        )));
+    }
     let crl_repos: BTreeSet<String> = list
         .components()
         .iter()
@@ -656,6 +674,17 @@ commit = "{SHA}"
         let unpinned = sim(false, "").replace(&format!("commit = \"{SHA}\"\n"), "");
         let e = check(unpinned.as_bytes()).err().unwrap().to_string();
         assert!(e.contains("fully specified"), "{e}");
+    }
+
+    /// A `!TYPE = ignore` section (private thorns, as `cactup sim export --local` writes them) is
+    /// refused, naming each checkout.
+    #[test]
+    fn refuses_ignored_thorns() {
+        let private = "CarpetX/Loop\n\n!TARGET = $ROOT/arrangements\n!TYPE = ignore\n!NAME = mine\n!CHECKOUT = Private/Secret\n'''";
+        let text = sim(false, "").replacen("CarpetX/Loop\n'''", private, 1);
+        assert_ne!(text, sim(false, ""));
+        let e = check(text.as_bytes()).err().unwrap().to_string();
+        assert!(e.contains("!TYPE = ignore") && e.contains("Private/Secret (mine)"), "{e}");
     }
 
     /// A pin's label (`owner/pkg@X.Y.Z`, on a track too) needs nothing past `.sim` format 1, so a
