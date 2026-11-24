@@ -88,19 +88,10 @@ fn check_as(bytes: &[u8], source: Source) -> AppResult<Checked> {
     // A `!TYPE = ignore` section names thorns the sim needs but nobody else can fetch (private,
     // or untracked): a sim built from them isn't reproducible, so it can't be published. Cactup's
     // `sim export --local` writes one for your own use; this refuses it, hand-edited or not.
-    if !list.ignored().is_empty() {
-        let sections: Vec<String> = list
-            .ignored()
-            .iter()
-            .map(|c| match c.name.as_deref() {
-                Some(n) => format!("{} ({n})", c.checkout),
-                None => c.checkout.clone(),
-            })
-            .collect();
+    if let Some(thorns) = crate::remotes::ignored_thorns(&list) {
         return Err(AppError::bad(format!(
-            "the thornlist has !TYPE = ignore sections, thorns others can't fetch: {}. Publish them in a repo \
-             anyone can fetch (and pin it), or keep the sim for your own use",
-            sections.join(", ")
+            "the thornlist has !TYPE = ignore sections, thorns others can't fetch: {thorns}. Publish them in a repo \
+             anyone can fetch (and pin it), or keep the sim for your own use"
         )));
     }
     let crl_repos: BTreeSet<String> = list

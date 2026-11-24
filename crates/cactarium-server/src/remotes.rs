@@ -175,6 +175,23 @@ pub async fn stored_problems(db: &sqlx::PgPool, allow_local: bool) -> anyhow::Re
     Ok(out)
 }
 
+/// The `!TYPE = ignore` sections of a thornlist, when it has any with thorns: each checkout, with
+/// the section's `!NAME` if it gives one ("Private/B (mine)"). Such thorns are in the tree but
+/// fetched by no one else (private, or untracked), so nothing built from them can be rebuilt by
+/// anyone else; a sim or stack with them isn't published. An empty section (the Einstein
+/// Toolkit's "Private thorns" placeholder) lists nothing.
+pub fn ignored_thorns(list: &crl::Thornlist) -> Option<String> {
+    let sections: Vec<String> = list
+        .ignored()
+        .iter()
+        .map(|c| match c.name.as_deref() {
+            Some(n) => format!("{} ({n})", c.checkout),
+            None => c.checkout.clone(),
+        })
+        .collect();
+    (!sections.is_empty()).then(|| sections.join(", "))
+}
+
 /// [`component_problems`] for every component of a thornlist's text (none if it doesn't parse).
 fn thornlist_problems(text: &str, allow_local: bool) -> Vec<String> {
     let mut out = Vec::new();
@@ -189,6 +206,17 @@ fn thornlist_problems(text: &str, allow_local: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ignore section's thorns are listed, named by `!NAME` when given; the Einstein Toolkit's
+    /// empty "Private thorns" placeholder lists none.
+    #[test]
+    fn ignored_thorns_are_listed() {
+        let head = "!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!TARGET = $ROOT\n!TYPE = git\n!URL = https://x/r.git\n!CHECKOUT = r\n";
+        let placeholder = format!("{head}\n# Private thorns\n!TARGET = $ROOT\n!TYPE = ignore\n!CHECKOUT =\n");
+        assert_eq!(ignored_thorns(&crl::parse(&placeholder).unwrap()), None);
+        let named = format!("{head}\n!TARGET = $ROOT\n!TYPE = ignore\n!NAME = mine\n!CHECKOUT = Private/B\n");
+        assert_eq!(ignored_thorns(&crl::parse(&named).unwrap()).as_deref(), Some("Private/B (mine)"));
+    }
 
     /// Every remote is probed (a local path isn't, in development), each once, and a private one
     /// is reported with the https wording.

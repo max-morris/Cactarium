@@ -2417,6 +2417,18 @@ check("and one whose dependency is a stack", s == 200 and "that is a stack" in t
 s, text, _ = dep_stack("max/pinpkg@^1")
 check("one whose dependency has a version in range is released", s == 303, text[text.find("alert"):][:300])
 
+# A stack whose thornlist has thorns in a !TYPE = ignore section is refused, as a sim is; the
+# Einstein Toolkit's empty "Private thorns" placeholder is no such section.
+def ign_stack(name, thornlist):
+    maxv.get("/new/stack")
+    d = f'format = 1\n\n[stack]\nname = "{name}"\nextends = ["et/et-stack@2026.5.0"]\n'
+    return maxv.post("/new/stack", {"definition": d, "thornlist": thornlist, "version": "0.1.0"})
+s, text, _ = ign_stack("ignstack", "!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!DEFINE ARR = $ROOT/arrangements\n\n!TARGET = $ARR\n!TYPE = ignore\n!NAME = mine\n!CHECKOUT = Private/Secret\n")
+check("a stack with thorns in a !TYPE = ignore section is refused, naming them",
+      s == 200 and "!TYPE = ignore" in text and "Private/Secret (mine)" in text, text[text.find("alert"):][:300])
+s, text, _ = ign_stack("placeholderstack", "!CRL_VERSION = 1.0\n!DEFINE ROOT = Cactus\n!DEFINE ARR = $ROOT/arrangements\n\n# Private thorns\n!TARGET = $ARR\n!TYPE = ignore\n!CHECKOUT =\n")
+check("and one with only the empty placeholder is released", s == 303, text[text.find("alert"):][:300])
+
 # Registering through the API: preview, a stale fingerprint, confirm, nothing to add.
 _, arbare, _, _ = tiny_package("apireg", "bob", "ApiArr")
 APIREG = REPOS + "/apireg.git"
