@@ -966,6 +966,31 @@ pub fn nothing_to_add(p: &Preview) -> Option<String> {
     Some(format!("{} already has every entry its manifests give: {}; nothing to add", p.url, list.join(", ")))
 }
 
+/// How `only` (manifest names) reads against a preview: the names of new (or failing) entries,
+/// to register, and those of entries already on the repo, which there is nothing to do for. A name
+/// that is neither is refused: with the preview's reason when it leaves that manifest out, else
+/// with the names the repo's manifests give.
+pub fn only_names<'a>(p: &Preview, only: &'a [String]) -> AppResult<(Vec<&'a String>, Vec<&'a String>)> {
+    let name_of = |e: &PreviewEntry| e.slug.rsplit('/').next().unwrap_or("").to_owned();
+    let (mut new, mut existing) = (Vec::new(), Vec::new());
+    for name in only {
+        let Some(row) = p.entries.iter().find(|e| &name_of(e) == name) else {
+            let names: Vec<String> = p.entries.iter().map(name_of).filter(|n| !n.is_empty()).collect();
+            let given = if names.is_empty() { "none".to_owned() } else { names.join(", ") };
+            return Err(AppError::bad(format!("no entry named '{name}' in {} (the names its manifests give: {given})", p.url)));
+        };
+        match row.status {
+            "new" | "fails" => new.push(name),
+            "existing" => existing.push(name),
+            _ => {
+                let why = row.note.as_deref().unwrap_or("left out");
+                return Err(AppError::bad(format!("'{name}' ({}) can't be registered now: {why}", row.file)));
+            }
+        }
+    }
+    Ok((new, existing))
+}
+
 /// The preview's mark on a release whose manifest file isn't on the default branch anymore.
 fn off_head_note(p: &Planned) -> String {
     if p.off_head {
@@ -1056,17 +1081,20 @@ pub async fn register(
         Choice::All => preview(state, Some(user), Some(&owner), url, at(), None).await?,
         Choice::Names(names) => {
             let full = preview(state, Some(user), Some(&owner), url, at(), None).await?;
-            let mut files = Vec::new();
-            for name in names {
-                match full.plan.new.iter().find(|p| &p.name == name) {
-                    Some(p) => files.push(p.file.to_owned()),
-                    None => {
-                        let new: Vec<&str> = full.plan.new.iter().map(|p| p.name.as_str()).collect();
-                        *refused = Some(full.preview);
-                        return Err(AppError::bad(format!("no new entry named '{name}' to register (new here: {})", new.join(", "))));
-                    }
+            let (new, existing) = match only_names(&full.preview, names) {
+                Ok(split) => split,
+                Err(e) => {
+                    *refused = Some(full.preview);
+                    return Err(e);
                 }
+            };
+            if new.is_empty() {
+                let list: Vec<&str> = existing.iter().map(|n| n.as_str()).collect();
+                *refused = Some(full.preview);
+                return Err(AppError::bad(format!("nothing to register: {} already registered", list.join(", "))));
             }
+            let files: Vec<String> =
+                full.plan.new.iter().filter(|p| new.contains(&&p.name)).map(|p| p.file.to_owned()).collect();
             left = full.plan.new.iter().filter(|p| !names.contains(&p.name)).map(|p| format!("{}/{} ({})", full.plan.owner, p.name, p.file)).collect();
             not_chosen = full.preview.entries.iter().filter(|e| !e.shown.is_empty() && !files.contains(&e.file)).cloned().collect();
             if files.len() == full.plan.new.len() {

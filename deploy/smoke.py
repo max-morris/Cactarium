@@ -1769,7 +1769,8 @@ write(OR, "cactarium-sim.toml", sims_toml("onlyrepo-sims", {"alpha": "a.sim"}, p
 commit_tag(OR, "both", "v1.0.0")
 publish_tree(OR, "onlyrepo")
 ok, out = cli("register", "max", ORURL, "--only", "nope")
-check("--only naming no new entry is refused", not ok and "no new entry named 'nope'" in out, out[-300:])
+check("--only naming no entry is refused, listing those there are",
+      not ok and "no entry named 'nope'" in out and "onlyrepo" in out and "onlyrepo-sims" in out, out[-300:])
 ok, out = cli("register", "max", ORURL, "--only", "onlyrepo")
 check("--only registers just that entry, and says the other wasn't chosen",
       ok and "Registered max/onlyrepo (package" in out and "Registered max/onlyrepo-sims" not in out and "not chosen" in out, out[-400:])
@@ -2451,6 +2452,12 @@ check("registering with a fresh fingerprint registers it, with its page and its 
 s, r, _ = api("POST", "/repos", {"url": APIREG}, BOB)
 check("a repo with nothing to add answers 200, every entry existing",
       s == 200 and r.get("entries") and all(x["status"] == "existing" for x in r["entries"]) and not r.get("expect"), r)
+for dry in (True, False):
+    s, r, _ = api("POST", "/repos", {"url": APIREG, "only": ["apireg"], "dry-run": dry}, BOB)
+    check(f"only naming a registered entry answers 200, existing ({'dry run' if dry else 'register'})",
+          s == 200 and [(x["slug"], x["status"]) for x in r.get("entries", [])] == [("bob/apireg", "existing")] and not r.get("expect"), r)
+s, r, _ = api("POST", "/repos", {"url": APIREG, "only": ["nope"], "dry-run": True}, BOB)
+check("only naming no entry is a 400 that lists those there are", s == 400 and "apireg" in r["error"]["message"], r)
 
 # A dependency on a package awaiting review waits; once approved, the version is read.
 M = new_tree("m17")
