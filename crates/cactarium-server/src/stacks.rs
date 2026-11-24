@@ -157,6 +157,14 @@ pub async fn resolve(
         if !missing.is_empty() {
             list = parse(&enable_lines(text, &missing))?;
         }
+        // As for a sim: thorns in a `!TYPE = ignore` section are fetched by no one else, so a
+        // stack with them (its own, or a base's) can't be rebuilt from what it publishes.
+        if let Some(thorns) = crate::remotes::ignored_thorns(&list) {
+            return Err(AppError::bad(format!(
+                "{label} has !TYPE = ignore sections, thorns others can't fetch: {thorns}. Publish them in a repo \
+                 anyone can fetch and check them out from it"
+            )));
+        }
         match &root {
             None => root = Some(list.root().to_owned()),
             Some(r) if r != list.root() && list.root() != "." => {
