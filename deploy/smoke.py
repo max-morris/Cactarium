@@ -170,7 +170,7 @@ check("a wrong CSRF token is refused", s == 400, s)
 # Only admins publish under a namespace that is not theirs.
 alice.get("/new/repo")
 s, t, _ = alice.post("/new/repo", {"url": REPOS + "/spacetimex.git", "owner": "et"})
-check("a non-member cannot publish under et", s == 200 and "organization you belong to" in t, s)
+check("a non-member cannot publish under et", s == 200 and "organization that you belong to" in t, s)
 
 maxv = Visitor("max")
 for p in ["/dashboard", "/settings", "/new/repo", "/new/sim", "/new/stack", "/new/stack?name=max/carpetx-mp",
@@ -410,7 +410,7 @@ page(alice, "/orgs/alice-lab", contains="Add member")
 page(anon, "/alice", contains="alice-lab")
 alice.get("/new/stack")
 s, text, _ = alice.post("/new/stack", {"owner": "et", "definition": definition.replace("smoke-stack", "alice-et"), "thornlist": "", "version": "0.1.0"})
-check("a non-member cannot publish under an organization", s == 200 and "organization you belong to" in text, text[text.find("alert"):][:200])
+check("a non-member cannot publish under an organization", s == 200 and "organization that you belong to" in text, text[text.find("alert"):][:200])
 maxv.get("/orgs/et")
 s, _, _ = maxv.post("/orgs/et/members", {"username": "alice", "role": "member"})
 check("an owner adds a member", s == 303, s)

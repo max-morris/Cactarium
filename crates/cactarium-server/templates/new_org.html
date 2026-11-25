@@ -3,7 +3,7 @@
 {% block content %}
 <section class="narrow stack-lg">
   <h1>New organization</h1>
-  <p class="lead">An organization is a namespace you share. Its members publish under it and manage its packages, stacks and sims; its owners also manage who is a member.</p>
+  <p class="lead">An organization is a namespace that you share. Its members publish under it and manage its packages, stacks and sims; its owners also manage who is a member.</p>
   {% if let Some(e) = error %}<div class="alert">{{ e }}</div>{% endif %}
   <form class="card stack" method="post" action="/orgs/new">
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">

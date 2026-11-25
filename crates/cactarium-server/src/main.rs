@@ -75,7 +75,7 @@ enum Command {
     /// schemes): repos, pins and thornlists of stack releases and sims, sims' inputs, downloads.
     /// Read-only. Exits 1 when it lists any.
     CheckUrls,
-    /// A dry run: the preview registering URL (at TAG, if given) shows, and with a tag, how each
+    /// A dry run: what registering URL (at TAG, if given) would preview, and with a tag, how each
     /// entry already on the repo would read it. Writes nothing. With --commit, a tag that doesn't
     /// exist yet is read as if it named that commit (a branch or a full commit id).
     Check {
@@ -100,20 +100,20 @@ enum Command {
         version: Option<String>,
         #[arg(long, conflicts_with = "version")]
         tag: Option<String>,
-        /// Read the version's moved tag at the commit it names now, replacing the frozen commit.
+        /// Read the version's moved tag at the commit that it names now, replacing the frozen commit.
         #[arg(long, requires = "version")]
         moved: bool,
     },
     /// Read the thorn facts of package versions again at their frozen commits, as an admin, and
     /// store them in place of the old ones: facts stored before the scanner read included headers
     /// (`INCLUDE ... IN`, and the sources' unconditional `#include`s) say a thorn provides and
-    /// needs none. Only versions with a thorn an older scanner read, unless `--all`; only
+    /// needs none. Only versions with a thorn read by an older scanner, unless `--all`; only
     /// OWNER/NAME if given.
     /// Prints one line per version; running it again does only what is left.
     RescanFacts {
         username: String,
         slug: Option<String>,
-        /// Every valid version, not only those with facts an older scanner read.
+        /// Every valid version, not only those with facts read by an older scanner.
         #[arg(long)]
         all: bool,
     },
@@ -177,7 +177,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DownloadAction {
-    /// Approve a download without the server fetching it (too big, or on a host it can't reach),
+    /// Approve a download without the server fetching it (too big, or on a host that it can't reach),
     /// as ADMIN vouching for it: a new one, or one awaiting review, whose fetch failed or that was
     /// rejected. The audit log records that it wasn't verified.
     Approve {
@@ -218,7 +218,7 @@ enum AdminAction {
     /// Make an admin an ordinary user.
     Revoke { username: String },
     /// Mark a user, an organization, or an entry (owner/name) trusted: new entries and releases
-    /// they publish, or new releases of the entry, skip review.
+    /// that they publish, or new releases of the entry, skip review.
     Trust { name: String },
     /// Mark a user, organization or entry untrusted again.
     Untrust { name: String },

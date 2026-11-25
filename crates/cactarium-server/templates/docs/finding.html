@@ -3,14 +3,14 @@
 <h1>Finding things</h1>
 
 <h2 id="search">Search</h2>
-<p>The search box at the top of every page, and the <a href="/search">search page</a>, match entry names (<code>owner/name</code>), summaries, the thorns and implementations a package provides, and the thorns a stack or a sim builds. Searching <code>CarpetX</code> among stacks lists the stacks one of whose releases builds a CarpetX thorn. Entries whose name matches exactly come first.</p>
+<p>The search box at the top of every page, and the <a href="/search">search page</a>, match entry names (<code>owner/name</code>), summaries, the thorns and implementations provided by a package, and the thorns built by a stack or a sim. Searching <code>CarpetX</code> among stacks lists the stacks one of whose releases builds a CarpetX thorn. Entries whose name matches exactly come first.</p>
 <p>Filter by kind: packages, stacks, sims or thorns. A thorn search matches thorn names, implementations and arrangements, and lists each thorn with the package that provides it and that package's latest version containing it. Only public, published versions count.</p>
 
 <h2 id="thorns">Thorn pages</h2>
 <p>Every thorn has a page: <code>/thorns/Arrangement/Thorn</code>, or <code>/thorns/Thorn</code> to match the name in any arrangement (Cactus thorn names are global). It shows:</p>
 <ul>
   <li><strong>Provided by</strong>: the packages that contain the thorn, with the latest version that has it;</li>
-  <li><strong>Built by</strong>: the public stacks and sims whose newest release builds it. A thorn a thornlist only checks out (on its <code>!CHECKOUT</code> line) isn't built, so it doesn't count.</li>
+  <li><strong>Built by</strong>: the public stacks and sims whose newest release builds it. A thorn that a thornlist only checks out (on its <code>!CHECKOUT</code> line) isn't built, so it doesn't count.</li>
 </ul>
 <p>Implementations have pages too: <code>/implementations/driver</code> lists the thorns that implement <code>driver</code>.</p>
 

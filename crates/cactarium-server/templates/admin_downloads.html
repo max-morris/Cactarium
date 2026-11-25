@@ -8,7 +8,7 @@
   <form method="post" action="/admin/downloads/vouch" class="card stack-sm">
     <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
     <h2 class="h-small">Approve without fetching</h2>
-    <p class="small muted">For a download too big for the server to fetch, or on a host it can't reach: approved as you vouch for it, without the server checking its sha256 (the audit log says so). Also approves one awaiting review, whose fetch failed, or that was rejected. The same as <code>just cli download approve &lt;admin&gt; &lt;url&gt; &lt;sha256&gt; [--note …]</code>.</p>
+    <p class="small muted">For a download too big for the server to fetch, or on a host that it can't reach: approved as you vouch for it, without the server checking its sha256 (the audit log says so). Also approves one awaiting review, whose fetch failed, or that was rejected. The same as <code>just cli download approve &lt;admin&gt; &lt;url&gt; &lt;sha256&gt; [--note …]</code>.</p>
     <label for="vouch-url">URL</label>
     <input id="vouch-url" name="url" type="url" required>
     <label for="vouch-sha">sha256</label>

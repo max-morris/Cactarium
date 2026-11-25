@@ -2,7 +2,7 @@
 
 A registry for the Cactup ecosystem: **packages** of Cactus thorns (published from the authors'
 own git repos, versioned by tags), **stacks** (versioned thornlists whose releases pin every repo),
-and **sim files** (a parfile plus the exact configuration it ran on). The `cactup` CLI is its
+and **sim files** (a parfile plus the exact configuration that it ran on). The `cactup` CLI is its
 client: `cactup add`, `cactup install owner/stack`, `cactup import owner/sim`.
 
 The file formats, the CRL thornlist parser and the CCL scanner live in
@@ -79,7 +79,7 @@ say `x-cactarium-unreviewed: true`.
   there can't be read (an invalid manifest, a thorn problem); and 502 `upstream` when the host
   can't be reached or doesn't send the commit in time (try again later). An abbreviated commit
   that matches nothing is also 404; one shorter than 7 hex digits is 400. Unreviewed code
-  (`head`, `master`, a commit no version froze) of a package that isn't trusted is 403
+  (`head`, `master`, a commit not frozen by any version) of a package that isn't trusted is 403
   `forbidden` unless the site allows untrusted artifacts; when it is served, it carries
   `x-cactarium-untrusted: true` (`false` on a trusted package's).
 - `POST /packages/read`: at most 200 items (owner/name and a full commit id, no pair twice), else
@@ -91,9 +91,9 @@ say `x-cactarium-unreviewed: true`.
   against the per-minute limit on reads made now (a 429 refuses it whole); one that reads nothing
   now doesn't count, as a single read of a cached full commit doesn't. What is read now
   comes from the repo's kept history mirror, and shares the single reads' cache (4096 readings,
-  the oldest dropped first): the commit's tree checked out from the mirror, the files it lacks
-  fetched in one request per package and kept (packed anew from exactly those files); a commit no
-  branch or tag of the mirror reaches, or one the mirror can't serve, is checked out as the single
+  the oldest dropped first): the commit's tree checked out from the mirror, the files that it lacks
+  fetched in one request per package and kept (packed anew from exactly those files); a commit not
+  reached by any branch or tag of the mirror, or one that the mirror can't serve, is checked out as the single
   read does. The answer comes within 20 seconds: items not done by then are `not-read` ("still
   being read; ask again shortly", with `in-progress: true`) and go on in the background, filling
   the mirror and the cache; a `not-read` item that never started has `in-progress: false`.
@@ -103,7 +103,7 @@ say `x-cactarium-unreviewed: true`.
 - Mirrors are kept warm at every package's default-branch tip: once cloned, after each sync of the
   package, and in a pass over all packages at startup, one repo at a time on a slot of its own. So
   a base at the packages' tips reads with no network at all.
-- `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit a version froze. For any
+- `POST /lookup`: a pin's `flesh` and `fork-of` are exact for a commit frozen by a version. For any
   other commit the server doesn't read the manifest there: `flesh` is the package's newest
   version's value, a hint, and `fork-of` is empty.
 - Repo URLs are matched with the crate's `url::normalize_repo_url` (stored as
@@ -120,7 +120,7 @@ say `x-cactarium-unreviewed: true`.
   the 409 for a known download (a failed one is tried again, and its 409 says why the last try
   failed, such as "the file's sha256 is X, not Y"), and from the refusal of a sim that pins it.
   Rows left being fetched past the fetch's time limit are fetched again by the hourly sweep. An
-  admin can approve a download without the server fetching it (too big, or on a host it can't
+  admin can approve a download without the server fetching it (too big, or on a host that it can't
   reach): Admin, Downloads, *Approve without fetching*, or `cactarium download approve <admin>
   <url> <sha256> [--note ...]` (`just cli download approve ...`); its size is unknown and the
   audit log records that it wasn't verified.
@@ -141,15 +141,15 @@ Server-side commands run in the app container with `just cli ...`:
 [--commit <ref>]]`, `publish-sim`, `sync`, `reread <admin> <owner/name> <version>` (or `--tag <tag>`, or `<version> --moved`), `rescan-facts <admin> [<owner/name>] [--all]`, `move-repo`, `reapply`, `token`. Create the `et`
 organization with `just cli org create et <your-username> --display-name "Einstein Toolkit"`.
 
-- `register` finds each manifest file's newest release among the repo's tags (the newest tag its
-  own manifest reads as a version, with siblings' claims applied; the default branch decides
+- `register` finds each manifest file's newest release among the repo's tags (the newest tag read by its
+  own manifest as a version, with siblings' claims applied; the default branch decides
   nothing), or reads exactly `--tag`; a manifest with no release tag yet is skipped with a note. It
   reads each new entry at its tag before writing anything, creates the entries in one transaction
   (only those named by `--only`, if given, by manifest name), and prints one line per entry
   registered; on a repo that already has entries it adds only the missing ones. An entry is named
   by its manifest's `name`, under `--owner` (default: the registering user), which the manifest's
   `owners` must list. `check` prints the same preview as a dry run (nothing written), also for tags
-  that don't exist yet (`--commit` names the commit or branch they would name). The website's
+  that don't exist yet (`--commit` names the commit or branch that they would name). The website's
   Register a repo is the same, in two steps: the preview, then confirming the entries checked.
 - Each tag is read by the entry's manifest in the tag's commit (`tag-pattern`, else
   `[track/]vX.Y.Z`, and its `since`): a manifest change applies to the tags carrying it, with no
@@ -158,7 +158,7 @@ organization with `just cli org create et <your-username> --display-name "Einste
   of the entry at all); with `--tag`, it examines a tag recorded as not a version again under the
   current rules. With `--moved`, `reread` reads a version of a sim or stack whose tag moved (marked
   `tag-moved`, the frozen commit still served) at the tag's current commit: if the tag there is still
-  that version and passes every check a new tag passes, the version takes the new commit and
+  that version and passes every check that a new tag passes, the version takes the new commit and
   everything stored from the old one is replaced (a stack's frozen thornlist and pins, every stored
   `.sim` of a sim entry, the thorn and pin indexes; the next release's diff), the mark goes, the
   tag's alerts are acknowledged, and it is reviewed as a pushed tag is (`version.reread-moved` in the
@@ -166,9 +166,9 @@ organization with `just cli org create et <your-username> --display-name "Einste
   *Re-read moved tag*. Package versions are refused: sims and stacks pin their commits.
 - A package version, a sim (upload or tag) and a stack release (tag or upload) are checked against
   what their thorns need: a package's against its own thorns and its dependencies' `needs`, a sim's
-  and a release's against the thorns their thornlist builds (each thorn's facts are those of the
+  and a release's against the thorns built by their thornlist (each thorn's facts are those of the
   package version that froze its pinned commit). Besides the CCL requirements, a thorn needs every
-  `USES INCLUDE` header its sources include outside any `#if`/`#ifdef`, where a published thorn
+  `USES INCLUDE` header that its sources include outside any `#if`/`#ifdef`, where a published thorn
   provides it (`INCLUDE ... IN`) and the thorn doesn't declare such a provider `OPTIONAL` or
   `OPTIONAL_IFACTIVE`, and the sources don't test the header's own guard macro. A built thorn
   for which Cactarium has no facts (a download, a commit not frozen by any version) is not checked and is
@@ -187,8 +187,8 @@ organization with `just cli org create et <your-username> --display-name "Einste
   preview of a repo with no entries uses a temporary mirror, deleted afterward, cloned on a slot of
   its own (never one of syncing's three), given up (its git killed) once the request goes away,
   and stopped past 1 GB; leftovers of a process that died are swept at startup and hourly. Kept
-  mirrors have no size limit for their history; the file contents batch reads and warming keep
-  in them stop being added once a mirror's objects take 2 GB or the volume has under 10 GB free
+  mirrors have no size limit for their history; the file contents kept in them by batch reads and warming
+  stop being added once a mirror's objects take 2 GB or the volume has under 10 GB free
   (logged), so size the mirrors volume for the packages' trees at their tips plus what changed
   since (a few GB for the Einstein Toolkit), with 10 GB to spare. The volume is a cache: deleting it
   costs clones and fetches, nothing else. Previews and confirms together are limited to
@@ -213,8 +213,8 @@ organization with `just cli org create et <your-username> --display-name "Einste
   fields, so until they are rescanned no header is needed or provided anywhere. After `just
   update`, run `just cli rescan-facts <admin>` once (it fetches each package version's commit; one
   line per version; run it again to retry what failed, it skips what is done). From then on new
-  package versions, sims and stack releases are refused when a thorn includes a header only a thorn
-  they don't build provides. Versions already frozen stay as they are. Tags read after the deploy
+  package versions, sims and stack releases are refused when a thorn includes a header provided only by a thorn
+  that they don't build. Versions already frozen stay as they are. Tags read after the deploy
   (or `reapply`) of curated packages whose manifests leave such a header to a dependency without
   naming its thorn in `needs` are refused with the line that fixes it; so are tip reads of them.
 - Upgrading to the dependency-plan release (migrations 0017 and 0018): the first `migrate` (which
@@ -244,10 +244,10 @@ organization with `just cli org create et <your-username> --display-name "Einste
   source_pins ADD PRIMARY KEY (version_id, repo); DELETE FROM _sqlx_migrations WHERE description
   = 'multi sim';`. That works only before any multi-sim version was stored (several rows per
   version can't go back to one); otherwise reset.
-- Rollback: a binary from the retry-not-freeze release on starts on a database a later release
-  migrated; leaves unread (never freezes) the tags it can't read: format-2 manifests, format-4
-  sims, a tag without an entry's manifest on a repo with several entries; skips the tags this
-  release recorded as not an entry's (`foreign_tags`); and serves a sim download's file and
+- Rollback: a binary from the retry-not-freeze release on starts on a database migrated by a later
+  release; leaves unread (never freezes) the tags that it can't read: format-2 manifests, format-4
+  sims, a tag without an entry's manifest on a repo with several entries; skips the tags recorded by this
+  release as not an entry's (`foreign_tags`); and serves a sim download's file and
   sha256 from one row. Under it, a multi-sim entry's pages fail to render (its stored sims are
   format 4), so hide those entries (Admin, Entries, Hide) for the duration. Before rolling back
   further than that release, hiding every multi-sim entry is required: hidden entries aren't
@@ -264,7 +264,7 @@ The whole sequence, rehearsed end to end against the real repos (curating takes 
    `<base>/auth/github/callback`) and optionally ORCID's, and `SSH_FROM`. Never set
    `CACTARIUM_DEV_LOGIN` there.
 2. `just up`, then `just firewall` from an SSH session that comes through the bastion. It allows SSH
-   from the bastion on the ports sshd listens on now; if sshd is moving to another port, list both in
+   from the bastion on the ports that sshd listens on now; if sshd is moving to another port, list both in
    `SSH_PORTS` (e.g. `22 2525`) and run it again with only the new one once that works.
 3. Sign in on the site with GitHub. The account named in `CACTARIUM_SUPERADMIN` is the superadmin;
    signing in creates your user.

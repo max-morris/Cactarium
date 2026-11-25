@@ -248,7 +248,7 @@ pub async fn resolve(
     let mut seen = BTreeSet::new();
     url_problems.retain(|u| seen.insert(u.clone()));
     if !url_problems.is_empty() {
-        return Err(AppError::bad(format!("the stack publishes URLs it can't: {}", url_problems.join("; "))));
+        return Err(AppError::bad(format!("the stack publishes URLs that it can't: {}", url_problems.join("; "))));
     }
     // Every git remote must answer a stranger. Not a fact about the definition (the repo may be
     // made public, the host may be down): a tag waits, a person is told ([`for_a_person`]).
@@ -260,7 +260,7 @@ pub async fn resolve(
     let silent = crate::remotes::unanswered(policy, &remotes).await;
     if !silent.is_empty() {
         let why: Vec<String> = silent.into_iter().map(|(_, why)| why).collect();
-        return Err(AppError::Upstream(format!("the stack publishes remotes others can't fetch: {}", why.join("; "))));
+        return Err(AppError::Upstream(format!("the stack publishes remotes that others can't fetch: {}", why.join("; "))));
     }
 
     if tip == Some(Tip::Master) {

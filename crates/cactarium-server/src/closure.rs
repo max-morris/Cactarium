@@ -169,8 +169,8 @@ fn built_thorn(c: &Component) -> Option<(&str, &str)> {
 pub fn said(checkout: &str, need: &Need, what: &str, providers: &[(String, String)]) -> String {
     let missing = match need {
         Need::Thorn(_) => format!("which {what} doesn't build"),
-        Need::Implementation(_) => format!("which nothing {what} builds implements"),
-        _ => format!("which nothing {what} builds provides"),
+        Need::Implementation(_) => format!("which nothing built by {what} implements"),
+        _ => format!("which nothing built by {what} provides"),
     };
     let named: Vec<String> = providers.iter().take(3).map(|(t, p)| format!("{t} ({p})")).collect();
     let more = providers.len().saturating_sub(named.len());
@@ -458,13 +458,13 @@ mod tests {
         let tp = ("EinsteinInitialData/TwoPunctures".to_owned(), "et/einsteininitialdata".to_owned());
         assert_eq!(
             said("EinsteinInitialData/TwoPuncturesX", &header, "the sim", std::slice::from_ref(&tp)),
-            "EinsteinInitialData/TwoPuncturesX includes the header TP_Guts.h, which nothing the sim builds provides; \
+            "EinsteinInitialData/TwoPuncturesX includes the header TP_Guts.h, which nothing built by the sim provides; \
              EinsteinInitialData/TwoPunctures (et/einsteininitialdata) does: add it to the thornlist"
         );
         let drivers: Vec<(String, String)> =
             ["Carpet", "CarpetX", "PUGH", "Other"].iter().map(|d| (format!("{d}/{d}"), format!("et/{}", d.to_lowercase()))).collect();
         let s = said("A/B", &Need::Implementation("driver".into()), "the release", &drivers[..2]);
-        assert!(s.contains("which nothing the release builds implements; Carpet/Carpet (et/carpet) and CarpetX/CarpetX (et/carpetx) do: add one of them"), "{s}");
+        assert!(s.contains("which nothing built by the release implements; Carpet/Carpet (et/carpet) and CarpetX/CarpetX (et/carpetx) do: add one of them"), "{s}");
         let s = said("A/B", &Need::Implementation("driver".into()), "the release", &drivers);
         assert!(s.contains("PUGH/PUGH (et/pugh), and 1 more, do"), "{s}");
         let s = said("A/B", &Need::Thorn("Helper".into()), "the sim", &[]);

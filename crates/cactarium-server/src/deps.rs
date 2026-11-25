@@ -261,7 +261,7 @@ async fn resolve_dependencies<'a>(state: &AppState, claims: &'a [ClaimRec], of: 
                                 && occupied(&repo.join(into))
                             {
                                 r.problems.push(format!(
-                                    "the dependency on {} puts its checkout into {into}, which this commit already has: choose a folder the repo doesn't use",
+                                    "the dependency on {} puts its checkout into {into}, which this commit already has: choose a folder not used by the repo",
                                     alt.target()
                                 ));
                             }

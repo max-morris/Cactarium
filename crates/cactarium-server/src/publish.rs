@@ -49,7 +49,7 @@ pub async fn check_namespace(state: &AppState, user: &User, owner: &str) -> AppR
         )));
     }
     Err(AppError::Denied(format!(
-        "you can publish only under your own name or an organization you belong to, not '{owner}'"
+        "you can publish only under your own name or an organization that you belong to, not '{owner}'"
     )))
 }
 
